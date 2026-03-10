@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     env,
     net::{IpAddr, SocketAddr},
@@ -12,6 +13,7 @@ use tracing::debug;
 
 use crate::{
     config::{FiltersConfig, QbittorrentConfig},
+    persistence::ActiveBanRecord,
     types::{PeerObservationId, PeerSnapshot, TorrentPeer, TorrentSummary},
 };
 
@@ -31,6 +33,11 @@ pub struct QbittorrentClient {
     min_total_seeders: u32,
     client: Client,
     base_url: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanSyncResult {
+    pub banned_ips: Vec<IpAddr>,
 }
 
 impl QbittorrentClient {
@@ -104,6 +111,39 @@ impl QbittorrentClient {
         let url = self.torrent_peers_url(torrent_hash, 0)?;
         let body = self.authenticated_get_text(url).await?;
         self.normalize_torrent_peers(torrent_hash, &body)
+    }
+
+    pub async fn apply_peer_ban(
+        &self,
+        ban: &ActiveBanRecord,
+        active_bans: &[ActiveBanRecord],
+    ) -> Result<BanSyncResult> {
+        let ban_url = self.ban_peers_url()?;
+        let peers = self.encode_ban_peers(&[(ban.peer_ip, ban.peer_port)]);
+        self.send_authenticated(|| self.client.post(ban_url.clone()).form(&[("peers", peers.clone())]))
+            .await
+            .with_context(|| format!("failed to apply qbittorrent peer ban for {}:{}", ban.peer_ip, ban.peer_port))?;
+
+        let banned_ips = self.managed_banned_ips(active_bans.iter().chain(std::iter::once(ban)));
+        self.sync_banned_ips(&banned_ips).await.with_context(|| {
+            format!(
+                "failed to persist managed banned IPs after banning {}:{}",
+                ban.peer_ip, ban.peer_port
+            )
+        })
+    }
+
+    pub async fn reconcile_expired_bans(
+        &self,
+        active_bans: &[ActiveBanRecord],
+    ) -> Result<BanSyncResult> {
+        let banned_ips = self.managed_banned_ips(active_bans.iter());
+        self.sync_banned_ips(&banned_ips).await.with_context(|| {
+            format!(
+                "failed to reconcile qbittorrent banned IPs from {} active bans",
+                active_bans.len()
+            )
+        })
     }
 
     async fn authenticated_get_text(&self, url: Url) -> Result<String> {
@@ -294,6 +334,33 @@ impl QbittorrentClient {
         })
         .to_string())
     }
+
+    fn managed_banned_ips<'a>(
+        &self,
+        active_bans: impl IntoIterator<Item = &'a ActiveBanRecord>,
+    ) -> Vec<IpAddr> {
+        active_bans
+            .into_iter()
+            .map(|ban| ban.peer_ip)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    async fn sync_banned_ips(&self, banned_ips: &[IpAddr]) -> Result<BanSyncResult> {
+        let preferences_url = self.set_preferences_url()?;
+        let payload = self.encode_banned_ips_preferences(banned_ips)?;
+        self.send_authenticated(|| {
+            self.client
+                .post(preferences_url.clone())
+                .form(&[("json", payload.clone())])
+        })
+        .await?;
+
+        Ok(BanSyncResult {
+            banned_ips: banned_ips.to_vec(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,12 +439,13 @@ mod tests {
     };
 
     use super::{
-        APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, QbPeer, QbTorrentPeersResponse,
-        QbittorrentClient, SYNC_TORRENT_PEERS_PATH, TORRENTS_INFO_PATH, TRANSFER_BAN_PEERS_PATH,
-        WEBAPI_VERSION_PATH, parse_peer_key,
+        APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, BanSyncResult, QbPeer,
+        QbTorrentPeersResponse, QbittorrentClient, SYNC_TORRENT_PEERS_PATH, TORRENTS_INFO_PATH,
+        TRANSFER_BAN_PEERS_PATH, WEBAPI_VERSION_PATH, parse_peer_key,
     };
     use crate::{
         config::{FiltersConfig, QbittorrentConfig},
+        persistence::ActiveBanRecord,
         types::{PeerObservationId, TorrentSummary},
     };
 
@@ -720,6 +788,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deduplicates_and_sorts_managed_banned_ips() {
+        let client = test_client();
+
+        assert_eq!(
+            client.managed_banned_ips([
+                &active_ban("10.0.0.11", 51414, "torrent:def456"),
+                &active_ban("10.0.0.10", 51413, "torrent:abc123"),
+                &active_ban("10.0.0.10", 51415, "torrent:ghi789"),
+            ]),
+            vec![
+                "10.0.0.10".parse::<IpAddr>().unwrap(),
+                "10.0.0.11".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
     fn test_client() -> QbittorrentClient {
         scoped_test_client(FiltersConfig::default())
     }
@@ -916,6 +1001,116 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn apply_peer_ban_posts_endpoint_ban_and_syncs_preferences() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.10", "10.0.0.11"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_test_client(&base_url);
+        let ban = active_ban("10.0.0.10", 51413, "torrent:abc123");
+        let result = client
+            .apply_peer_ban(
+                &ban,
+                &[
+                    ban.clone(),
+                    active_ban("10.0.0.11", 51414, "torrent:def456"),
+                    active_ban("10.0.0.10", 51415, "torrent:ghi789"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BanSyncResult {
+                banned_ips: vec![
+                    "10.0.0.10".parse::<IpAddr>().unwrap(),
+                    "10.0.0.11".parse::<IpAddr>().unwrap(),
+                ],
+            }
+        );
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_expired_bans_syncs_remaining_managed_ips() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json="],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11", "10.0.0.12"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_test_client(&base_url);
+        let result = client
+            .reconcile_expired_bans(&[
+                active_ban("10.0.0.12", 51416, "torrent:xyz999"),
+                active_ban("10.0.0.11", 51414, "torrent:def456"),
+                active_ban("10.0.0.11", 51415, "torrent:ghi789"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BanSyncResult {
+                banned_ips: vec![
+                    "10.0.0.11".parse::<IpAddr>().unwrap(),
+                    "10.0.0.12".parse::<IpAddr>().unwrap(),
+                ],
+            }
+        );
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
     #[derive(Clone)]
     struct ExpectedRequest {
         method: &'static str,
@@ -1004,6 +1199,19 @@ mod tests {
             std::time::Duration::from_secs(10),
         )
         .unwrap()
+    }
+
+    fn active_ban(peer_ip: &str, peer_port: u16, scope: &str) -> ActiveBanRecord {
+        ActiveBanRecord {
+            peer_ip: peer_ip.parse().unwrap(),
+            peer_port,
+            scope: scope.to_string(),
+            offence_number: 1,
+            reason: "slow_non_progressing".to_string(),
+            created_at: std::time::UNIX_EPOCH,
+            expires_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600),
+            reconciled_at: None,
+        }
     }
 
     fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
