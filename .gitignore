@@ -1,0 +1,11 @@
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+.cargo-home/
+target/
+
+
+# Added by cargo
+
+/target
