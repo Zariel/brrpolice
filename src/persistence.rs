@@ -33,6 +33,35 @@ pub struct ServiceMetaRecord {
     pub updated_at: SystemTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveBanRecord {
+    pub peer_ip: IpAddr,
+    pub peer_port: u16,
+    pub scope: String,
+    pub offence_number: u32,
+    pub reason: String,
+    pub created_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub reconciled_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerOffenceRecord {
+    pub id: Option<i64>,
+    pub torrent_hash: String,
+    pub peer_ip: IpAddr,
+    pub peer_port: u16,
+    pub offence_number: u32,
+    pub reason_code: String,
+    pub observed_duration: Duration,
+    pub bad_duration: Duration,
+    pub progress_delta_per_mille: u32,
+    pub avg_up_rate_bps: u64,
+    pub banned_at: SystemTime,
+    pub ban_expires_at: SystemTime,
+    pub ban_revoked_at: Option<SystemTime>,
+}
+
 #[derive(Clone)]
 pub struct Persistence {
     pool: SqlitePool,
@@ -348,6 +377,243 @@ impl Persistence {
             updated_at,
         })
     }
+
+    pub async fn upsert_active_ban(&self, ban: &ActiveBanRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO active_bans (
+                peer_ip,
+                peer_port,
+                scope,
+                offence_number,
+                reason,
+                created_at,
+                expires_at,
+                reconciled_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_ip, peer_port, scope) DO UPDATE SET
+                offence_number = excluded.offence_number,
+                reason = excluded.reason,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                reconciled_at = excluded.reconciled_at
+            "#,
+        )
+        .bind(ban.peer_ip.to_string())
+        .bind(i64::from(ban.peer_port))
+        .bind(&ban.scope)
+        .bind(i64::from(ban.offence_number))
+        .bind(&ban.reason)
+        .bind(format_system_time(ban.created_at))
+        .bind(format_system_time(ban.expires_at))
+        .bind(ban.reconciled_at.map(format_system_time))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn load_active_bans(&self) -> Result<Vec<ActiveBanRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                peer_ip,
+                peer_port,
+                scope,
+                offence_number,
+                reason,
+                created_at,
+                expires_at,
+                reconciled_at
+            FROM active_bans
+            ORDER BY expires_at, peer_ip, peer_port, scope
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(decode_active_ban).collect()
+    }
+
+    pub async fn list_expired_active_bans(
+        &self,
+        as_of: SystemTime,
+    ) -> Result<Vec<ActiveBanRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                peer_ip,
+                peer_port,
+                scope,
+                offence_number,
+                reason,
+                created_at,
+                expires_at,
+                reconciled_at
+            FROM active_bans
+            WHERE expires_at <= ? AND reconciled_at IS NULL
+            ORDER BY expires_at, peer_ip, peer_port, scope
+            "#,
+        )
+        .bind(format_system_time(as_of))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(decode_active_ban).collect()
+    }
+
+    pub async fn mark_active_ban_reconciled(
+        &self,
+        peer_ip: IpAddr,
+        peer_port: u16,
+        scope: &str,
+        reconciled_at: SystemTime,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE active_bans
+            SET reconciled_at = ?
+            WHERE peer_ip = ? AND peer_port = ? AND scope = ?
+            "#,
+        )
+        .bind(format_system_time(reconciled_at))
+        .bind(peer_ip.to_string())
+        .bind(i64::from(peer_port))
+        .bind(scope)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_active_ban(
+        &self,
+        peer_ip: IpAddr,
+        peer_port: u16,
+        scope: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM active_bans WHERE peer_ip = ? AND peer_port = ? AND scope = ?",
+        )
+        .bind(peer_ip.to_string())
+        .bind(i64::from(peer_port))
+        .bind(scope)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn insert_peer_offence(&self, offence: &PeerOffenceRecord) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO peer_offences (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_seconds,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                banned_at,
+                ban_expires_at,
+                ban_revoked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&offence.torrent_hash)
+        .bind(offence.peer_ip.to_string())
+        .bind(i64::from(offence.peer_port))
+        .bind(i64::from(offence.offence_number))
+        .bind(&offence.reason_code)
+        .bind(i64::try_from(offence.observed_duration.as_secs())?)
+        .bind(i64::try_from(offence.bad_duration.as_secs())?)
+        .bind(f64::from(offence.progress_delta_per_mille) / 1000.0)
+        .bind(i64::try_from(offence.avg_up_rate_bps)?)
+        .bind(format_system_time(offence.banned_at))
+        .bind(format_system_time(offence.ban_expires_at))
+        .bind(offence.ban_revoked_at.map(format_system_time))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn load_peer_offences_by_ip(
+        &self,
+        peer_ip: IpAddr,
+    ) -> Result<Vec<PeerOffenceRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_seconds,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                banned_at,
+                ban_expires_at,
+                ban_revoked_at
+            FROM peer_offences
+            WHERE peer_ip = ?
+            ORDER BY offence_number, banned_at
+            "#,
+        )
+        .bind(peer_ip.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(decode_peer_offence).collect()
+    }
+
+    pub async fn load_offence_history(
+        &self,
+        identity: &OffenceIdentity,
+    ) -> Result<crate::types::OffenceHistory> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS offence_count,
+                MAX(ban_expires_at) AS last_ban_expires_at
+            FROM peer_offences
+            WHERE peer_ip = ?
+            "#,
+        )
+        .bind(identity.peer_ip.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(crate::types::OffenceHistory {
+            offence_count: u32::try_from(row.get::<i64, _>("offence_count"))?,
+            last_ban_expires_at: row
+                .get::<Option<String>, _>("last_ban_expires_at")
+                .map(|value| parse_system_time(&value))
+                .transpose()?,
+        })
+    }
+
+    pub async fn revoke_peer_offence(
+        &self,
+        offence_id: i64,
+        revoked_at: SystemTime,
+    ) -> Result<bool> {
+        let result = sqlx::query("UPDATE peer_offences SET ban_revoked_at = ? WHERE id = ?")
+            .bind(format_system_time(revoked_at))
+            .bind(offence_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 async fn apply_migration_1(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -584,6 +850,45 @@ fn decode_service_meta(row: sqlx::sqlite::SqliteRow) -> Result<ServiceMetaRecord
     })
 }
 
+fn decode_active_ban(row: sqlx::sqlite::SqliteRow) -> Result<ActiveBanRecord> {
+    Ok(ActiveBanRecord {
+        peer_ip: row.get::<String, _>("peer_ip").parse()?,
+        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
+        scope: row.get("scope"),
+        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
+        reason: row.get("reason"),
+        created_at: parse_system_time(&row.get::<String, _>("created_at"))?,
+        expires_at: parse_system_time(&row.get::<String, _>("expires_at"))?,
+        reconciled_at: row
+            .get::<Option<String>, _>("reconciled_at")
+            .map(|value| parse_system_time(&value))
+            .transpose()?,
+    })
+}
+
+fn decode_peer_offence(row: sqlx::sqlite::SqliteRow) -> Result<PeerOffenceRecord> {
+    Ok(PeerOffenceRecord {
+        id: Some(row.get("id")),
+        torrent_hash: row.get("torrent_hash"),
+        peer_ip: row.get::<String, _>("peer_ip").parse()?,
+        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
+        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
+        reason_code: row.get("reason_code"),
+        observed_duration: Duration::from_secs(u64::try_from(
+            row.get::<i64, _>("observed_seconds"),
+        )?),
+        bad_duration: Duration::from_secs(u64::try_from(row.get::<i64, _>("bad_seconds"))?),
+        progress_delta_per_mille: ((row.get::<f64, _>("progress_delta") * 1000.0).round()) as u32,
+        avg_up_rate_bps: u64::try_from(row.get::<i64, _>("avg_up_rate_bps"))?,
+        banned_at: parse_system_time(&row.get::<String, _>("banned_at"))?,
+        ban_expires_at: parse_system_time(&row.get::<String, _>("ban_expires_at"))?,
+        ban_revoked_at: row
+            .get::<Option<String>, _>("ban_revoked_at")
+            .map(|value| parse_system_time(&value))
+            .transpose()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -592,10 +897,15 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use super::{CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, Persistence};
+    use super::{
+        ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, PeerOffenceRecord,
+        Persistence,
+    };
     use crate::{
         config::DatabaseConfig,
-        types::{ExemptionReason, OffenceIdentity, PeerObservationId, PeerSessionState},
+        types::{
+            ExemptionReason, OffenceHistory, OffenceIdentity, PeerObservationId, PeerSessionState,
+        },
     };
 
     #[tokio::test]
@@ -687,6 +997,105 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_bans_round_trip_expiry_and_reconciliation() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let ban = sample_active_ban();
+
+        persistence.upsert_active_ban(&ban).await.unwrap();
+        let loaded = persistence.load_active_bans().await.unwrap();
+        assert_eq!(loaded, vec![ban.clone()]);
+
+        let expired_before = persistence
+            .list_expired_active_bans(UNIX_EPOCH + Duration::from_secs(3599))
+            .await
+            .unwrap();
+        assert!(expired_before.is_empty());
+
+        let expired_after = persistence
+            .list_expired_active_bans(UNIX_EPOCH + Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(expired_after, vec![ban.clone()]);
+
+        assert!(
+            persistence
+                .mark_active_ban_reconciled(
+                    ban.peer_ip,
+                    ban.peer_port,
+                    &ban.scope,
+                    UNIX_EPOCH + Duration::from_secs(3700),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            persistence
+                .list_expired_active_bans(UNIX_EPOCH + Duration::from_secs(4000))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            persistence
+                .delete_active_ban(ban.peer_ip, ban.peer_port, &ban.scope)
+                .await
+                .unwrap()
+        );
+        assert!(persistence.load_active_bans().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_offences_round_trip_history_and_revocation() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let first = sample_peer_offence(1, 3600);
+        let second = sample_peer_offence(2, 7200);
+
+        let first_id = persistence.insert_peer_offence(&first).await.unwrap();
+        let second_id = persistence.insert_peer_offence(&second).await.unwrap();
+
+        let offences = persistence
+            .load_peer_offences_by_ip(first.peer_ip)
+            .await
+            .unwrap();
+        assert_eq!(offences.len(), 2);
+        assert_eq!(offences[0].id, Some(first_id));
+        assert_eq!(offences[1].id, Some(second_id));
+        assert_eq!(offences[1].offence_number, 2);
+
+        let history = persistence
+            .load_offence_history(&OffenceIdentity {
+                peer_ip: first.peer_ip,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            history,
+            OffenceHistory {
+                offence_count: 2,
+                last_ban_expires_at: Some(UNIX_EPOCH + Duration::from_secs(7200)),
+            }
+        );
+
+        assert!(
+            persistence
+                .revoke_peer_offence(second_id, UNIX_EPOCH + Duration::from_secs(5400))
+                .await
+                .unwrap()
+        );
+        let offences = persistence
+            .load_peer_offences_by_ip(first.peer_ip)
+            .await
+            .unwrap();
+        assert_eq!(
+            offences[1].ban_revoked_at,
+            Some(UNIX_EPOCH + Duration::from_secs(5400))
         );
     }
 
@@ -789,6 +1198,37 @@ mod tests {
             }),
             bannable_since: Some(UNIX_EPOCH + Duration::from_secs(150)),
             last_ban_decision_at: Some(UNIX_EPOCH + Duration::from_secs(180)),
+        }
+    }
+
+    fn sample_active_ban() -> ActiveBanRecord {
+        ActiveBanRecord {
+            peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_port: 51413,
+            scope: "torrent:abc123".to_string(),
+            offence_number: 2,
+            reason: "slow peer".to_string(),
+            created_at: UNIX_EPOCH + Duration::from_secs(1800),
+            expires_at: UNIX_EPOCH + Duration::from_secs(3600),
+            reconciled_at: None,
+        }
+    }
+
+    fn sample_peer_offence(offence_number: u32, ban_expires_at_secs: u64) -> PeerOffenceRecord {
+        PeerOffenceRecord {
+            id: None,
+            torrent_hash: "abc123".to_string(),
+            peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_port: 51413,
+            offence_number,
+            reason_code: "slow_peer".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(480),
+            progress_delta_per_mille: 2,
+            avg_up_rate_bps: 512,
+            banned_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs.saturating_sub(1800)),
+            ban_expires_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs),
+            ban_revoked_at: None,
         }
     }
 }
