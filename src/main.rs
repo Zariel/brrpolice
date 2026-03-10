@@ -27,8 +27,9 @@ async fn main() -> Result<()> {
 
     let persistence = Arc::new(Persistence::connect(&config.database).await?);
     persistence.run_migrations().await?;
-
     let state = Arc::new(ServiceState::new());
+    state.mark_database_ready();
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let qbittorrent = Arc::new(QbittorrentClient::new(
@@ -38,6 +39,7 @@ async fn main() -> Result<()> {
         config.qbittorrent.request_timeout,
     )?);
     qbittorrent.authenticate().await?;
+    state.mark_qbittorrent_ready();
 
     let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
     let http_server = HttpServer::new(
@@ -46,10 +48,17 @@ async fn main() -> Result<()> {
         state.clone(),
         shutdown_rx.clone(),
     );
-    let control_loop = ControlLoop::new(config, persistence, qbittorrent, policy, shutdown_rx);
+    let control_loop = ControlLoop::new(
+        config,
+        persistence,
+        qbittorrent,
+        policy,
+        state.clone(),
+        shutdown_rx,
+    );
+    let _startup_snapshot = control_loop.recover_startup_state().await?;
 
-    state.mark_ready();
-    info!("startup complete");
+    info!("startup complete; waiting for poll loop readiness");
 
     let mut http_handle = tokio::spawn(async move { http_server.run().await });
     let mut control_handle = tokio::spawn(async move { control_loop.run().await });
