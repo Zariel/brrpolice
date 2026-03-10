@@ -97,11 +97,32 @@ pub struct PeerEvaluation {
     pub is_bannable: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffenceHistory {
+    pub offence_count: u32,
+    pub last_ban_expires_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BanDecision {
     pub peer_ip: IpAddr,
     pub peer_port: u16,
     pub offence_number: u32,
     pub ttl: Duration,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BanDisposition {
+    Exempt(ExemptionReason),
+    NotBannableYet {
+        observed_duration: Duration,
+        required_observation: Duration,
+        bad_duration: Duration,
+        required_bad_duration: Duration,
+    },
+    RebanCooldown {
+        remaining: Duration,
+    },
+    Ban(BanDecision),
 }

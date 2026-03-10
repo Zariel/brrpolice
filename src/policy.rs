@@ -11,8 +11,8 @@ use ipnet::IpNet;
 use crate::{
     config::{FiltersConfig, PolicyConfig},
     types::{
-        BanDecision, ExemptionReason, OffenceIdentity, PeerContext, PeerEvaluation,
-        PeerObservationId, PeerSessionState,
+        BanDecision, BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
+        PeerEvaluation, PeerObservationId, PeerSessionState,
     },
 };
 
@@ -245,6 +245,47 @@ impl PolicyEngine {
         }
     }
 
+    pub fn decide_ban(
+        &self,
+        peer: &PeerContext,
+        evaluation: &PeerEvaluation,
+        history: &OffenceHistory,
+    ) -> BanDisposition {
+        if let Some(exemption) = evaluation.session.last_exemption_reason.clone() {
+            return BanDisposition::Exempt(exemption);
+        }
+
+        if !evaluation.is_bannable {
+            return BanDisposition::NotBannableYet {
+                observed_duration: evaluation.session.observed_duration,
+                required_observation: self.config.min_observation_duration,
+                bad_duration: evaluation.session.bad_duration,
+                required_bad_duration: self.config.bad_for_duration,
+            };
+        }
+
+        if let Some(remaining) =
+            self.remaining_reban_cooldown(history.last_ban_expires_at, peer.observed_at)
+        {
+            return BanDisposition::RebanCooldown { remaining };
+        }
+
+        let offence_number = history.offence_count + 1;
+        BanDisposition::Ban(BanDecision {
+            peer_ip: peer.peer.ip,
+            peer_port: peer.peer.port,
+            offence_number,
+            ttl: self.ban_ttl_for_offence(offence_number),
+            reason: format!(
+                "slow peer: avg_up_rate_bps={} progress_delta={:.4} bad_seconds={} observed_seconds={}",
+                evaluation.session.rolling_avg_up_rate_bps,
+                evaluation.progress_delta,
+                evaluation.session.bad_duration.as_secs(),
+                evaluation.session.observed_duration.as_secs()
+            ),
+        })
+    }
+
     pub fn evaluate(&self) -> Vec<BanDecision> {
         Vec::new()
     }
@@ -310,6 +351,20 @@ impl PolicyEngine {
             / (previous_weight + sample_weight))
             .round() as u64
     }
+
+    fn remaining_reban_cooldown(
+        &self,
+        last_ban_expires_at: Option<SystemTime>,
+        observed_at: SystemTime,
+    ) -> Option<Duration> {
+        let expiry = last_ban_expires_at?;
+        let elapsed = observed_at.duration_since(expiry).unwrap_or_default();
+        if elapsed >= self.config.reban_cooldown {
+            return None;
+        }
+
+        Some(self.config.reban_cooldown - elapsed)
+    }
 }
 
 #[cfg(test)]
@@ -321,7 +376,10 @@ mod tests {
 
     use crate::{
         config::{FiltersConfig, PolicyConfig},
-        types::{ExemptionReason, PeerContext, PeerSessionState, PeerSnapshot, TorrentScope},
+        types::{
+            BanDisposition, ExemptionReason, OffenceHistory, PeerContext, PeerSessionState,
+            PeerSnapshot, TorrentScope,
+        },
     };
 
     use super::PolicyEngine;
@@ -552,8 +610,104 @@ mod tests {
         assert!(evaluation.is_bannable);
     }
 
+    #[test]
+    fn returns_not_bannable_until_thresholds_are_met() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(600);
+        config.bad_for_duration = Duration::from_secs(300);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
+
+        assert_eq!(
+            engine.decide_ban(&seeded_peer(120, 0.10, 500), &evaluation, &empty_history()),
+            BanDisposition::NotBannableYet {
+                observed_duration: Duration::from_secs(60),
+                required_observation: Duration::from_secs(600),
+                bad_duration: Duration::from_secs(60),
+                required_bad_duration: Duration::from_secs(300),
+            }
+        );
+    }
+
+    #[test]
+    fn returns_reban_cooldown_when_previous_ban_expired_recently() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        config.reban_cooldown = Duration::from_secs(300);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+
+        assert_eq!(
+            engine.decide_ban(
+                &peer,
+                &evaluation,
+                &OffenceHistory {
+                    offence_count: 1,
+                    last_ban_expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(120)),
+                }
+            ),
+            BanDisposition::RebanCooldown {
+                remaining: Duration::from_secs(240),
+            }
+        );
+    }
+
+    #[test]
+    fn selects_ban_ladder_ttl_from_prior_offence_count() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+
+        match engine.decide_ban(
+            &peer,
+            &evaluation,
+            &OffenceHistory {
+                offence_count: 2,
+                last_ban_expires_at: None,
+            },
+        ) {
+            BanDisposition::Ban(decision) => {
+                assert_eq!(decision.offence_number, 3);
+                assert_eq!(decision.ttl, Duration::from_secs(24 * 60 * 60));
+                assert_eq!(decision.peer_ip, peer.peer.ip);
+                assert_eq!(decision.peer_port, peer.peer.port);
+                assert!(decision.reason.contains("slow peer"));
+            }
+            other => panic!("expected ban decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_exemption_before_ban_decision() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(300);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = test_peer();
+        let evaluation = engine.evaluate_peer(&peer, None);
+
+        assert!(matches!(
+            engine.decide_ban(&peer, &evaluation, &empty_history()),
+            BanDisposition::Exempt(ExemptionReason::NewPeerGracePeriod { .. })
+        ));
+    }
+
     fn test_peer() -> PeerContext {
         seeded_peer(120, 0.25, 1024)
+    }
+
+    fn empty_history() -> OffenceHistory {
+        OffenceHistory {
+            offence_count: 0,
+            last_ban_expires_at: None,
+        }
     }
 
     fn seeded_peer(observed_secs: u64, progress: f64, up_rate_bps: u64) -> PeerContext {
