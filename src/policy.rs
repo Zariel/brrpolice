@@ -10,7 +10,10 @@ use ipnet::IpNet;
 
 use crate::{
     config::{FiltersConfig, PolicyConfig},
-    types::{BanDecision, ExemptionReason, OffenceIdentity, PeerContext, PeerObservationId},
+    types::{
+        BanDecision, ExemptionReason, OffenceIdentity, PeerContext, PeerEvaluation,
+        PeerObservationId, PeerSessionState,
+    },
 };
 
 #[derive(Clone)]
@@ -111,6 +114,137 @@ impl PolicyEngine {
             })
     }
 
+    pub fn begin_session(
+        &self,
+        peer: &PeerContext,
+        carryover: Option<&PeerSessionState>,
+    ) -> PeerSessionState {
+        let observation_id = self.peer_observation_id(peer);
+        let offence_identity = self.offence_identity(peer);
+        let mut session = PeerSessionState {
+            observation_id: observation_id.clone(),
+            offence_identity: offence_identity.clone(),
+            first_seen_at: peer.first_seen_at,
+            last_seen_at: peer.observed_at,
+            baseline_progress: peer.peer.progress,
+            latest_progress: peer.peer.progress,
+            rolling_avg_up_rate_bps: peer.peer.up_rate_bps,
+            observed_duration: peer
+                .observed_at
+                .duration_since(peer.first_seen_at)
+                .unwrap_or_default(),
+            bad_duration: Duration::ZERO,
+            sample_count: 1,
+            last_torrent_seeder_count: peer.torrent.total_seeders,
+            last_exemption_reason: self.classify_exemption(peer),
+        };
+
+        if let Some(previous) = carryover.filter(|previous| {
+            self.can_carry_over(previous, &observation_id, &offence_identity, peer)
+        }) {
+            let gap = peer
+                .observed_at
+                .duration_since(previous.last_seen_at)
+                .unwrap_or_default();
+            session.first_seen_at = previous.first_seen_at;
+            session.baseline_progress = previous.baseline_progress.min(peer.peer.progress);
+            session.rolling_avg_up_rate_bps = previous.rolling_avg_up_rate_bps;
+            session.observed_duration = previous.observed_duration;
+            session.bad_duration = self.decay_bad_duration(previous.bad_duration, gap);
+            session.sample_count = previous.sample_count + 1;
+            session.last_exemption_reason = self.classify_exemption(peer);
+        }
+
+        session
+    }
+
+    pub fn evaluate_peer(
+        &self,
+        peer: &PeerContext,
+        existing: Option<&PeerSessionState>,
+    ) -> PeerEvaluation {
+        if existing.is_none() {
+            let mut session = self.begin_session(peer, None);
+            let sample_duration = peer
+                .observed_at
+                .duration_since(peer.first_seen_at)
+                .unwrap_or_default();
+            let progress_delta = 0.0;
+            let exemption = session.last_exemption_reason.clone();
+            let is_bad_sample = exemption.is_none()
+                && peer.peer.up_rate_bps < self.config.slow_rate_bps
+                && progress_delta < self.config.min_progress_delta;
+            if is_bad_sample {
+                session.bad_duration = sample_duration;
+            }
+
+            let is_bannable = exemption.is_none()
+                && session.observed_duration >= self.config.min_observation_duration
+                && session.bad_duration >= self.config.bad_for_duration;
+
+            return PeerEvaluation {
+                session,
+                progress_delta,
+                sample_duration,
+                sample_up_rate_bps: peer.peer.up_rate_bps,
+                is_bad_sample,
+                is_bannable,
+            };
+        }
+
+        let previous = existing
+            .cloned()
+            .unwrap_or_else(|| self.begin_session(peer, None));
+
+        let sample_duration = peer
+            .observed_at
+            .duration_since(previous.last_seen_at)
+            .unwrap_or_default();
+        let progress_delta = (peer.peer.progress - previous.latest_progress).max(0.0);
+        let exemption = self.classify_exemption(peer);
+        let is_bad_sample = exemption.is_none()
+            && peer.peer.up_rate_bps < self.config.slow_rate_bps
+            && progress_delta < self.config.min_progress_delta;
+        let observed_duration = previous.observed_duration + sample_duration;
+        let mut bad_duration = self.decay_bad_duration(previous.bad_duration, sample_duration);
+        if is_bad_sample {
+            bad_duration += sample_duration;
+        }
+
+        let session = PeerSessionState {
+            observation_id: self.peer_observation_id(peer),
+            offence_identity: self.offence_identity(peer),
+            first_seen_at: previous.first_seen_at,
+            last_seen_at: peer.observed_at,
+            baseline_progress: previous.baseline_progress,
+            latest_progress: peer.peer.progress,
+            rolling_avg_up_rate_bps: self.weighted_rate(
+                previous.rolling_avg_up_rate_bps,
+                previous.observed_duration,
+                peer.peer.up_rate_bps,
+                sample_duration,
+            ),
+            observed_duration,
+            bad_duration,
+            sample_count: previous.sample_count + 1,
+            last_torrent_seeder_count: peer.torrent.total_seeders,
+            last_exemption_reason: exemption.clone(),
+        };
+
+        let is_bannable = exemption.is_none()
+            && observed_duration >= self.config.min_observation_duration
+            && bad_duration >= self.config.bad_for_duration;
+
+        PeerEvaluation {
+            session,
+            progress_delta,
+            sample_duration,
+            sample_up_rate_bps: peer.peer.up_rate_bps,
+            is_bad_sample,
+            is_bannable,
+        }
+    }
+
     pub fn evaluate(&self) -> Vec<BanDecision> {
         Vec::new()
     }
@@ -126,6 +260,56 @@ impl PolicyEngine {
             .unwrap_or_default()
             < self.config.new_peer_grace_period
     }
+
+    fn can_carry_over(
+        &self,
+        previous: &PeerSessionState,
+        observation_id: &PeerObservationId,
+        offence_identity: &OffenceIdentity,
+        peer: &PeerContext,
+    ) -> bool {
+        previous.observation_id != *observation_id
+            && previous.observation_id.torrent_hash == observation_id.torrent_hash
+            && previous.offence_identity == *offence_identity
+            && peer.observed_at >= previous.last_seen_at
+            && peer
+                .observed_at
+                .duration_since(previous.last_seen_at)
+                .unwrap_or_default()
+                <= self.config.decay_window
+    }
+
+    fn decay_bad_duration(&self, bad_duration: Duration, elapsed: Duration) -> Duration {
+        if bad_duration.is_zero() || elapsed.is_zero() {
+            return bad_duration;
+        }
+
+        let decay_ratio =
+            self.config.bad_for_duration.as_secs_f64() / self.config.decay_window.as_secs_f64();
+        let decay = elapsed.mul_f64(decay_ratio);
+        bad_duration.saturating_sub(decay)
+    }
+
+    fn weighted_rate(
+        &self,
+        previous_rate: u64,
+        previous_duration: Duration,
+        sample_rate: u64,
+        sample_duration: Duration,
+    ) -> u64 {
+        if sample_duration.is_zero() {
+            return previous_rate.max(sample_rate);
+        }
+        if previous_duration.is_zero() {
+            return sample_rate;
+        }
+
+        let previous_weight = previous_duration.as_secs_f64();
+        let sample_weight = sample_duration.as_secs_f64();
+        ((((previous_rate as f64) * previous_weight) + ((sample_rate as f64) * sample_weight))
+            / (previous_weight + sample_weight))
+            .round() as u64
+    }
 }
 
 #[cfg(test)]
@@ -137,7 +321,7 @@ mod tests {
 
     use crate::{
         config::{FiltersConfig, PolicyConfig},
-        types::{ExemptionReason, PeerContext, PeerSnapshot, TorrentScope},
+        types::{ExemptionReason, PeerContext, PeerSessionState, PeerSnapshot, TorrentScope},
     };
 
     use super::PolicyEngine;
@@ -226,7 +410,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn accumulates_bad_time_until_peer_is_bannable() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(300);
+        config.bad_for_duration = Duration::from_secs(180);
+        config.decay_window = Duration::from_secs(600);
+        config.slow_rate_bps = 1_000;
+        config.min_progress_delta = 0.01;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let initial = seeded_peer(0, 0.10, 500);
+        let mut session = engine.begin_session(&initial, None);
+
+        for offset in [120, 240] {
+            let evaluation =
+                engine.evaluate_peer(&seeded_peer(offset, 0.1005, 500), Some(&session));
+            assert!(evaluation.is_bad_sample);
+            assert!(!evaluation.is_bannable);
+            session = evaluation.session;
+        }
+
+        let evaluation = engine.evaluate_peer(&seeded_peer(360, 0.1010, 500), Some(&session));
+        assert!(evaluation.is_bad_sample);
+        assert!(evaluation.is_bannable);
+        assert_eq!(
+            evaluation.session.observed_duration,
+            Duration::from_secs(360)
+        );
+        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(288));
+    }
+
+    #[test]
+    fn decays_bad_time_when_peer_improves() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.bad_for_duration = Duration::from_secs(300);
+        config.decay_window = Duration::from_secs(600);
+        config.min_progress_delta = 0.01;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let mut session = PeerSessionState {
+            observation_id: PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default())
+                .peer_observation_id(&seeded_peer(0, 0.10, 500)),
+            offence_identity: engine.offence_identity(&seeded_peer(0, 0.10, 500)),
+            first_seen_at: SystemTime::UNIX_EPOCH,
+            last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(300),
+            baseline_progress: 0.10,
+            latest_progress: 0.10,
+            rolling_avg_up_rate_bps: 500,
+            observed_duration: Duration::from_secs(300),
+            bad_duration: Duration::from_secs(300),
+            sample_count: 3,
+            last_torrent_seeder_count: 5,
+            last_exemption_reason: None,
+        };
+
+        let evaluation = engine.evaluate_peer(&seeded_peer(420, 0.13, 2_000), Some(&session));
+        assert!(!evaluation.is_bad_sample);
+        assert!(!evaluation.is_bannable);
+        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(240));
+        session = evaluation.session;
+
+        let second = engine.evaluate_peer(&seeded_peer(720, 0.20, 2_000), Some(&session));
+        assert_eq!(second.session.bad_duration, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn carries_over_state_across_reconnect_on_new_port() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.bad_for_duration = Duration::from_secs(300);
+        config.decay_window = Duration::from_secs(600);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let mut peer = seeded_peer(120, 0.10, 500);
+        let previous = PeerSessionState {
+            observation_id: engine.peer_observation_id(&peer),
+            offence_identity: engine.offence_identity(&peer),
+            first_seen_at: SystemTime::UNIX_EPOCH,
+            last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
+            baseline_progress: 0.10,
+            latest_progress: 0.12,
+            rolling_avg_up_rate_bps: 400,
+            observed_duration: Duration::from_secs(120),
+            bad_duration: Duration::from_secs(120),
+            sample_count: 2,
+            last_torrent_seeder_count: 5,
+            last_exemption_reason: None,
+        };
+
+        peer.peer.port = 51414;
+        peer.observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(240);
+
+        let resumed = engine.begin_session(&peer, Some(&previous));
+        assert_eq!(resumed.observation_id.peer_port, 51414);
+        assert_eq!(resumed.offence_identity, previous.offence_identity);
+        assert_eq!(resumed.observed_duration, Duration::from_secs(120));
+        assert_eq!(resumed.bad_duration, Duration::from_secs(60));
+        assert_eq!(resumed.sample_count, 3);
+        assert_eq!(resumed.first_seen_at, previous.first_seen_at);
+    }
+
+    #[test]
+    fn does_not_mark_exempt_samples_as_bad() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(300);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let initial = test_peer();
+        let session = engine.begin_session(&initial, None);
+
+        let evaluation = engine.evaluate_peer(&test_peer(), Some(&session));
+        assert!(!evaluation.is_bad_sample);
+        assert!(!evaluation.is_bannable);
+        assert!(matches!(
+            evaluation.session.last_exemption_reason,
+            Some(ExemptionReason::NewPeerGracePeriod { .. })
+        ));
+    }
+
+    #[test]
+    fn supports_first_evaluation_without_seeded_session() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        config.decay_window = Duration::from_secs(600);
+        config.min_progress_delta = 0.01;
+        config.slow_rate_bps = 1_000;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
+        assert_eq!(evaluation.session.sample_count, 1);
+        assert_eq!(
+            evaluation.session.observed_duration,
+            Duration::from_secs(60)
+        );
+        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(60));
+        assert!(evaluation.is_bad_sample);
+        assert!(evaluation.is_bannable);
+    }
+
     fn test_peer() -> PeerContext {
+        seeded_peer(120, 0.25, 1024)
+    }
+
+    fn seeded_peer(observed_secs: u64, progress: f64, up_rate_bps: u64) -> PeerContext {
         PeerContext {
             torrent: TorrentScope {
                 hash: "abc123".to_string(),
@@ -238,11 +568,11 @@ mod tests {
             peer: PeerSnapshot {
                 ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
                 port: 51413,
-                progress: 0.25,
-                up_rate_bps: 1024,
+                progress,
+                up_rate_bps,
             },
             first_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
-            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(observed_secs),
             has_active_ban: false,
         }
     }

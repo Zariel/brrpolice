@@ -53,6 +53,22 @@ pub struct PeerContext {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PeerSessionState {
+    pub observation_id: PeerObservationId,
+    pub offence_identity: OffenceIdentity,
+    pub first_seen_at: SystemTime,
+    pub last_seen_at: SystemTime,
+    pub baseline_progress: f64,
+    pub latest_progress: f64,
+    pub rolling_avg_up_rate_bps: u64,
+    pub observed_duration: Duration,
+    pub bad_duration: Duration,
+    pub sample_count: u32,
+    pub last_torrent_seeder_count: u32,
+    pub last_exemption_reason: Option<ExemptionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExemptionReason {
     TorrentExcluded,
     InsufficientSeeders {
@@ -69,6 +85,16 @@ pub enum ExemptionReason {
         grace_period: Duration,
     },
     AlreadyBanned,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerEvaluation {
+    pub session: PeerSessionState,
+    pub progress_delta: f64,
+    pub sample_duration: Duration,
+    pub sample_up_rate_bps: u64,
+    pub is_bad_sample: bool,
+    pub is_bannable: bool,
 }
 
 #[derive(Debug, Clone)]
