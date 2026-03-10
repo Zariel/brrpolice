@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, net::IpAddr, time::Duration};
 
-use anyhow::{Context, Result};
-use reqwest::{Client, Url};
+use anyhow::{Context, Result, bail};
+use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -26,7 +26,10 @@ pub struct QbittorrentClient {
 impl QbittorrentClient {
     pub fn new(config: QbittorrentConfig, timeout: Duration) -> Result<Self> {
         let base_url = Url::parse(&config.base_url).context("invalid qbittorrent.base_url")?;
-        let client = Client::builder().timeout(timeout).build()?;
+        let client = Client::builder()
+            .cookie_store(true)
+            .timeout(timeout)
+            .build()?;
 
         Ok(Self {
             config,
@@ -36,23 +39,88 @@ impl QbittorrentClient {
     }
 
     pub async fn authenticate(&self) -> Result<()> {
-        let _password = env::var(&self.config.password_env).with_context(|| {
+        let password = env::var(&self.config.password_env).with_context(|| {
             format!(
                 "missing qbittorrent password env `{}`",
                 self.config.password_env
             )
         })?;
+        let response = self
+            .client
+            .post(self.api_url(AUTH_LOGIN_PATH)?)
+            .form(&[
+                ("username", self.config.username.as_str()),
+                ("password", password.as_str()),
+            ])
+            .send()
+            .await
+            .context("qbittorrent login request failed")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read qbittorrent login response")?;
+        if status != StatusCode::OK || body.trim() != "Ok." {
+            bail!(
+                "qbittorrent login failed: status={} body={}",
+                status,
+                body.trim()
+            );
+        }
         debug!(
             login_url = %self.api_url(AUTH_LOGIN_PATH)?,
             base_url = %self.base_url,
-            "qbittorrent authentication placeholder"
+            "qbittorrent authentication succeeded"
         );
-        let _ = &self.client;
         Ok(())
     }
 
     pub async fn list_in_scope_torrents(&self) -> Result<Vec<TorrentSummary>> {
         Ok(Vec::new())
+    }
+
+    async fn authenticated_get_text(&self, url: Url) -> Result<String> {
+        let response = self
+            .send_authenticated(|| self.client.get(url.clone()))
+            .await?;
+        response
+            .text()
+            .await
+            .context("failed to read qbittorrent response body")
+    }
+
+    async fn send_authenticated<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        let response = build().send().await.context("qbittorrent request failed")?;
+        if response.status() == StatusCode::FORBIDDEN {
+            self.authenticate().await?;
+            let retried = build()
+                .send()
+                .await
+                .context("qbittorrent authenticated retry failed")?;
+            return Self::ensure_success(retried).await;
+        }
+
+        Self::ensure_success(response).await
+    }
+
+    async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        bail!(
+            "qbittorrent request failed: status={} body={}",
+            status,
+            body.trim()
+        );
     }
 
     fn api_url(&self, path: &str) -> Result<Url> {
@@ -169,7 +237,15 @@ fn split_tags(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        env, io,
+        net::{IpAddr, Ipv4Addr},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::{
         APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, QbPeer, QbTorrentPeersResponse,
@@ -361,5 +437,153 @@ mod tests {
             std::time::Duration::from_secs(10),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticate_posts_credentials_and_accepts_ok_response() {
+        let (base_url, server) = spawn_server(vec![ExpectedRequest {
+            method: "POST",
+            path: "/api/v2/auth/login",
+            must_contain: vec!["username=admin", "password=secret"],
+            response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+        }])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_test_client(&base_url);
+        client.authenticate().await.unwrap();
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_retry_after_login_and_reuse_cookie() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/version",
+                must_contain: vec![],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/version",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n5.0.4",
+            },
+        ])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_test_client(&base_url);
+        let version = client
+            .authenticated_get_text(client.api_url(APP_VERSION_PATH).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(version, "5.0.4");
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct ExpectedRequest {
+        method: &'static str,
+        path: &'static str,
+        must_contain: Vec<&'static str>,
+        response: &'static str,
+    }
+
+    async fn spawn_server(
+        expected_requests: Vec<ExpectedRequest>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for expected in expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                assert!(request.starts_with(&format!("{} {} ", expected.method, expected.path)));
+                for needle in expected.must_contain {
+                    assert!(
+                        request.contains(needle),
+                        "request missing `{needle}`: {request}"
+                    );
+                }
+                stream
+                    .write_all(expected.response.as_bytes())
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        (format!("http://{address}/"), handle)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> io::Result<String> {
+        let mut buffer = Vec::new();
+        let mut header = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut header).await?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&header[..read]);
+            if let Some(request) = complete_request(&buffer) {
+                return Ok(request);
+            }
+        }
+        Ok(String::from_utf8_lossy(&buffer).to_string())
+    }
+
+    fn complete_request(buffer: &[u8]) -> Option<String> {
+        let marker = b"\r\n\r\n";
+        let header_end = buffer
+            .windows(marker.len())
+            .position(|window| window == marker)?;
+        let header_end = header_end + marker.len();
+        let request = String::from_utf8_lossy(buffer).to_string();
+        let content_length = request
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if buffer.len() >= header_end + content_length {
+            Some(request)
+        } else {
+            None
+        }
+    }
+
+    fn network_test_client(base_url: &str) -> QbittorrentClient {
+        QbittorrentClient::new(
+            QbittorrentConfig {
+                base_url: base_url.to_string(),
+                username: "admin".to_string(),
+                password_env: "QBITTORRENT_PASSWORD".to_string(),
+                poll_interval: std::time::Duration::from_secs(30),
+                request_timeout: std::time::Duration::from_secs(10),
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+
+    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            unsafe { env::set_var(key, value) };
+        } else {
+            unsafe { env::remove_var(key) };
+        }
     }
 }
