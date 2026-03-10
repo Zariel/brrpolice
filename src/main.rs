@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     )?);
     qbittorrent.authenticate().await?;
 
-    let policy = Arc::new(PolicyEngine::new(config.policy.clone()));
+    let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
     let http_server = HttpServer::new(
         config.clone(),
         persistence.clone(),
