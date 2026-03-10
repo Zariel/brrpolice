@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, net::IpAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
@@ -7,7 +12,7 @@ use tracing::debug;
 
 use crate::{
     config::{FiltersConfig, QbittorrentConfig},
-    types::TorrentSummary,
+    types::{PeerObservationId, PeerSnapshot, TorrentPeer, TorrentSummary},
 };
 
 const AUTH_LOGIN_PATH: &str = "api/v2/auth/login";
@@ -93,6 +98,12 @@ impl QbittorrentClient {
         let body = self.authenticated_get_text(url).await?;
         let torrents = self.parse_torrents(&body)?;
         Ok(self.filter_in_scope_torrents(torrents))
+    }
+
+    pub async fn list_torrent_peers(&self, torrent_hash: &str) -> Result<Vec<TorrentPeer>> {
+        let url = self.torrent_peers_url(torrent_hash, 0)?;
+        let body = self.authenticated_get_text(url).await?;
+        self.normalize_torrent_peers(torrent_hash, &body)
     }
 
     async fn authenticated_get_text(&self, url: Url) -> Result<String> {
@@ -221,6 +232,54 @@ impl QbittorrentClient {
         serde_json::from_str(body).context("invalid torrent peers payload")
     }
 
+    fn normalize_torrent_peers(&self, torrent_hash: &str, body: &str) -> Result<Vec<TorrentPeer>> {
+        let peers = self.parse_torrent_peers(body)?;
+        let mut normalized = peers
+            .peers
+            .into_iter()
+            .map(|(peer_key, peer)| self.normalize_peer(torrent_hash, &peer_key, peer))
+            .collect::<Result<Vec<_>>>()?;
+        normalized.sort_by(|left, right| {
+            left.observation_id
+                .peer_ip
+                .cmp(&right.observation_id.peer_ip)
+                .then(left.observation_id.peer_port.cmp(&right.observation_id.peer_port))
+        });
+        Ok(normalized)
+    }
+
+    fn normalize_peer(&self, torrent_hash: &str, peer_key: &str, peer: QbPeer) -> Result<TorrentPeer> {
+        let ip = peer
+            .ip
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid peer ip `{}`", peer.ip))?;
+        if let Some(address) = parse_peer_key(peer_key) {
+            if address.ip() != ip || address.port() != peer.port {
+                bail!(
+                    "peer key `{peer_key}` does not match body endpoint `{ip}:{}`",
+                    peer.port
+                );
+            }
+        }
+        let client_name = empty_string_to_none(peer.client.trim().to_string());
+        let peer = PeerSnapshot {
+            ip,
+            port: peer.port,
+            progress: peer.progress.clamp(0.0, 1.0),
+            up_rate_bps: peer.up_speed,
+        };
+
+        Ok(TorrentPeer {
+            observation_id: PeerObservationId {
+                torrent_hash: torrent_hash.to_string(),
+                peer_ip: peer.ip,
+                peer_port: peer.port,
+            },
+            peer,
+            client_name,
+        })
+    }
+
     fn encode_ban_peers(&self, peers: &[(IpAddr, u16)]) -> String {
         peers
             .iter()
@@ -296,6 +355,10 @@ fn matches_list(value: Option<&str>, filter_values: &[String]) -> bool {
         .is_some_and(|entry| filter_values.iter().any(|candidate| candidate == entry))
 }
 
+fn parse_peer_key(key: &str) -> Option<SocketAddr> {
+    key.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -311,11 +374,11 @@ mod tests {
     use super::{
         APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, QbPeer, QbTorrentPeersResponse,
         QbittorrentClient, SYNC_TORRENT_PEERS_PATH, TORRENTS_INFO_PATH, TRANSFER_BAN_PEERS_PATH,
-        WEBAPI_VERSION_PATH,
+        WEBAPI_VERSION_PATH, parse_peer_key,
     };
     use crate::{
         config::{FiltersConfig, QbittorrentConfig},
-        types::TorrentSummary,
+        types::{PeerObservationId, TorrentSummary},
     };
 
     #[test]
@@ -508,6 +571,133 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_torrent_peers_into_internal_models() {
+        let client = test_client();
+        let peers = client
+            .normalize_torrent_peers(
+                "abc123",
+                r#"{
+                    "rid": 15,
+                    "peers": {
+                        "10.0.0.11:51414": {
+                            "client": " qBittorrent/5.0.0 ",
+                            "ip": "10.0.0.11",
+                            "port": 51414,
+                            "progress": 1.2,
+                            "dl_speed": 0,
+                            "up_speed": 32768
+                        },
+                        "10.0.0.10:51413": {
+                            "client": "",
+                            "ip": "10.0.0.10",
+                            "port": 51413,
+                            "progress": -0.2,
+                            "dl_speed": 0,
+                            "up_speed": 16384
+                        }
+                    }
+                }"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| peer.observation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "10.0.0.10".parse().unwrap(),
+                    peer_port: 51413,
+                },
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "10.0.0.11".parse().unwrap(),
+                    peer_port: 51414,
+                },
+            ]
+        );
+        assert_eq!(peers[0].peer.progress, 0.0);
+        assert_eq!(peers[0].peer.up_rate_bps, 16384);
+        assert_eq!(peers[0].client_name, None);
+        assert_eq!(peers[1].peer.progress, 1.0);
+        assert_eq!(peers[1].peer.up_rate_bps, 32768);
+        assert_eq!(peers[1].client_name.as_deref(), Some("qBittorrent/5.0.0"));
+    }
+
+    #[test]
+    fn rejects_invalid_peer_ip_during_normalization() {
+        let client = test_client();
+        let error = client
+            .normalize_torrent_peers(
+                "abc123",
+                r#"{
+                    "rid": 15,
+                    "peers": {
+                        "not-an-ip:51413": {
+                            "client": "qBittorrent/5.0.0",
+                            "ip": "not-an-ip",
+                            "port": 51413,
+                            "progress": 0.42,
+                            "dl_speed": 32768,
+                            "up_speed": 65536
+                        }
+                    }
+                }"#,
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid peer ip `not-an-ip`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_peer_key_during_normalization() {
+        let client = test_client();
+        let error = client
+            .normalize_torrent_peers(
+                "abc123",
+                r#"{
+                    "rid": 15,
+                    "peers": {
+                        "10.0.0.10:51413": {
+                            "client": "qBittorrent/5.0.0",
+                            "ip": "10.0.0.11",
+                            "port": 51413,
+                            "progress": 0.42,
+                            "dl_speed": 32768,
+                            "up_speed": 65536
+                        }
+                    }
+                }"#,
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("peer key `10.0.0.10:51413` does not match body endpoint `10.0.0.11:51413`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn parses_peer_keys_when_qbittorrent_uses_socket_addresses() {
+        assert_eq!(
+            parse_peer_key("10.0.0.10:51413"),
+            Some("10.0.0.10:51413".parse().unwrap())
+        );
+        assert_eq!(
+            parse_peer_key("[2001:db8::1]:51413"),
+            Some("[2001:db8::1]:51413".parse().unwrap())
+        );
+        assert_eq!(parse_peer_key("not-a-socket"), None);
+    }
+
+    #[test]
     fn encodes_ban_peers_and_banned_ip_preferences() {
         let client = test_client();
 
@@ -664,6 +854,63 @@ mod tests {
             torrents.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_torrent_peers_requests_sync_endpoint_and_normalizes_peers() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
+                must_contain: vec![],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.42,\"dl_speed\":32768,\"up_speed\":65536},\"10.0.0.11:51414\":{\"client\":\"\",\"ip\":\"10.0.0.11\",\"port\":51414,\"progress\":0.9,\"dl_speed\":1024,\"up_speed\":2048}},\"peers_removed\":[]}",
+            },
+        ])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_test_client(&base_url);
+        let peers = client.list_torrent_peers("abc123").await.unwrap();
+
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| peer.observation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "10.0.0.10".parse().unwrap(),
+                    peer_port: 51413,
+                },
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "10.0.0.11".parse().unwrap(),
+                    peer_port: 51414,
+                },
+            ]
+        );
+        assert_eq!(
+            peers[0].client_name.as_deref(),
+            Some("qBittorrent/5.0.0")
+        );
+        assert_eq!(peers[1].client_name, None);
 
         restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();

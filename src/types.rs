@@ -31,6 +31,13 @@ pub struct PeerSnapshot {
     pub up_rate_bps: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TorrentPeer {
+    pub observation_id: PeerObservationId,
+    pub peer: PeerSnapshot,
+    pub client_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerObservationId {
     pub torrent_hash: String,
