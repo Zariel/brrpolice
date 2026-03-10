@@ -33,6 +33,8 @@ async fn main() -> Result<()> {
 
     let qbittorrent = Arc::new(QbittorrentClient::new(
         config.qbittorrent.clone(),
+        config.filters.clone(),
+        config.policy.min_total_seeders,
         config.qbittorrent.request_timeout,
     )?);
     qbittorrent.authenticate().await?;

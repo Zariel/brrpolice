@@ -5,7 +5,10 @@ use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::{config::QbittorrentConfig, types::TorrentSummary};
+use crate::{
+    config::{FiltersConfig, QbittorrentConfig},
+    types::TorrentSummary,
+};
 
 const AUTH_LOGIN_PATH: &str = "api/v2/auth/login";
 const APP_VERSION_PATH: &str = "api/v2/app/version";
@@ -19,12 +22,19 @@ const TRANSFER_BAN_PEERS_PATH: &str = "api/v2/transfer/banPeers";
 #[derive(Clone)]
 pub struct QbittorrentClient {
     config: QbittorrentConfig,
+    filters: FiltersConfig,
+    min_total_seeders: u32,
     client: Client,
     base_url: Url,
 }
 
 impl QbittorrentClient {
-    pub fn new(config: QbittorrentConfig, timeout: Duration) -> Result<Self> {
+    pub fn new(
+        config: QbittorrentConfig,
+        filters: FiltersConfig,
+        min_total_seeders: u32,
+        timeout: Duration,
+    ) -> Result<Self> {
         let base_url = Url::parse(&config.base_url).context("invalid qbittorrent.base_url")?;
         let client = Client::builder()
             .cookie_store(true)
@@ -33,6 +43,8 @@ impl QbittorrentClient {
 
         Ok(Self {
             config,
+            filters,
+            min_total_seeders,
             client,
             base_url,
         })
@@ -76,7 +88,11 @@ impl QbittorrentClient {
     }
 
     pub async fn list_in_scope_torrents(&self) -> Result<Vec<TorrentSummary>> {
-        Ok(Vec::new())
+        let mut url = self.torrent_info_url()?;
+        url.query_pairs_mut().append_pair("filter", "seeding");
+        let body = self.authenticated_get_text(url).await?;
+        let torrents = self.parse_torrents(&body)?;
+        Ok(self.filter_in_scope_torrents(torrents))
     }
 
     async fn authenticated_get_text(&self, url: Url) -> Result<String> {
@@ -164,6 +180,43 @@ impl QbittorrentClient {
             .collect())
     }
 
+    fn filter_in_scope_torrents(&self, torrents: Vec<TorrentSummary>) -> Vec<TorrentSummary> {
+        torrents
+            .into_iter()
+            .filter(|torrent| self.is_torrent_in_scope(torrent))
+            .collect()
+    }
+
+    fn is_torrent_in_scope(&self, torrent: &TorrentSummary) -> bool {
+        if torrent.total_seeders < self.min_total_seeders {
+            return false;
+        }
+
+        if matches_list(torrent.category.as_deref(), &self.filters.exclude_categories) {
+            return false;
+        }
+
+        if torrent
+            .tags
+            .iter()
+            .any(|tag| matches_list(Some(tag.as_str()), &self.filters.exclude_tags))
+        {
+            return false;
+        }
+
+        let has_include_rules = !self.filters.include_categories.is_empty()
+            || !self.filters.include_tags.is_empty();
+        if !has_include_rules {
+            return true;
+        }
+
+        matches_list(torrent.category.as_deref(), &self.filters.include_categories)
+            || torrent
+                .tags
+                .iter()
+                .any(|tag| matches_list(Some(tag.as_str()), &self.filters.include_tags))
+    }
+
     fn parse_torrent_peers(&self, body: &str) -> Result<QbTorrentPeersResponse> {
         serde_json::from_str(body).context("invalid torrent peers payload")
     }
@@ -230,9 +283,17 @@ fn empty_string_to_none(value: String) -> Option<String> {
 fn split_tags(value: &str) -> Vec<String> {
     value
         .split(',')
+        .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn matches_list(value: Option<&str>, filter_values: &[String]) -> bool {
+    value
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .is_some_and(|entry| filter_values.iter().any(|candidate| candidate == entry))
 }
 
 #[cfg(test)]
@@ -252,7 +313,10 @@ mod tests {
         QbittorrentClient, SYNC_TORRENT_PEERS_PATH, TORRENTS_INFO_PATH, TRANSFER_BAN_PEERS_PATH,
         WEBAPI_VERSION_PATH,
     };
-    use crate::config::QbittorrentConfig;
+    use crate::{
+        config::{FiltersConfig, QbittorrentConfig},
+        types::TorrentSummary,
+    };
 
     #[test]
     fn builds_expected_contract_endpoints() {
@@ -330,6 +394,47 @@ mod tests {
         assert_eq!(torrents[0].total_seeders, 17);
         assert_eq!(torrents[1].category, None);
         assert!(torrents[1].tags.is_empty());
+    }
+
+    #[test]
+    fn filters_torrents_by_scope_rules() {
+        let client = scoped_test_client(FiltersConfig {
+            include_categories: vec!["tv".to_string()],
+            exclude_categories: vec!["linux".to_string()],
+            include_tags: vec!["keep".to_string()],
+            exclude_tags: vec!["skip".to_string()],
+            allowlist_peer_ips: vec![],
+            allowlist_peer_cidrs: vec![],
+        });
+
+        let filtered = client.filter_in_scope_torrents(vec![
+            torrent_summary("a", Some("tv"), &["public"], 5),
+            torrent_summary("b", Some("music"), &["keep"], 5),
+            torrent_summary("c", Some("linux"), &["keep"], 5),
+            torrent_summary("d", Some("tv"), &["skip"], 5),
+            torrent_summary("e", Some("tv"), &["public"], 2),
+            torrent_summary("f", Some("books"), &["public"], 5),
+        ]);
+
+        assert_eq!(
+            filtered.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn includes_all_non_excluded_torrents_when_no_include_filters_are_set() {
+        let client = test_client();
+
+        let filtered = client.filter_in_scope_torrents(vec![
+            torrent_summary("a", Some("tv"), &["public"], 3),
+            torrent_summary("b", Some("tv"), &["skip"], 3),
+        ]);
+
+        assert_eq!(
+            filtered.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -426,6 +531,10 @@ mod tests {
     }
 
     fn test_client() -> QbittorrentClient {
+        scoped_test_client(FiltersConfig::default())
+    }
+
+    fn scoped_test_client(filters: FiltersConfig) -> QbittorrentClient {
         QbittorrentClient::new(
             QbittorrentConfig {
                 base_url: "http://qbittorrent:8080/".to_string(),
@@ -434,9 +543,26 @@ mod tests {
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
             },
+            filters,
+            3,
             std::time::Duration::from_secs(10),
         )
         .unwrap()
+    }
+
+    fn torrent_summary(
+        hash: &str,
+        category: Option<&str>,
+        tags: &[&str],
+        total_seeders: u32,
+    ) -> TorrentSummary {
+        TorrentSummary {
+            hash: hash.to_string(),
+            name: format!("torrent-{hash}"),
+            total_seeders,
+            category: category.map(str::to_string),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+        }
     }
 
     #[tokio::test]
@@ -490,6 +616,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, "5.0.4");
+
+        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_in_scope_torrents_requests_seeding_filter_and_applies_scope_rules() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"a\",\"name\":\"Allowed category\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5},{\"hash\":\"b\",\"name\":\"Allowed tag\",\"category\":\"music\",\"tags\":\" keep ,misc \",\"num_complete\":6},{\"hash\":\"c\",\"name\":\"Excluded category\",\"category\":\"linux\",\"tags\":\"keep\",\"num_complete\":6},{\"hash\":\"d\",\"name\":\"Excluded tag\",\"category\":\"tv\",\"tags\":\"skip\",\"num_complete\":6},{\"hash\":\"e\",\"name\":\"Too small\",\"category\":\"tv\",\"tags\":\"keep\",\"num_complete\":2}]",
+            },
+        ])
+        .await;
+        let previous = env::var_os("QBITTORRENT_PASSWORD");
+        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
+
+        let client = network_scoped_test_client(
+            &base_url,
+            FiltersConfig {
+                include_categories: vec!["tv".to_string()],
+                exclude_categories: vec!["linux".to_string()],
+                include_tags: vec!["keep".to_string()],
+                exclude_tags: vec!["skip".to_string()],
+                allowlist_peer_ips: vec![],
+                allowlist_peer_cidrs: vec![],
+            },
+        );
+        let torrents = client.list_in_scope_torrents().await.unwrap();
+
+        assert_eq!(
+            torrents.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
 
         restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
@@ -566,6 +740,10 @@ mod tests {
     }
 
     fn network_test_client(base_url: &str) -> QbittorrentClient {
+        network_scoped_test_client(base_url, FiltersConfig::default())
+    }
+
+    fn network_scoped_test_client(base_url: &str, filters: FiltersConfig) -> QbittorrentClient {
         QbittorrentClient::new(
             QbittorrentConfig {
                 base_url: base_url.to_string(),
@@ -574,6 +752,8 @@ mod tests {
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
             },
+            filters,
+            3,
             std::time::Duration::from_secs(10),
         )
         .unwrap()
