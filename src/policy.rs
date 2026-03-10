@@ -137,6 +137,8 @@ impl PolicyEngine {
             sample_count: 1,
             last_torrent_seeder_count: peer.torrent.total_seeders,
             last_exemption_reason: self.classify_exemption(peer),
+            bannable_since: None,
+            last_ban_decision_at: None,
         };
 
         if let Some(previous) = carryover.filter(|previous| {
@@ -153,6 +155,8 @@ impl PolicyEngine {
             session.bad_duration = self.decay_bad_duration(previous.bad_duration, gap);
             session.sample_count = previous.sample_count + 1;
             session.last_exemption_reason = self.classify_exemption(peer);
+            session.bannable_since = previous.bannable_since;
+            session.last_ban_decision_at = previous.last_ban_decision_at;
         }
 
         session
@@ -181,6 +185,9 @@ impl PolicyEngine {
             let is_bannable = exemption.is_none()
                 && session.observed_duration >= self.config.min_observation_duration
                 && session.bad_duration >= self.config.bad_for_duration;
+            if is_bannable {
+                session.bannable_since = Some(peer.observed_at);
+            }
 
             return PeerEvaluation {
                 session,
@@ -211,6 +218,20 @@ impl PolicyEngine {
             bad_duration += sample_duration;
         }
 
+        let is_bannable = exemption.is_none()
+            && observed_duration >= self.config.min_observation_duration
+            && bad_duration >= self.config.bad_for_duration;
+        let bannable_since = if is_bannable {
+            previous.bannable_since.or(Some(peer.observed_at))
+        } else {
+            None
+        };
+        let last_ban_decision_at = if is_bannable {
+            previous.last_ban_decision_at
+        } else {
+            None
+        };
+
         let session = PeerSessionState {
             observation_id: self.peer_observation_id(peer),
             offence_identity: self.offence_identity(peer),
@@ -229,11 +250,9 @@ impl PolicyEngine {
             sample_count: previous.sample_count + 1,
             last_torrent_seeder_count: peer.torrent.total_seeders,
             last_exemption_reason: exemption.clone(),
+            bannable_since,
+            last_ban_decision_at,
         };
-
-        let is_bannable = exemption.is_none()
-            && observed_duration >= self.config.min_observation_duration
-            && bad_duration >= self.config.bad_for_duration;
 
         PeerEvaluation {
             session,
@@ -270,6 +289,10 @@ impl PolicyEngine {
             return BanDisposition::RebanCooldown { remaining };
         }
 
+        if evaluation.session.last_ban_decision_at.is_some() {
+            return BanDisposition::DuplicateSuppressed;
+        }
+
         let offence_number = history.offence_count + 1;
         BanDisposition::Ban(BanDecision {
             peer_ip: peer.peer.ip,
@@ -284,6 +307,16 @@ impl PolicyEngine {
                 evaluation.session.observed_duration.as_secs()
             ),
         })
+    }
+
+    pub fn record_ban_decision(
+        &self,
+        session: &PeerSessionState,
+        decided_at: SystemTime,
+    ) -> PeerSessionState {
+        let mut updated = session.clone();
+        updated.last_ban_decision_at = Some(decided_at);
+        updated
     }
 
     pub fn evaluate(&self) -> Vec<BanDecision> {
@@ -523,6 +556,8 @@ mod tests {
             sample_count: 3,
             last_torrent_seeder_count: 5,
             last_exemption_reason: None,
+            bannable_since: None,
+            last_ban_decision_at: None,
         };
 
         let evaluation = engine.evaluate_peer(&seeded_peer(420, 0.13, 2_000), Some(&session));
@@ -557,6 +592,8 @@ mod tests {
             sample_count: 2,
             last_torrent_seeder_count: 5,
             last_exemption_reason: None,
+            bannable_since: None,
+            last_ban_decision_at: None,
         };
 
         peer.peer.port = 51414;
@@ -696,6 +733,66 @@ mod tests {
         assert!(matches!(
             engine.decide_ban(&peer, &evaluation, &empty_history()),
             BanDisposition::Exempt(ExemptionReason::NewPeerGracePeriod { .. })
+        ));
+    }
+
+    #[test]
+    fn suppresses_duplicate_ban_decisions_for_same_bannable_episode() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+        let first_session = match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+            BanDisposition::Ban(_) => {
+                engine.record_ban_decision(&evaluation.session, peer.observed_at)
+            }
+            other => panic!("expected ban decision, got {other:?}"),
+        };
+
+        let next_peer = seeded_peer(240, 0.10, 500);
+        let next_evaluation = engine.evaluate_peer(&next_peer, Some(&first_session));
+        assert_eq!(
+            engine.decide_ban(&next_peer, &next_evaluation, &empty_history()),
+            BanDisposition::DuplicateSuppressed
+        );
+    }
+
+    #[test]
+    fn allows_new_ban_after_peer_leaves_bannable_state() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        config.decay_window = Duration::from_secs(60);
+        config.reban_cooldown = Duration::from_secs(30);
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+        let banned_session = engine.record_ban_decision(&evaluation.session, peer.observed_at);
+
+        let recovered_peer = seeded_peer(420, 0.20, 5_000);
+        let recovered = engine.evaluate_peer(&recovered_peer, Some(&banned_session));
+        assert!(matches!(
+            engine.decide_ban(&recovered_peer, &recovered, &empty_history()),
+            BanDisposition::NotBannableYet { .. }
+        ));
+        assert_eq!(recovered.session.last_ban_decision_at, None);
+
+        let relapsed_peer = seeded_peer(540, 0.20, 500);
+        let relapsed = engine.evaluate_peer(&relapsed_peer, Some(&recovered.session));
+        assert!(matches!(
+            engine.decide_ban(
+                &relapsed_peer,
+                &relapsed,
+                &OffenceHistory {
+                    offence_count: 1,
+                    last_ban_expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+                }
+            ),
+            BanDisposition::Ban(_)
         ));
     }
 

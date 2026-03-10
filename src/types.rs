@@ -66,6 +66,8 @@ pub struct PeerSessionState {
     pub sample_count: u32,
     pub last_torrent_seeder_count: u32,
     pub last_exemption_reason: Option<ExemptionReason>,
+    pub bannable_since: Option<SystemTime>,
+    pub last_ban_decision_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,5 +126,6 @@ pub enum BanDisposition {
     RebanCooldown {
         remaining: Duration,
     },
+    DuplicateSuppressed,
     Ban(BanDecision),
 }
