@@ -1,10 +1,16 @@
 #![allow(dead_code)]
 
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
-use config::{Config, Environment, File, FileFormat};
+use config::{Config, File, FileFormat};
 use humantime::parse_duration;
+use ipnet::IpNet;
 use serde::Deserialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -29,38 +35,45 @@ impl AppConfig {
         let file = path
             .or_else(|| env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.toml"));
+        Self::load_from_path(&file)
+    }
 
-        let builder = Config::builder()
-            .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
-            .set_default("qbittorrent.username", "admin")?
-            .set_default("qbittorrent.password_env", "QBITTORRENT_PASSWORD")?
-            .set_default("qbittorrent.poll_interval", "30s")?
-            .set_default("qbittorrent.request_timeout", "10s")?
-            .set_default("policy.slow_rate_bps", 262_144_u64)?
-            .set_default("policy.min_progress_delta", 0.0025_f64)?
-            .set_default("policy.new_peer_grace_period", "5m")?
-            .set_default("policy.min_observation_duration", "20m")?
-            .set_default("policy.bad_for_duration", "15m")?
-            .set_default("policy.decay_window", "60m")?
-            .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
-            .set_default("policy.min_total_seeders", 3_u32)?
-            .set_default("policy.reban_cooldown", "30m")?
-            .set_default(
-                "policy.ban_ladder.durations",
-                vec!["1h", "6h", "24h", "168h"],
-            )?
-            .set_default("database.path", "/data/brrpolice.sqlite")?
-            .set_default("database.busy_timeout", "5s")?
-            .set_default("http.bind", "0.0.0.0:9090")?
-            .set_default("logging.level", "info")?
-            .set_default("logging.format", "json")?
-            .add_source(
-                File::new(file.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
-            )
-            .add_source(Environment::with_prefix("BRRPOLICE").separator("__"));
+    fn load_from_path(path: &Path) -> Result<Self> {
+        Self::from_builder(
+            Config::builder()
+                .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
+                .set_default("qbittorrent.username", "admin")?
+                .set_default("qbittorrent.password_env", "QBITTORRENT_PASSWORD")?
+                .set_default("qbittorrent.poll_interval", "30s")?
+                .set_default("qbittorrent.request_timeout", "10s")?
+                .set_default("policy.slow_rate_bps", 262_144_u64)?
+                .set_default("policy.min_progress_delta", 0.0025_f64)?
+                .set_default("policy.new_peer_grace_period", "5m")?
+                .set_default("policy.min_observation_duration", "20m")?
+                .set_default("policy.bad_for_duration", "15m")?
+                .set_default("policy.decay_window", "60m")?
+                .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
+                .set_default("policy.min_total_seeders", 3_u32)?
+                .set_default("policy.reban_cooldown", "30m")?
+                .set_default(
+                    "policy.ban_ladder.durations",
+                    vec!["1h", "6h", "24h", "168h"],
+                )?
+                .set_default("database.path", "/data/brrpolice.sqlite")?
+                .set_default("database.busy_timeout", "5s")?
+                .set_default("http.bind", "0.0.0.0:9090")?
+                .set_default("logging.level", "info")?
+                .set_default("logging.format", "json")?
+                .add_source(
+                    File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
+                ),
+        )
+    }
 
+    fn from_builder(builder: config::ConfigBuilder<config::builder::DefaultState>) -> Result<Self> {
         let raw = builder.build()?;
-        let parsed = raw.try_deserialize::<AppConfig>()?;
+        let mut parsed = raw.try_deserialize::<AppConfig>()?;
+        parsed.apply_env_overrides()?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -79,15 +92,134 @@ impl AppConfig {
         Ok(())
     }
 
+    fn apply_env_overrides(&mut self) -> Result<()> {
+        apply_string_override(
+            "BRRPOLICE_QBITTORRENT__BASE_URL",
+            &mut self.qbittorrent.base_url,
+        );
+        apply_string_override(
+            "BRRPOLICE_QBITTORRENT__USERNAME",
+            &mut self.qbittorrent.username,
+        );
+        apply_string_override(
+            "BRRPOLICE_QBITTORRENT__PASSWORD_ENV",
+            &mut self.qbittorrent.password_env,
+        );
+        apply_duration_override(
+            "BRRPOLICE_QBITTORRENT__POLL_INTERVAL",
+            &mut self.qbittorrent.poll_interval,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT",
+            &mut self.qbittorrent.request_timeout,
+        )?;
+
+        apply_u64_override(
+            "BRRPOLICE_POLICY__SLOW_RATE_BPS",
+            &mut self.policy.slow_rate_bps,
+        )?;
+        apply_f64_override(
+            "BRRPOLICE_POLICY__MIN_PROGRESS_DELTA",
+            &mut self.policy.min_progress_delta,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD",
+            &mut self.policy.new_peer_grace_period,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION",
+            &mut self.policy.min_observation_duration,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_POLICY__BAD_FOR_DURATION",
+            &mut self.policy.bad_for_duration,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_POLICY__DECAY_WINDOW",
+            &mut self.policy.decay_window,
+        )?;
+        apply_f64_override(
+            "BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE",
+            &mut self.policy.ignore_peer_progress_at_or_above,
+        )?;
+        apply_u32_override(
+            "BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS",
+            &mut self.policy.min_total_seeders,
+        )?;
+        apply_duration_override(
+            "BRRPOLICE_POLICY__REBAN_COOLDOWN",
+            &mut self.policy.reban_cooldown,
+        )?;
+        apply_duration_list_override(
+            "BRRPOLICE_POLICY__BAN_LADDER__DURATIONS",
+            &mut self.policy.ban_ladder.durations,
+        )?;
+
+        apply_list_override(
+            "BRRPOLICE_FILTERS__INCLUDE_CATEGORIES",
+            &mut self.filters.include_categories,
+        );
+        apply_list_override(
+            "BRRPOLICE_FILTERS__EXCLUDE_CATEGORIES",
+            &mut self.filters.exclude_categories,
+        );
+        apply_list_override(
+            "BRRPOLICE_FILTERS__INCLUDE_TAGS",
+            &mut self.filters.include_tags,
+        );
+        apply_list_override(
+            "BRRPOLICE_FILTERS__EXCLUDE_TAGS",
+            &mut self.filters.exclude_tags,
+        );
+        apply_list_override(
+            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
+            &mut self.filters.allowlist_peer_ips,
+        );
+        apply_list_override(
+            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS",
+            &mut self.filters.allowlist_peer_cidrs,
+        );
+
+        apply_path_override("BRRPOLICE_DATABASE__PATH", &mut self.database.path);
+        apply_duration_override(
+            "BRRPOLICE_DATABASE__BUSY_TIMEOUT",
+            &mut self.database.busy_timeout,
+        )?;
+
+        apply_string_override("BRRPOLICE_HTTP__BIND", &mut self.http.bind);
+        apply_string_override("BRRPOLICE_LOGGING__LEVEL", &mut self.logging.level);
+        apply_string_override("BRRPOLICE_LOGGING__FORMAT", &mut self.logging.format);
+
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.qbittorrent.base_url.trim().is_empty() {
             bail!("qbittorrent.base_url must not be empty");
         }
+        let base_url = reqwest::Url::parse(&self.qbittorrent.base_url)
+            .context("qbittorrent.base_url must be a valid URL")?;
+        match base_url.scheme() {
+            "http" | "https" => {}
+            scheme => bail!("qbittorrent.base_url scheme must be http or https, got `{scheme}`"),
+        }
+
         if self.qbittorrent.username.trim().is_empty() {
             bail!("qbittorrent.username must not be empty");
         }
         if self.qbittorrent.password_env.trim().is_empty() {
             bail!("qbittorrent.password_env must not be empty");
+        }
+        validate_env_var_name(&self.qbittorrent.password_env)?;
+        require_positive_duration(self.qbittorrent.poll_interval, "qbittorrent.poll_interval")?;
+        require_positive_duration(
+            self.qbittorrent.request_timeout,
+            "qbittorrent.request_timeout",
+        )?;
+        if self.qbittorrent.request_timeout > self.qbittorrent.poll_interval {
+            bail!(
+                "qbittorrent.request_timeout must be less than or equal to qbittorrent.poll_interval"
+            );
         }
         if self.policy.slow_rate_bps == 0 {
             bail!("policy.slow_rate_bps must be positive");
@@ -98,15 +230,38 @@ impl AppConfig {
         if self.policy.min_progress_delta < 0.0 {
             bail!("policy.min_progress_delta must not be negative");
         }
+        if self.policy.min_progress_delta > 1.0 {
+            bail!("policy.min_progress_delta must not exceed 1.0");
+        }
         if self.policy.ban_ladder.durations.is_empty() {
             bail!("policy.ban_ladder.durations must not be empty");
         }
+        require_positive_duration(
+            self.policy.new_peer_grace_period,
+            "policy.new_peer_grace_period",
+        )?;
+        require_positive_duration(
+            self.policy.min_observation_duration,
+            "policy.min_observation_duration",
+        )?;
+        require_positive_duration(self.policy.bad_for_duration, "policy.bad_for_duration")?;
+        require_positive_duration(self.policy.decay_window, "policy.decay_window")?;
+        require_positive_duration(self.policy.reban_cooldown, "policy.reban_cooldown")?;
         if self.policy.bad_for_duration > self.policy.decay_window {
             bail!("policy.bad_for_duration must be less than or equal to policy.decay_window");
+        }
+        if self.policy.min_total_seeders == 0 {
+            bail!("policy.min_total_seeders must be at least 1");
+        }
+        for (index, duration) in self.policy.ban_ladder.durations.iter().enumerate() {
+            require_positive_duration(*duration, &format!("policy.ban_ladder.durations[{index}]"))?;
         }
         if self.http.bind.parse::<SocketAddr>().is_err() {
             bail!("http.bind must be a valid socket address");
         }
+        require_positive_duration(self.database.busy_timeout, "database.busy_timeout")?;
+        validate_ip_allowlists(&self.filters)?;
+        validate_logging_format(&self.logging.format)?;
 
         Ok(())
     }
@@ -275,4 +430,354 @@ where
     raw.into_iter()
         .map(|value| parse_duration(&value).map_err(serde::de::Error::custom))
         .collect()
+}
+
+fn require_positive_duration(duration: Duration, field_name: &str) -> Result<()> {
+    if duration.is_zero() {
+        bail!("{field_name} must be greater than zero");
+    }
+
+    Ok(())
+}
+
+fn apply_string_override(key: &str, target: &mut String) {
+    if let Some(value) = read_env_var(key) {
+        *target = value;
+    }
+}
+
+fn apply_path_override(key: &str, target: &mut PathBuf) {
+    if let Some(value) = read_env_var(key) {
+        *target = PathBuf::from(value);
+    }
+}
+
+fn apply_duration_override(key: &str, target: &mut Duration) -> Result<()> {
+    if let Some(value) = read_env_var(key) {
+        *target = parse_duration(&value)
+            .with_context(|| format!("invalid duration in environment variable `{key}`"))?;
+    }
+
+    Ok(())
+}
+
+fn apply_duration_list_override(key: &str, target: &mut Vec<Duration>) -> Result<()> {
+    if let Some(value) = read_env_var(key) {
+        *target = split_env_list(&value)
+            .into_iter()
+            .map(|item| {
+                parse_duration(&item)
+                    .with_context(|| format!("invalid duration in environment variable `{key}`"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+
+    Ok(())
+}
+
+fn apply_u64_override(key: &str, target: &mut u64) -> Result<()> {
+    if let Some(value) = read_env_var(key) {
+        *target = value
+            .parse()
+            .with_context(|| format!("invalid u64 in environment variable `{key}`"))?;
+    }
+
+    Ok(())
+}
+
+fn apply_u32_override(key: &str, target: &mut u32) -> Result<()> {
+    if let Some(value) = read_env_var(key) {
+        *target = value
+            .parse()
+            .with_context(|| format!("invalid u32 in environment variable `{key}`"))?;
+    }
+
+    Ok(())
+}
+
+fn apply_f64_override(key: &str, target: &mut f64) -> Result<()> {
+    if let Some(value) = read_env_var(key) {
+        *target = value
+            .parse()
+            .with_context(|| format!("invalid f64 in environment variable `{key}`"))?;
+    }
+
+    Ok(())
+}
+
+fn apply_list_override(key: &str, target: &mut Vec<String>) {
+    if let Some(value) = read_env_var(key) {
+        *target = split_env_list(&value);
+    }
+}
+
+fn read_env_var(key: &str) -> Option<String> {
+    env::var(key).ok().map(|value| value.trim().to_string())
+}
+
+fn split_env_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn validate_env_var_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("qbittorrent.password_env must not be empty");
+    };
+
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        bail!("qbittorrent.password_env must start with a letter or underscore");
+    }
+
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        bail!("qbittorrent.password_env must contain only ASCII letters, digits, and underscores");
+    }
+
+    Ok(())
+}
+
+fn validate_ip_allowlists(filters: &FiltersConfig) -> Result<()> {
+    for value in &filters.allowlist_peer_ips {
+        value
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid allowlisted peer IP `{value}`"))?;
+    }
+
+    for value in &filters.allowlist_peer_cidrs {
+        value
+            .parse::<IpNet>()
+            .with_context(|| format!("invalid allowlisted peer CIDR `{value}`"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_logging_format(format: &str) -> Result<()> {
+    match format {
+        "json" | "plain" | "text" => Ok(()),
+        other => bail!("unsupported logging format `{other}`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::Path,
+        sync::{Mutex, OnceLock},
+        time::Duration,
+    };
+
+    use super::AppConfig;
+    use tempfile::tempdir;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn loads_defaults_when_no_file_exists() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = AppConfig::load(Some(config_path)).unwrap();
+
+        assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
+        assert_eq!(config.policy.slow_rate_bps, 262_144);
+        assert_eq!(
+            config.policy.ban_ladder.durations,
+            vec![
+                Duration::from_secs(3_600),
+                Duration::from_secs(21_600),
+                Duration::from_secs(86_400),
+                Duration::from_secs(604_800)
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_values_from_toml_file() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+base_url = "https://qb.example.internal"
+username = "alice"
+password_env = "QB_PASSWORD"
+poll_interval = "45s"
+request_timeout = "5s"
+
+[policy]
+slow_rate_bps = 1024
+min_progress_delta = 0.01
+new_peer_grace_period = "10m"
+min_observation_duration = "25m"
+bad_for_duration = "20m"
+decay_window = "90m"
+ignore_peer_progress_at_or_above = 0.9
+min_total_seeders = 5
+reban_cooldown = "45m"
+
+[policy.ban_ladder]
+durations = ["2h", "12h"]
+
+[filters]
+allowlist_peer_ips = ["127.0.0.1"]
+allowlist_peer_cidrs = ["10.0.0.0/24"]
+
+[database]
+path = "/tmp/test.sqlite"
+busy_timeout = "7s"
+
+[http]
+bind = "127.0.0.1:9191"
+
+[logging]
+level = "debug"
+format = "plain"
+"#,
+        );
+
+        let config = AppConfig::load(Some(config_path)).unwrap();
+
+        assert_eq!(config.qbittorrent.username, "alice");
+        assert_eq!(config.policy.slow_rate_bps, 1024);
+        assert_eq!(config.filters.allowlist_peer_cidrs, vec!["10.0.0.0/24"]);
+        assert_eq!(config.http.bind, "127.0.0.1:9191");
+        assert_eq!(config.logging.format, "plain");
+    }
+
+    #[test]
+    fn environment_overrides_toml_values() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+username = "from-file"
+poll_interval = "45s"
+request_timeout = "10s"
+
+[policy]
+slow_rate_bps = 2048
+
+[filters]
+allowlist_peer_ips = ["127.0.0.1"]
+"#,
+        );
+
+        unsafe {
+            std::env::set_var("BRRPOLICE_QBITTORRENT__USERNAME", "from-env");
+            std::env::set_var("BRRPOLICE_POLICY__SLOW_RATE_BPS", "4096");
+            std::env::set_var(
+                "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
+                "192.168.1.10,192.168.1.11",
+            );
+        }
+
+        let config = AppConfig::load(Some(config_path)).unwrap();
+
+        assert_eq!(config.qbittorrent.username, "from-env");
+        assert_eq!(config.policy.slow_rate_bps, 4096);
+        assert_eq!(
+            config.filters.allowlist_peer_ips,
+            vec!["192.168.1.10", "192.168.1.11"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cidr() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[filters]
+allowlist_peer_cidrs = ["10.0.0.0/99"]
+"#,
+        );
+
+        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        assert!(error.to_string().contains("invalid allowlisted peer CIDR"));
+    }
+
+    #[test]
+    fn rejects_invalid_qbittorrent_threshold_combinations() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+poll_interval = "5s"
+request_timeout = "10s"
+"#,
+        );
+
+        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        assert!(error.to_string().contains("request_timeout"));
+    }
+
+    #[test]
+    fn rejects_unsupported_logging_format() {
+        let _guard = env_lock();
+        clear_test_env();
+
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[logging]
+format = "yaml"
+"#,
+        );
+
+        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        assert!(error.to_string().contains("unsupported logging format"));
+    }
+
+    fn write_config(dir: &Path, content: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn clear_test_env() {
+        const KEYS: &[&str] = &[
+            "BRRPOLICE_CONFIG",
+            "BRRPOLICE_QBITTORRENT__USERNAME",
+            "BRRPOLICE_POLICY__SLOW_RATE_BPS",
+            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
+        ];
+
+        for key in KEYS {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
 }
