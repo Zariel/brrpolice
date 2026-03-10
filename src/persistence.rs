@@ -11,7 +11,11 @@ pub struct Persistence {
 
 impl Persistence {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        let url = format!("sqlite://{}", config.path.display());
+        let url = if config.path == std::path::Path::new(":memory:") {
+            "sqlite::memory:".to_string()
+        } else {
+            format!("sqlite://{}", config.path.display())
+        };
         let pool = SqlitePoolOptions::new().connect(&url).await?;
         sqlx::query("PRAGMA journal_mode = WAL;")
             .execute(&pool)
