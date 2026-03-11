@@ -125,6 +125,10 @@ impl ControlLoop {
                 _ = interval.tick() => {
                     match self.run_poll_cycle_with_retry().await {
                         Ok(cycle) => {
+                            if self.shutdown_requested() {
+                                info!("control loop stopping");
+                                return Ok(());
+                            }
                             debug!(
                                 torrent_count = cycle.torrent_count,
                                 peer_count = cycle.peer_count,
@@ -133,6 +137,10 @@ impl ControlLoop {
                             );
                         }
                         Err(error) => {
+                            if self.shutdown_requested() {
+                                info!("control loop stopping");
+                                return Ok(());
+                            }
                             warn!(?error, "control loop tick failed after retries");
                         }
                     }
@@ -190,7 +198,11 @@ impl ControlLoop {
         let mut peer_count = 0;
         let mut ban_count = 0;
 
-        for torrent in &torrents {
+        'torrents: for torrent in &torrents {
+            if self.shutdown_requested() {
+                info!("shutdown requested; stopping poll cycle");
+                break;
+            }
             let torrent_scope = TorrentScope {
                 hash: torrent.hash.clone(),
                 name: torrent.name.clone(),
@@ -214,6 +226,10 @@ impl ControlLoop {
                 }
             };
             for peer in peers {
+                if self.shutdown_requested() {
+                    info!("shutdown requested; stopping poll cycle");
+                    break 'torrents;
+                }
                 peer_count += 1;
                 let existing = self
                     .persistence
@@ -508,9 +524,21 @@ impl ControlLoop {
 
     async fn run_poll_cycle_with_retry(&mut self) -> Result<PollCycleResult> {
         let mut attempt = 0;
+        let mut shutdown = self.shutdown.clone();
         loop {
+            if *shutdown.borrow() {
+                return Ok(PollCycleResult::default());
+            }
+
             let started = std::time::Instant::now();
-            match self.run_poll_cycle().await {
+            let cycle_result = tokio::select! {
+                result = self.run_poll_cycle() => result,
+                _ = wait_for_shutdown_signal(&mut shutdown) => {
+                    return Ok(PollCycleResult::default());
+                }
+            };
+
+            match cycle_result {
                 Ok(result) => {
                     self.metrics.record_poll_loop_duration(started.elapsed());
                     self.metrics
@@ -533,11 +561,20 @@ impl ControlLoop {
                         error = ?error,
                         "control loop tick failed; retrying"
                     );
-                    time::sleep(delay).await;
+                    tokio::select! {
+                        _ = time::sleep(delay) => {}
+                        _ = wait_for_shutdown_signal(&mut shutdown) => {
+                            return Ok(PollCycleResult::default());
+                        }
+                    }
                     attempt += 1;
                 }
             }
         }
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        *self.shutdown.borrow()
     }
 
     async fn reconcile_expired_bans(&self, reconciled_at: std::time::SystemTime) -> Result<usize> {
@@ -863,6 +900,19 @@ fn startup_retry_backoff(attempt: u32) -> Duration {
     let multiplier = 1_u32 << shift;
     let delay = STARTUP_RETRY_BACKOFF_BASE * multiplier;
     delay.min(STARTUP_RETRY_BACKOFF_MAX)
+}
+
+async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        match shutdown.changed().await {
+            Ok(()) => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
 }
 
 fn progress_delta_per_mille(progress_delta: f64) -> u32 {
@@ -1455,6 +1505,7 @@ mod tests {
         .await
         .expect("service should become ready after startup retry succeeds");
 
+        time::sleep(Duration::from_millis(100)).await;
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
         server.await.unwrap();
@@ -1803,6 +1854,62 @@ mod tests {
             "service readiness should not flap during retry backoff"
         );
         assert!(state.is_ready());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_cycle_with_retry_stops_promptly_on_shutdown_during_backoff() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+
+        let (base_url, server) = spawn_server(vec![ExpectedRequest {
+            method: "GET",
+            path: "/api/v2/torrents/info?filter=seeding",
+            must_contain: vec![],
+            response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+        }])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut control = ControlLoop::new(
+            config,
+            persistence,
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        let task = tokio::spawn(async move { control.run_poll_cycle_with_retry().await.unwrap() });
+        time::sleep(Duration::from_millis(10)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let result = timeout(Duration::from_millis(250), task)
+            .await
+            .expect("poll cycle should stop promptly after shutdown signal")
+            .unwrap();
+        assert_eq!(result, super::PollCycleResult::default());
 
         server.await.unwrap();
     }
