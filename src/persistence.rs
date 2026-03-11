@@ -1,4 +1,5 @@
 use std::{
+    env,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{
@@ -140,9 +141,16 @@ impl Persistence {
     pub async fn run_migrations(&self) -> Result<()> {
         self.migrations_succeeded.store(false, Ordering::Relaxed);
 
-        let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
+        let migration_path = resolve_migrations_path()?;
+        let migration_path_display = migration_path.display().to_string();
+        let migrator = sqlx::migrate::Migrator::new(migration_path)
             .await
-            .context("failed to load sqlx migrations from ./migrations")?;
+            .with_context(|| {
+                format!(
+                    "failed to load sqlx migrations from {}",
+                    migration_path_display
+                )
+            })?;
         migrator
             .run(&self.pool)
             .await
@@ -611,6 +619,21 @@ impl Persistence {
 
         Ok(result.rows_affected() > 0)
     }
+}
+
+fn resolve_migrations_path() -> Result<PathBuf> {
+    let mut candidates = vec![PathBuf::from("./migrations"), PathBuf::from("/app/migrations")];
+    if let Ok(executable) = env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        candidates.push(parent.join("migrations"));
+    }
+
+    candidates.into_iter().find(|path| path.is_dir()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no migrations directory found in expected locations: ./migrations, /app/migrations, <exe_dir>/migrations"
+        )
+    })
 }
 
 #[derive(sqlx::FromRow)]
