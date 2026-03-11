@@ -1119,6 +1119,100 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn adapter_lifecycle_covers_auth_listing_ban_and_reconcile() {
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.42,\"dl_speed\":32768,\"up_speed\":65536}},\"peers_removed\":[]}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.10", "10.0.0.11"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+
+        let client = network_test_client(&base_url);
+        let torrents = client.list_in_scope_torrents().await.unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].hash, "abc123");
+
+        let peers = client.list_torrent_peers("abc123").await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].observation_id.peer_ip,
+            "10.0.0.10".parse::<IpAddr>().unwrap()
+        );
+
+        let ban_result = client
+            .apply_peer_ban(
+                &active_ban("10.0.0.10", 51413, "torrent:abc123"),
+                &[
+                    active_ban("10.0.0.10", 51413, "torrent:abc123"),
+                    active_ban("10.0.0.11", 51414, "torrent:def456"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ban_result,
+            BanSyncResult {
+                banned_ips: vec![
+                    "10.0.0.10".parse::<IpAddr>().unwrap(),
+                    "10.0.0.11".parse::<IpAddr>().unwrap(),
+                ],
+            }
+        );
+
+        let reconcile_result = client
+            .reconcile_expired_bans(&[active_ban("10.0.0.11", 51414, "torrent:def456")])
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_result,
+            BanSyncResult {
+                banned_ips: vec!["10.0.0.11".parse::<IpAddr>().unwrap()],
+            }
+        );
+
+        server.await.unwrap();
+    }
+
     #[derive(Clone)]
     struct ExpectedRequest {
         method: &'static str,
