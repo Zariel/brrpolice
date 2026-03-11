@@ -1266,6 +1266,8 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
+    use tempfile::tempdir;
+
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
         PeerOffenceRecord, Persistence, RecoverySnapshot,
@@ -1596,6 +1598,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_persists_recovery_state_across_connections() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("restart.sqlite");
+
+        let persistence = file_persistence(&db_path).await;
+        persistence.run_migrations().await.unwrap();
+        let evaluation = pending_ban_evaluation();
+        let decision = sample_ban_decision();
+        let stored = persistence
+            .record_ban_enforcement(
+                &evaluation,
+                &decision,
+                UNIX_EPOCH + Duration::from_secs(900),
+            )
+            .await
+            .unwrap();
+        let active_ban = stored.active_ban.clone().unwrap();
+        drop(persistence);
+
+        let reopened = file_persistence(&db_path).await;
+        reopened.run_migrations().await.unwrap();
+        let snapshot = reopened.load_recovery_snapshot().await.unwrap();
+
+        assert_eq!(snapshot.service_meta.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(snapshot.peer_sessions.len(), 1);
+        assert_eq!(snapshot.active_bans, vec![active_ban]);
+        assert_eq!(
+            reopened
+                .load_peer_offences_by_ip(decision.peer_ip)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_ban_suppression_survives_restart() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("duplicate.sqlite");
+
+        let persistence = file_persistence(&db_path).await;
+        persistence.run_migrations().await.unwrap();
+        let evaluation = pending_ban_evaluation();
+        let decision = sample_ban_decision();
+        let first = persistence
+            .record_ban_enforcement(
+                &evaluation,
+                &decision,
+                UNIX_EPOCH + Duration::from_secs(900),
+            )
+            .await
+            .unwrap();
+        assert!(!first.duplicate_suppressed);
+        drop(persistence);
+
+        let reopened = file_persistence(&db_path).await;
+        reopened.run_migrations().await.unwrap();
+        let second = reopened
+            .record_ban_enforcement(
+                &evaluation,
+                &decision,
+                UNIX_EPOCH + Duration::from_secs(960),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second,
+            EnforcementWriteResult {
+                duplicate_suppressed: true,
+                offence_id: None,
+                active_ban: None,
+            }
+        );
+        assert_eq!(
+            reopened
+                .load_peer_offences_by_ip(decision.peer_ip)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(reopened.load_active_bans().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn migrations_upgrade_existing_version_one_schema() {
         let persistence = test_persistence().await;
         let mut tx = persistence.pool.begin().await.unwrap();
@@ -1663,6 +1752,15 @@ mod tests {
     async fn test_persistence() -> Persistence {
         Persistence::connect(&DatabaseConfig {
             path: PathBuf::from(":memory:"),
+            busy_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn file_persistence(path: &std::path::Path) -> Persistence {
+        Persistence::connect(&DatabaseConfig {
+            path: path.to_path_buf(),
             busy_timeout: Duration::from_secs(1),
         })
         .await
