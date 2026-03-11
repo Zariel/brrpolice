@@ -50,6 +50,7 @@ pub struct PeerObservationId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffenceIdentity {
+    pub torrent_hash: String,
     pub peer_ip: IpAddr,
 }
 
@@ -83,10 +84,6 @@ pub struct PeerSessionState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExemptionReason {
     TorrentExcluded,
-    InsufficientSeeders {
-        total_seeders: u32,
-        required_seeders: u32,
-    },
     AllowlistedPeer,
     NearComplete {
         progress: f64,

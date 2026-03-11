@@ -518,9 +518,10 @@ impl Persistence {
                 COUNT(*) AS offence_count,
                 MAX(ban_expires_at) AS last_ban_expires_at
             FROM peer_offences
-            WHERE peer_ip = ?
+            WHERE torrent_hash = ? AND peer_ip = ?
             "#,
         )
+        .bind(&identity.torrent_hash)
         .bind(identity.peer_ip.to_string())
         .fetch_one(&self.pool)
         .await?;
@@ -761,10 +762,6 @@ fn parse_system_time(value: &str) -> Result<SystemTime> {
 fn encode_exemption_reason(reason: &ExemptionReason) -> String {
     match reason {
         ExemptionReason::TorrentExcluded => "torrent_excluded".to_string(),
-        ExemptionReason::InsufficientSeeders {
-            total_seeders,
-            required_seeders,
-        } => format!("insufficient_seeders:{total_seeders}:{required_seeders}"),
         ExemptionReason::AllowlistedPeer => "allowlisted_peer".to_string(),
         ExemptionReason::NearComplete {
             progress,
@@ -783,12 +780,6 @@ fn decode_exemption_reason(value: &str) -> Result<ExemptionReason> {
     let parts: Vec<_> = value.split(':').collect();
     match parts.as_slice() {
         ["torrent_excluded"] => Ok(ExemptionReason::TorrentExcluded),
-        ["insufficient_seeders", total_seeders, required_seeders] => {
-            Ok(ExemptionReason::InsufficientSeeders {
-                total_seeders: total_seeders.parse()?,
-                required_seeders: required_seeders.parse()?,
-            })
-        }
         ["allowlisted_peer"] => Ok(ExemptionReason::AllowlistedPeer),
         ["near_complete", progress, threshold] => Ok(ExemptionReason::NearComplete {
             progress: progress.parse()?,
@@ -806,13 +797,17 @@ fn decode_exemption_reason(value: &str) -> Result<ExemptionReason> {
 fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
     let peer_ip = row.peer_ip.parse::<IpAddr>()?;
     let peer_port = u16::try_from(row.peer_port)?;
+    let torrent_hash = row.torrent_hash;
     Ok(PeerSessionState {
         observation_id: PeerObservationId {
-            torrent_hash: row.torrent_hash,
+            torrent_hash: torrent_hash.clone(),
             peer_ip,
             peer_port,
         },
-        offence_identity: OffenceIdentity { peer_ip },
+        offence_identity: OffenceIdentity {
+            torrent_hash,
+            peer_ip,
+        },
         first_seen_at: parse_system_time(&row.first_seen_at)?,
         last_seen_at: parse_system_time(&row.last_seen_at)?,
         baseline_progress: row.baseline_progress,
@@ -1425,7 +1420,8 @@ mod tests {
         let persistence = test_persistence().await;
         persistence.run_migrations().await.unwrap();
         let first = sample_peer_offence(1, 3600);
-        let second = sample_peer_offence(2, 7200);
+        let mut second = sample_peer_offence(2, 7200);
+        second.torrent_hash = "def456".to_string();
 
         let first_id = persistence.insert_peer_offence(&first).await.unwrap();
         let second_id = persistence.insert_peer_offence(&second).await.unwrap();
@@ -1441,6 +1437,7 @@ mod tests {
 
         let history = persistence
             .load_offence_history(&OffenceIdentity {
+                torrent_hash: first.torrent_hash.clone(),
                 peer_ip: first.peer_ip,
             })
             .await
@@ -1448,7 +1445,22 @@ mod tests {
         assert_eq!(
             history,
             OffenceHistory {
-                offence_count: 2,
+                offence_count: 1,
+                last_ban_expires_at: Some(UNIX_EPOCH + Duration::from_secs(3600)),
+            }
+        );
+
+        let second_history = persistence
+            .load_offence_history(&OffenceIdentity {
+                torrent_hash: second.torrent_hash.clone(),
+                peer_ip: second.peer_ip,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            second_history,
+            OffenceHistory {
+                offence_count: 1,
                 last_ban_expires_at: Some(UNIX_EPOCH + Duration::from_secs(7200)),
             }
         );
@@ -1805,6 +1817,7 @@ mod tests {
                 peer_port: 51413,
             },
             offence_identity: OffenceIdentity {
+                torrent_hash: "abc123".to_string(),
                 peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
             },
             first_seen_at: UNIX_EPOCH + Duration::from_secs(60),

@@ -55,6 +55,7 @@ impl PolicyEngine {
 
     pub fn offence_identity(&self, peer: &PeerContext) -> OffenceIdentity {
         OffenceIdentity {
+            torrent_hash: peer.torrent.hash.clone(),
             peer_ip: peer.peer.ip,
         }
     }
@@ -62,13 +63,6 @@ impl PolicyEngine {
     pub fn classify_exemption(&self, peer: &PeerContext) -> Option<ExemptionReason> {
         if !peer.torrent.in_scope {
             return Some(ExemptionReason::TorrentExcluded);
-        }
-
-        if peer.torrent.total_seeders < self.config.min_total_seeders {
-            return Some(ExemptionReason::InsufficientSeeders {
-                total_seeders: peer.torrent.total_seeders,
-                required_seeders: self.config.min_total_seeders,
-            });
         }
 
         if self.is_allowlisted(peer.peer.ip) {
@@ -223,10 +217,11 @@ impl PolicyEngine {
         let is_bad_sample = exemption.is_none()
             && peer.peer.up_rate_bps < self.config.slow_rate_bps
             && progress_delta < required_progress_delta;
-        let mut bad_duration = self.decay_bad_duration(previous.bad_duration, sample_duration);
-        if is_bad_sample {
-            bad_duration += sample_duration;
-        }
+        let bad_duration = if is_bad_sample {
+            previous.bad_duration + sample_duration
+        } else {
+            self.decay_bad_duration(previous.bad_duration, sample_duration)
+        };
 
         let is_bannable = exemption.is_none()
             && observed_duration >= self.config.min_observation_duration
@@ -464,7 +459,7 @@ mod tests {
     use super::PolicyEngine;
 
     #[test]
-    fn uses_torrent_ip_port_for_observation_identity_and_ip_for_offence_identity() {
+    fn uses_torrent_ip_port_for_observation_identity_and_torrent_ip_for_offence_identity() {
         let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
         let peer = test_peer();
 
@@ -474,6 +469,7 @@ mod tests {
         assert_eq!(observation.torrent_hash, "abc123");
         assert_eq!(observation.peer_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
         assert_eq!(observation.peer_port, 51413);
+        assert_eq!(offence.torrent_hash, "abc123");
         assert_eq!(offence.peer_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
     }
 
@@ -541,21 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn classifies_insufficient_seeders_before_peer_checks() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
-        let mut peer = test_peer();
-        peer.torrent.total_seeders = 1;
-
-        assert_eq!(
-            engine.classify_exemption(&peer),
-            Some(ExemptionReason::InsufficientSeeders {
-                total_seeders: 1,
-                required_seeders: 3,
-            })
-        );
-    }
-
-    #[test]
     fn accumulates_bad_time_until_peer_is_bannable() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
@@ -586,7 +567,7 @@ mod tests {
             evaluation.session.observed_duration,
             Duration::from_secs(360)
         );
-        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(288));
+        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(360));
     }
 
     #[test]
@@ -736,6 +717,35 @@ mod tests {
             !second.is_bad_sample,
             "window progress should be sufficient even with small latest sample delta"
         );
+    }
+
+    #[test]
+    fn continuous_bad_samples_reach_bad_for_duration_without_hidden_decay() {
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(300),
+            bad_for_duration: Duration::from_secs(300),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let initial = seeded_peer(60, 0.10, 500);
+        let mut session = engine.begin_session(&initial, None);
+        let mut final_eval = None;
+        for observed_secs in [120, 180, 240, 300, 360] {
+            let evaluation = engine.evaluate_peer(&seeded_peer(observed_secs, 0.10, 500), Some(&session));
+            assert!(evaluation.is_bad_sample);
+            session = evaluation.session.clone();
+            final_eval = Some(evaluation);
+        }
+
+        let evaluation = final_eval.expect("expected final evaluation");
+        assert_eq!(evaluation.session.observed_duration, Duration::from_secs(300));
+        assert_eq!(evaluation.session.bad_duration, Duration::from_secs(300));
+        assert!(evaluation.is_bannable);
     }
 
     #[test]
@@ -1052,19 +1062,6 @@ mod tests {
                 ExemptionReason::NearComplete {
                     progress: 0.99,
                     threshold: 0.95,
-                },
-            ),
-            (
-                "low_seeders",
-                FiltersConfig::default(),
-                {
-                    let mut peer = seeded_peer(360, 0.10, 500);
-                    peer.torrent.total_seeders = 1;
-                    peer
-                },
-                ExemptionReason::InsufficientSeeders {
-                    total_seeders: 1,
-                    required_seeders: 3,
                 },
             ),
             (

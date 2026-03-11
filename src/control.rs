@@ -713,6 +713,7 @@ impl ControlLoop {
         let session = existing_session.unwrap_or(PeerSessionState {
             observation_id,
             offence_identity: OffenceIdentity {
+                torrent_hash: intent.torrent_hash.clone(),
                 peer_ip: intent.peer_ip,
             },
             first_seen_at: intent.observed_at,
@@ -1474,6 +1475,7 @@ mod tests {
                         peer_port: 51413,
                     },
                     offence_identity: OffenceIdentity {
+                        torrent_hash: "abc123".to_string(),
                         peer_ip: "10.0.0.10".parse().unwrap(),
                     },
                     first_seen_at: seeded_now - Duration::from_secs(180),
@@ -1819,6 +1821,7 @@ mod tests {
                         peer_port: 51413,
                     },
                     offence_identity: OffenceIdentity {
+                        torrent_hash: "abc123".to_string(),
                         peer_ip: "10.0.0.10".parse().unwrap(),
                     },
                     first_seen_at: std::time::UNIX_EPOCH,
