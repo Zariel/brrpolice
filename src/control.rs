@@ -774,7 +774,10 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::watch;
+    use tokio::{
+        sync::watch,
+        time::{self, timeout},
+    };
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
         matchers::any,
@@ -1558,8 +1561,16 @@ mod tests {
         );
 
         let task = tokio::spawn(async move { control.run_poll_cycle_with_retry().await.unwrap() });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!state.is_ready());
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !state.is_ready() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("service state should become unhealthy during retry backoff");
 
         let result = task.await.unwrap();
         assert_eq!(
