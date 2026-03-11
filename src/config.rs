@@ -62,7 +62,7 @@ impl AppConfig {
             )?
             .set_default("database.path", "/data/brrpolice.sqlite")?
             .set_default("database.busy_timeout", "5s")?
-            .set_default("http.bind", "0.0.0.0:9090")?
+            .set_default("http.bind", "127.0.0.1:9090")?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "json")?
             .add_source(
@@ -167,6 +167,9 @@ impl AppConfig {
         match base_url.scheme() {
             "http" | "https" => {}
             scheme => bail!("qbittorrent.base_url scheme must be http or https, got `{scheme}`"),
+        }
+        if !base_url.username().is_empty() || base_url.password().is_some() {
+            bail!("qbittorrent.base_url must not include URL credentials");
         }
 
         if self.qbittorrent.username.trim().is_empty() {
@@ -351,7 +354,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:9090".to_string(),
+            bind: "127.0.0.1:9090".to_string(),
         }
     }
 }
@@ -491,6 +494,16 @@ mod tests {
                 Duration::from_secs(604_800)
             ]
         );
+    }
+
+    #[test]
+    fn defaults_http_bind_to_loopback() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert_eq!(config.http.bind, "127.0.0.1:9090");
     }
 
     #[test]
@@ -636,6 +649,25 @@ password_env = "1NOT_VALID"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("password_env must start"));
+    }
+
+    #[test]
+    fn rejects_base_url_with_embedded_credentials() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+base_url = "http://admin:secret@qbittorrent:8080"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("qbittorrent.base_url must not include URL credentials")
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tracing::{debug, error, info};
 
@@ -28,11 +29,12 @@ const APP_SET_PREFERENCES_PATH: &str = "api/v2/app/setPreferences";
 const TORRENTS_INFO_PATH: &str = "api/v2/torrents/info";
 const SYNC_TORRENT_PEERS_PATH: &str = "api/v2/sync/torrentPeers";
 const TRANSFER_BAN_PEERS_PATH: &str = "api/v2/transfer/banPeers";
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct QbittorrentClient {
     config: QbittorrentConfig,
-    password: String,
+    password: SecretString,
     filters: FiltersConfig,
     min_total_seeders: u32,
     metrics: Arc<AppMetrics>,
@@ -48,7 +50,7 @@ pub struct BanSyncResult {
 impl QbittorrentClient {
     pub fn new(
         config: QbittorrentConfig,
-        password: String,
+        password: impl Into<SecretString>,
         filters: FiltersConfig,
         min_total_seeders: u32,
         timeout: Duration,
@@ -62,7 +64,7 @@ impl QbittorrentClient {
 
         Ok(Self {
             config,
-            password,
+            password: password.into(),
             filters,
             min_total_seeders,
             metrics,
@@ -75,13 +77,12 @@ impl QbittorrentClient {
         let response = self
             .execute_request(self.client.post(self.api_url(AUTH_LOGIN_PATH)?).form(&[
                 ("username", self.config.username.as_str()),
-                ("password", self.password.as_str()),
+                ("password", self.password.expose_secret()),
             ]))
             .await
             .context("qbittorrent login request failed")?;
         let status = response.status();
-        let body = response
-            .text()
+        let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
             .await
             .context("failed to read qbittorrent login response")?;
         if status != StatusCode::OK || body.trim() != "Ok." {
@@ -223,8 +224,7 @@ impl QbittorrentClient {
             return Ok(response);
         }
 
-        let body = response
-            .text()
+        let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
             .await
             .unwrap_or_else(|_| "<unavailable>".to_string());
         bail!(
@@ -596,6 +596,37 @@ fn matches_list(value: Option<&str>, filter_values: &[String]) -> bool {
 
 fn parse_peer_key(key: &str) -> Option<SocketAddr> {
     key.parse().ok()
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String> {
+    let mut buffer = Vec::with_capacity(max_bytes.min(256));
+    let mut truncated = false;
+
+    while let Some(chunk) = response.chunk().await? {
+        if buffer.len() >= max_bytes {
+            truncated = true;
+            break;
+        }
+
+        let remaining = max_bytes - buffer.len();
+        if chunk.len() <= remaining {
+            buffer.extend_from_slice(&chunk);
+            continue;
+        }
+
+        buffer.extend_from_slice(&chunk[..remaining]);
+        truncated = true;
+        break;
+    }
+
+    let mut body = String::from_utf8_lossy(&buffer).into_owned();
+    if truncated {
+        body.push_str(" [truncated]");
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -1124,6 +1155,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, "5.0.4");
+    }
+
+    #[tokio::test]
+    async fn authenticate_failure_truncates_oversized_response_body() {
+        let server = MockServer::start().await;
+        let large_body = "x".repeat(8_192);
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(large_body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = network_test_client(&server.uri());
+        let error = client.authenticate().await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("qbittorrent login failed"));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains(&large_body));
+    }
+
+    #[tokio::test]
+    async fn request_failure_truncates_oversized_response_body() {
+        let server = MockServer::start().await;
+        let large_body = "y".repeat(8_192);
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(large_body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = network_test_client(&server.uri());
+        let error = client
+            .authenticated_get_text(client.api_url(APP_VERSION_PATH).unwrap())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("qbittorrent request failed: status=500"));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains(&large_body));
     }
 
     #[tokio::test]

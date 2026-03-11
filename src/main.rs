@@ -11,6 +11,7 @@ mod types;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use secrecy::SecretString;
 use tokio::{signal, sync::watch};
 use tracing::{error, info};
 
@@ -48,12 +49,15 @@ async fn main() -> Result<()> {
     metrics.set_sqlite_size_bytes(persistence.sqlite_size_bytes().await?);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let qb_password = std::env::var(&config.qbittorrent.password_env).with_context(|| {
-        format!(
-            "missing qbittorrent password env `{}`",
-            config.qbittorrent.password_env
-        )
-    })?;
+    let qb_password =
+        SecretString::from(std::env::var(&config.qbittorrent.password_env).with_context(
+            || {
+                format!(
+                    "missing qbittorrent password env `{}`",
+                    config.qbittorrent.password_env
+                )
+            },
+        )?);
 
     let qbittorrent = Arc::new(QbittorrentClient::new(
         config.qbittorrent.clone(),

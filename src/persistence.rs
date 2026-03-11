@@ -28,8 +28,6 @@ const CURRENT_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceMetaRecord {
     pub schema_version: i64,
@@ -142,7 +140,10 @@ impl Persistence {
     pub async fn run_migrations(&self) -> Result<()> {
         self.migrations_succeeded.store(false, Ordering::Relaxed);
 
-        MIGRATOR
+        let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
+            .await
+            .context("failed to load sqlx migrations from ./migrations")?;
+        migrator
             .run(&self.pool)
             .await
             .context("failed to run sqlx migrations")?;
