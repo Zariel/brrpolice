@@ -593,14 +593,14 @@ fn parse_peer_key(key: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use std::{
-        io,
+        collections::VecDeque,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+    use wiremock::{
+        Match, Mock, MockServer, Request, Respond, ResponseTemplate,
+        matchers::{body_string_contains, header, method, path, query_param},
     };
 
     use super::{
@@ -1042,80 +1042,88 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_posts_credentials_and_accepts_ok_response() {
-        let (base_url, server) = spawn_server(vec![ExpectedRequest {
-            method: "POST",
-            path: "/api/v2/auth/login",
-            must_contain: vec!["username=admin", "password=secret"],
-            response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-        }])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         client.authenticate().await.unwrap();
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn authenticated_requests_retry_after_login_and_reuse_cookie() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/version",
-                must_contain: vec![],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/version",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n5.0.4",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/version"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/version"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("5.0.4"))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         let version = client
             .authenticated_get_text(client.api_url(APP_VERSION_PATH).unwrap())
             .await
             .unwrap();
         assert_eq!(version, "5.0.4");
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn list_in_scope_torrents_requests_seeding_filter_and_applies_scope_rules() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
-                must_contain: vec![],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"a\",\"name\":\"Allowed category\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5},{\"hash\":\"b\",\"name\":\"Allowed tag\",\"category\":\"music\",\"tags\":\" keep ,misc \",\"num_complete\":6},{\"hash\":\"c\",\"name\":\"Excluded category\",\"category\":\"linux\",\"tags\":\"keep\",\"num_complete\":6},{\"hash\":\"d\",\"name\":\"Excluded tag\",\"category\":\"tv\",\"tags\":\"skip\",\"num_complete\":6},{\"hash\":\"e\",\"name\":\"Too small\",\"category\":\"tv\",\"tags\":\"keep\",\"num_complete\":2}]",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("filter", "seeding"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("filter", "seeding"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2}]"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let client = network_scoped_test_client(
-            &base_url,
+            &server.uri(),
             FiltersConfig {
                 include_categories: vec!["tv".to_string()],
                 exclude_categories: vec!["linux".to_string()],
@@ -1134,35 +1142,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn list_torrent_peers_requests_sync_endpoint_and_normalizes_peers() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
-                must_contain: vec![],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.42,\"dl_speed\":32768,\"up_speed\":65536},\"10.0.0.11:51414\":{\"client\":\"\",\"ip\":\"10.0.0.11\",\"port\":51414,\"progress\":0.9,\"dl_speed\":1024,\"up_speed\":2048}},\"peers_removed\":[]}",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/torrentPeers"))
+            .and(query_param("hash", "abc123"))
+            .and(query_param("rid", "0"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/torrentPeers"))
+            .and(query_param("hash", "abc123"))
+            .and(query_param("rid", "0"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("Content-Type", "application/json").set_body_string(
+                    r#"{"rid":15,"peers":{"10.0.0.10:51413":{"client":"qBittorrent/5.0.0","ip":"10.0.0.10","port":51413,"progress":0.42,"dl_speed":32768,"up_speed":65536},"10.0.0.11:51414":{"client":"","ip":"10.0.0.11","port":51414,"progress":0.9,"dl_speed":1024,"up_speed":2048}},"peers_removed":[]}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         let peers = client.list_torrent_peers("abc123").await.unwrap();
 
         assert_eq!(
@@ -1185,53 +1201,59 @@ mod tests {
         );
         assert_eq!(peers[0].client_name.as_deref(), Some("qBittorrent/5.0.0"));
         assert_eq!(peers[1].client_name, None);
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn apply_peer_ban_posts_endpoint_ban_and_syncs_preferences() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/transfer/banPeers",
-                must_contain: vec!["peers=10.0.0.10%3A51413"],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/transfer/banPeers",
-                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/preferences",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.11\\n198.51.100.0/24\"}",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec![
-                    "cookie: SID=abc",
-                    "json=",
-                    "10.0.0.10",
-                    "10.0.0.11",
-                    "198.51.100.0%2F24",
-                ],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/transfer/banPeers"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .and(body_string_contains("peers=10.0.0.10%3A51413"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/transfer/banPeers"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("peers=10.0.0.10%3A51413"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"banned_IPs":"10.0.0.11\n198.51.100.0/24"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("json="))
+            .and(body_string_contains("10.0.0.10"))
+            .and(body_string_contains("10.0.0.11"))
+            .and(body_string_contains("198.51.100.0%2F24"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         let ban = active_ban("10.0.0.10", 51413, "torrent:abc123");
         let result = client
             .apply_peer_ban(
@@ -1253,47 +1275,50 @@ mod tests {
                 ],
             }
         );
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn reconcile_expired_bans_syncs_remaining_managed_ips() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/preferences",
-                must_contain: vec![],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/preferences",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.10\\n10.0.0.12\\n203.0.113.0/24\"}",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec![
-                    "cookie: SID=abc",
-                    "json=",
-                    "10.0.0.11",
-                    "10.0.0.12",
-                    "203.0.113.0%2F24",
-                ],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"banned_IPs":"10.0.0.10\n10.0.0.12\n203.0.113.0/24"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("json="))
+            .and(body_string_contains("10.0.0.11"))
+            .and(body_string_contains("10.0.0.12"))
+            .and(body_string_contains("203.0.113.0%2F24"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         let result = client
             .reconcile_expired_bans(
                 &[
@@ -1319,77 +1344,97 @@ mod tests {
                 ],
             }
         );
-
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn adapter_lifecycle_covers_auth_listing_ban_and_reconcile() {
-        let (base_url, server) = spawn_server(vec![
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
-                must_contain: vec![],
-                response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/auth/login",
-                must_contain: vec!["username=admin", "password=secret"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.42,\"dl_speed\":32768,\"up_speed\":65536}},\"peers_removed\":[]}",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/transfer/banPeers",
-                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/preferences",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.11\\n198.51.100.0/24\"}",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec![
-                    "cookie: SID=abc",
-                    "json=",
-                    "10.0.0.10",
-                    "10.0.0.11",
-                    "198.51.100.0%2F24",
-                ],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-            ExpectedRequest {
-                method: "GET",
-                path: "/api/v2/app/preferences",
-                must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.10\\n10.0.0.11\\n198.51.100.0/24\"}",
-            },
-            ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11", "198.51.100.0%2F24"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            },
-        ])
-        .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("filter", "seeding"))
+            .and(HeaderAbsentMatcher("cookie"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .and(body_string_contains("username=admin"))
+            .and(body_string_contains("password=secret"))
+            .respond_with(login_ok_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("filter", "seeding"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"[{"hash":"abc123","name":"Example","category":"tv","tags":"public","num_complete":5}]"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/torrentPeers"))
+            .and(query_param("hash", "abc123"))
+            .and(query_param("rid", "0"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"rid":15,"peers":{"10.0.0.10:51413":{"client":"qBittorrent/5.0.0","ip":"10.0.0.10","port":51413,"progress":0.42,"dl_speed":32768,"up_speed":65536}},"peers_removed":[]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/transfer/banPeers"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("peers=10.0.0.10%3A51413"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .and(header("cookie", "SID=abc"))
+            .respond_with(SequenceResponder::new(vec![
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"banned_IPs":"10.0.0.11\n198.51.100.0/24"}"#),
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"banned_IPs":"10.0.0.10\n10.0.0.11\n198.51.100.0/24"}"#),
+            ]))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("json="))
+            .and(body_string_contains("10.0.0.10"))
+            .and(body_string_contains("10.0.0.11"))
+            .and(body_string_contains("198.51.100.0%2F24"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .and(header("cookie", "SID=abc"))
+            .and(body_string_contains("json="))
+            .and(body_string_contains("10.0.0.11"))
+            .and(body_string_contains("198.51.100.0%2F24"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let client = network_test_client(&base_url);
+        let client = network_test_client(&server.uri());
         let torrents = client.list_in_scope_torrents().await.unwrap();
         assert_eq!(torrents.len(), 1);
         assert_eq!(torrents[0].hash, "abc123");
@@ -1437,78 +1482,42 @@ mod tests {
                 banned_ips: vec!["10.0.0.11".parse::<IpAddr>().unwrap()],
             }
         );
-
-        server.await.unwrap();
     }
 
-    #[derive(Clone)]
-    struct ExpectedRequest {
-        method: &'static str,
-        path: &'static str,
-        must_contain: Vec<&'static str>,
-        response: &'static str,
+    struct SequenceResponder {
+        responses: Mutex<VecDeque<ResponseTemplate>>,
     }
 
-    async fn spawn_server(
-        expected_requests: Vec<ExpectedRequest>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            for expected in expected_requests {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await.unwrap();
-                assert!(request.starts_with(&format!("{} {} ", expected.method, expected.path)));
-                for needle in expected.must_contain {
-                    assert!(
-                        request.contains(needle),
-                        "request missing `{needle}`: {request}"
-                    );
-                }
-                stream
-                    .write_all(expected.response.as_bytes())
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
-            }
-        });
+    struct HeaderAbsentMatcher(&'static str);
 
-        (format!("http://{address}/"), handle)
+    impl Match for HeaderAbsentMatcher {
+        fn matches(&self, request: &Request) -> bool {
+            !request.headers.contains_key(self.0)
+        }
     }
 
-    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> io::Result<String> {
-        let mut buffer = Vec::new();
-        let mut header = [0_u8; 1024];
-        loop {
-            let read = stream.read(&mut header).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&header[..read]);
-            if let Some(request) = complete_request(&buffer) {
-                return Ok(request);
+    impl SequenceResponder {
+        fn new(responses: Vec<ResponseTemplate>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
             }
         }
-        Ok(String::from_utf8_lossy(&buffer).to_string())
     }
 
-    fn complete_request(buffer: &[u8]) -> Option<String> {
-        let marker = b"\r\n\r\n";
-        let header_end = buffer
-            .windows(marker.len())
-            .position(|window| window == marker)?;
-        let header_end = header_end + marker.len();
-        let request = String::from_utf8_lossy(buffer).to_string();
-        let content_length = request
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if buffer.len() >= header_end + content_length {
-            Some(request)
-        } else {
-            None
+    impl Respond for SequenceResponder {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ResponseTemplate::new(500))
         }
+    }
+
+    fn login_ok_template() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("Set-Cookie", "SID=abc; Path=/; HttpOnly")
+            .set_body_string("Ok.")
     }
 
     fn network_test_client(base_url: &str) -> QbittorrentClient {
