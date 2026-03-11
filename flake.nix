@@ -33,7 +33,7 @@
           // {
             pname = "brrpolice-deps";
             version = "0.1.0";
-            cargoBuildCommand = "cargo build --release --locked";
+            cargoBuildCommand = "cargo build --release";
           }
         );
 
@@ -43,7 +43,7 @@
             inherit cargoArtifacts;
             pname = "brrpolice";
             version = "0.1.0";
-            cargoBuildCommand = "cargo build --release --locked";
+            cargoBuildCommand = "cargo build --release";
             doCheck = false;
           }
         );
