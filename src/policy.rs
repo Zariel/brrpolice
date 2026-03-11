@@ -723,6 +723,53 @@ mod tests {
     }
 
     #[test]
+    fn selects_first_ban_ladder_rung_for_first_offence() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        config.ban_ladder.durations = vec![Duration::from_secs(300), Duration::from_secs(600)];
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+
+        match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+            BanDisposition::Ban(decision) => {
+                assert_eq!(decision.offence_number, 1);
+                assert_eq!(decision.ttl, Duration::from_secs(300));
+            }
+            other => panic!("expected ban decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_ban_ladder_at_last_rung_for_high_offence_counts() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(60);
+        config.bad_for_duration = Duration::from_secs(30);
+        config.ban_ladder.durations = vec![Duration::from_secs(300), Duration::from_secs(600)];
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let peer = seeded_peer(180, 0.10, 500);
+        let evaluation = engine.evaluate_peer(&peer, None);
+
+        match engine.decide_ban(
+            &peer,
+            &evaluation,
+            &OffenceHistory {
+                offence_count: 8,
+                last_ban_expires_at: None,
+            },
+        ) {
+            BanDisposition::Ban(decision) => {
+                assert_eq!(decision.offence_number, 9);
+                assert_eq!(decision.ttl, Duration::from_secs(600));
+            }
+            other => panic!("expected ban decision, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn returns_exemption_before_ban_decision() {
         let mut config = PolicyConfig::default();
         config.new_peer_grace_period = Duration::from_secs(300);

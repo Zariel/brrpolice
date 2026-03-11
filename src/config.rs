@@ -797,6 +797,40 @@ request_timeout = "10s"
     }
 
     #[test]
+    fn rejects_invalid_password_env_name() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+password_env = "1NOT_VALID"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("password_env must start"));
+    }
+
+    #[test]
+    fn rejects_empty_ban_ladder() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.ban_ladder]
+durations = []
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ban_ladder.durations must not be empty")
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_logging_format() {
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
