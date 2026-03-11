@@ -180,6 +180,20 @@ impl ControlLoop {
                     .load_offence_history(&evaluation.session.offence_identity)
                     .await?;
 
+                if evaluation.is_bad_sample {
+                    warn!(
+                        torrent_hash = %torrent.hash,
+                        peer_ip = %peer.peer.ip,
+                        peer_port = peer.peer.port,
+                        observed_at = ?observed_at,
+                        sample_duration_seconds = evaluation.sample_duration.as_secs(),
+                        bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                        progress_delta = evaluation.progress_delta,
+                        average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                        "peer classified bad"
+                    );
+                }
+
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
                         let active_before = active_bans
@@ -204,12 +218,44 @@ impl ControlLoop {
                                 &active_before,
                             )
                             .await
-                            .inspect_err(|_| self.metrics.record_ban_failure())?;
+                            .inspect_err(|error| {
+                                self.metrics.record_ban_failure();
+                                error!(
+                                    torrent_hash = %torrent.hash,
+                                    peer_ip = %decision.peer_ip,
+                                    peer_port = decision.peer_port,
+                                    offence_number = decision.offence_number,
+                                    observed_at = ?observed_at,
+                                    bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                    progress_delta = evaluation.progress_delta,
+                                    average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                                    selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                                    reason_code = %decision.reason,
+                                    error = ?error,
+                                    "peer ban application failed"
+                                );
+                            })?;
                         let stored = self
                             .persistence
                             .record_ban_enforcement(&evaluation, &decision, observed_at)
                             .await
-                            .inspect_err(|_| self.metrics.record_ban_failure())?;
+                            .inspect_err(|error| {
+                                self.metrics.record_ban_failure();
+                                error!(
+                                    torrent_hash = %torrent.hash,
+                                    peer_ip = %decision.peer_ip,
+                                    peer_port = decision.peer_port,
+                                    offence_number = decision.offence_number,
+                                    observed_at = ?observed_at,
+                                    bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                    progress_delta = evaluation.progress_delta,
+                                    average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                                    selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                                    reason_code = %decision.reason,
+                                    error = ?error,
+                                    "peer ban persistence failed"
+                                );
+                            })?;
                         if let Some(active_ban) = stored.active_ban {
                             active_bans.push(active_ban);
                         }
@@ -217,7 +263,36 @@ impl ControlLoop {
                             ban_count += 1;
                             self.metrics
                                 .record_ban_applied(evaluation.session.bad_duration);
+                            info!(
+                                torrent_hash = %torrent.hash,
+                                peer_ip = %decision.peer_ip,
+                                peer_port = decision.peer_port,
+                                offence_number = decision.offence_number,
+                                observed_at = ?observed_at,
+                                bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                progress_delta = evaluation.progress_delta,
+                                average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                                selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                                reason_code = %decision.reason,
+                                "peer ban applied"
+                            );
                         }
+                    }
+                    BanDisposition::Exempt(reason) => {
+                        debug!(
+                            torrent_hash = %torrent.hash,
+                            peer_ip = %peer.peer.ip,
+                            peer_port = peer.peer.port,
+                            observed_at = ?observed_at,
+                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            progress_delta = evaluation.progress_delta,
+                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                            exemption_reason = ?reason,
+                            "peer exemption decision"
+                        );
+                        self.persistence
+                            .upsert_peer_session(&evaluation.session, "policy-v1")
+                            .await?;
                     }
                     _ => {
                         self.persistence
@@ -290,7 +365,16 @@ impl ControlLoop {
 
         self.qbittorrent
             .reconcile_expired_bans(&remaining_active_bans)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(
+                    expired_ban_count = expired_bans.len(),
+                    remaining_active_ban_count = remaining_active_bans.len(),
+                    reconciled_at = ?reconciled_at,
+                    error = ?error,
+                    "expired ban reconciliation failed"
+                );
+            })?;
 
         self.mark_expired_bans_reconciled(&expired_bans, reconciled_at)
             .await?;
@@ -320,6 +404,17 @@ impl ControlLoop {
                 .mark_active_ban_reconciled(ban.peer_ip, ban.peer_port, &ban.scope, reconciled_at)
                 .await?;
             self.revoke_expired_offence(ban, reconciled_at).await?;
+            info!(
+                scope = %ban.scope,
+                peer_ip = %ban.peer_ip,
+                peer_port = ban.peer_port,
+                offence_number = ban.offence_number,
+                created_at = ?ban.created_at,
+                expires_at = ?ban.expires_at,
+                reconciled_at = ?reconciled_at,
+                reason_code = %ban.reason,
+                "peer ban expired"
+            );
         }
 
         Ok(())

@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, error, info};
 
 use crate::{
     config::{FiltersConfig, QbittorrentConfig},
@@ -84,15 +84,23 @@ impl QbittorrentClient {
             .context("failed to read qbittorrent login response")?;
         if status != StatusCode::OK || body.trim() != "Ok." {
             self.metrics.record_qbittorrent_api_error();
+            error!(
+                status = %status,
+                response_body = body.trim(),
+                base_url = %self.base_url,
+                username = %self.config.username,
+                "qbittorrent authentication failed"
+            );
             bail!(
                 "qbittorrent login failed: status={} body={}",
                 status,
                 body.trim()
             );
         }
-        debug!(
+        info!(
             login_url = %self.api_url(AUTH_LOGIN_PATH)?,
             base_url = %self.base_url,
+            username = %self.config.username,
             "qbittorrent authentication succeeded"
         );
         Ok(())
@@ -266,6 +274,17 @@ impl QbittorrentClient {
 
     fn is_torrent_in_scope(&self, torrent: &TorrentSummary) -> bool {
         if torrent.total_seeders < self.min_total_seeders {
+            debug!(
+                torrent_hash = %torrent.hash,
+                torrent_name = %torrent.name,
+                torrent_category = torrent.category.as_deref().unwrap_or(""),
+                torrent_tags = ?torrent.tags,
+                total_seeders = torrent.total_seeders,
+                min_total_seeders = self.min_total_seeders,
+                in_scope = false,
+                reason_code = "insufficient_seeders",
+                "torrent filter decision"
+            );
             return false;
         }
 
@@ -273,6 +292,16 @@ impl QbittorrentClient {
             torrent.category.as_deref(),
             &self.filters.exclude_categories,
         ) {
+            debug!(
+                torrent_hash = %torrent.hash,
+                torrent_name = %torrent.name,
+                torrent_category = torrent.category.as_deref().unwrap_or(""),
+                torrent_tags = ?torrent.tags,
+                total_seeders = torrent.total_seeders,
+                in_scope = false,
+                reason_code = "excluded_category",
+                "torrent filter decision"
+            );
             return false;
         }
 
@@ -281,22 +310,53 @@ impl QbittorrentClient {
             .iter()
             .any(|tag| matches_list(Some(tag.as_str()), &self.filters.exclude_tags))
         {
+            debug!(
+                torrent_hash = %torrent.hash,
+                torrent_name = %torrent.name,
+                torrent_category = torrent.category.as_deref().unwrap_or(""),
+                torrent_tags = ?torrent.tags,
+                total_seeders = torrent.total_seeders,
+                in_scope = false,
+                reason_code = "excluded_tag",
+                "torrent filter decision"
+            );
             return false;
         }
 
         let has_include_rules =
             !self.filters.include_categories.is_empty() || !self.filters.include_tags.is_empty();
         if !has_include_rules {
+            debug!(
+                torrent_hash = %torrent.hash,
+                torrent_name = %torrent.name,
+                torrent_category = torrent.category.as_deref().unwrap_or(""),
+                torrent_tags = ?torrent.tags,
+                total_seeders = torrent.total_seeders,
+                in_scope = true,
+                reason_code = "default_include",
+                "torrent filter decision"
+            );
             return true;
         }
 
-        matches_list(
+        let included = matches_list(
             torrent.category.as_deref(),
             &self.filters.include_categories,
         ) || torrent
             .tags
             .iter()
-            .any(|tag| matches_list(Some(tag.as_str()), &self.filters.include_tags))
+            .any(|tag| matches_list(Some(tag.as_str()), &self.filters.include_tags));
+        debug!(
+            torrent_hash = %torrent.hash,
+            torrent_name = %torrent.name,
+            torrent_category = torrent.category.as_deref().unwrap_or(""),
+            torrent_tags = ?torrent.tags,
+            total_seeders = torrent.total_seeders,
+            in_scope = included,
+            reason_code = if included { "matched_include_rules" } else { "missing_include_match" },
+            "torrent filter decision"
+        );
+        included
     }
 
     fn parse_torrent_peers(&self, body: &str) -> Result<QbTorrentPeersResponse> {
