@@ -317,6 +317,44 @@ impl Persistence {
         row.map(decode_peer_session).transpose()
     }
 
+    pub async fn get_latest_peer_session_for_torrent_ip(
+        &self,
+        torrent_hash: &str,
+        peer_ip: IpAddr,
+    ) -> Result<Option<PeerSessionState>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                torrent_hash,
+                peer_key,
+                peer_ip,
+                peer_port,
+                first_seen_at,
+                last_seen_at,
+                baseline_progress,
+                latest_progress,
+                rolling_avg_up_rate_bps,
+                observed_seconds,
+                bad_seconds,
+                sample_count,
+                last_torrent_seeder_count,
+                last_exemption_reason,
+                bannable_since,
+                last_ban_decision_at
+            FROM peer_sessions
+            WHERE torrent_hash = ? AND peer_ip = ?
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(torrent_hash)
+        .bind(peer_ip.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(decode_peer_session).transpose()
+    }
+
     pub async fn upsert_peer_session(
         &self,
         session: &PeerSessionState,
@@ -1529,6 +1567,37 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn latest_peer_session_lookup_prefers_most_recent_port_for_same_ip() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let old_session = sample_peer_session();
+        let mut new_session = old_session.clone();
+        new_session.observation_id.peer_port = 51414;
+        new_session.last_seen_at = old_session.last_seen_at + Duration::from_secs(60);
+
+        persistence
+            .upsert_peer_session(&old_session, "policy-v1")
+            .await
+            .unwrap();
+        persistence
+            .upsert_peer_session(&new_session, "policy-v1")
+            .await
+            .unwrap();
+
+        let latest = persistence
+            .get_latest_peer_session_for_torrent_ip(
+                &old_session.observation_id.torrent_hash,
+                old_session.observation_id.peer_ip,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(latest.observation_id.peer_port, 51414);
+        assert_eq!(latest.last_seen_at, new_session.last_seen_at);
     }
 
     #[tokio::test]

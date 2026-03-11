@@ -160,8 +160,26 @@ impl ControlLoop {
                     .persistence
                     .get_peer_session(&peer.observation_id)
                     .await?;
+                let carryover = if existing.is_none() {
+                    self.persistence
+                        .get_latest_peer_session_for_torrent_ip(
+                            &peer.observation_id.torrent_hash,
+                            peer.observation_id.peer_ip,
+                        )
+                        .await?
+                        .filter(|session| {
+                            observed_at >= session.last_seen_at
+                                && observed_at
+                                    .duration_since(session.last_seen_at)
+                                    .unwrap_or_default()
+                                    <= self.config.policy.decay_window
+                        })
+                } else {
+                    None
+                };
                 let first_seen_at = existing
                     .as_ref()
+                    .or(carryover.as_ref())
                     .map(|session| session.first_seen_at)
                     .unwrap_or(observed_at);
                 let has_active_ban = has_active_ban(
@@ -178,7 +196,9 @@ impl ControlLoop {
                     observed_at,
                     has_active_ban,
                 };
-                let evaluation = self.policy.evaluate_peer(&peer_context, existing.as_ref());
+                let evaluation = self
+                    .policy
+                    .evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
                 self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
                 let history = self
                     .persistence
@@ -717,6 +737,7 @@ mod tests {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
         let metrics = Arc::new(AppMetrics::new());
+        let seeded_now = std::time::SystemTime::now();
         persistence
             .upsert_peer_session(
                 &PeerSessionState {
@@ -728,8 +749,8 @@ mod tests {
                     offence_identity: OffenceIdentity {
                         peer_ip: "10.0.0.10".parse().unwrap(),
                     },
-                    first_seen_at: std::time::UNIX_EPOCH,
-                    last_seen_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
+                    first_seen_at: seeded_now - Duration::from_secs(180),
+                    last_seen_at: seeded_now - Duration::from_secs(60),
                     baseline_progress: 0.10,
                     latest_progress: 0.10,
                     rolling_avg_up_rate_bps: 512,
@@ -738,7 +759,7 @@ mod tests {
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
-                    bannable_since: Some(std::time::UNIX_EPOCH + Duration::from_secs(30)),
+                    bannable_since: Some(seeded_now - Duration::from_secs(30)),
                     last_ban_decision_at: None,
                 },
                 "policy-v1",
@@ -769,12 +790,12 @@ mod tests {
                 method: "GET",
                 path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
                 must_contain: vec!["cookie: SID=abc"],
-                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.1005,\"dl_speed\":1024,\"up_speed\":128}},\"peers_removed\":[]}",
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51414\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51414,\"progress\":0.1005,\"dl_speed\":1024,\"up_speed\":128}},\"peers_removed\":[]}",
             },
             ExpectedRequest {
                 method: "POST",
                 path: "/api/v2/transfer/banPeers",
-                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
+                must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51414"],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
             ExpectedRequest {
@@ -859,7 +880,7 @@ mod tests {
                 .get_peer_session(&PeerObservationId {
                     torrent_hash: "abc123".to_string(),
                     peer_ip: "10.0.0.10".parse().unwrap(),
-                    peer_port: 51413,
+                    peer_port: 51414,
                 })
                 .await
                 .unwrap()
