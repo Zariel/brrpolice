@@ -1,0 +1,9 @@
+.beads
+.cache
+.cargo-home
+.dolt
+.doltcfg
+.git
+.github
+target
+config.yaml

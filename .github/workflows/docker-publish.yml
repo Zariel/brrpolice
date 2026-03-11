@@ -1,4 +1,4 @@
-name: oci-publish
+name: docker-publish
 
 on:
   push:
@@ -17,40 +17,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v15
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Enable Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          use-gha-cache: "enabled"
-          use-flakehub: "disabled"
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image coordinates
-        id: coords
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag="${GITHUB_REF_NAME//\//-}"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Resolve image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
 
-      - name: Build OCI archive with Nix
-        id: build
-        run: |
-          set -euo pipefail
-          archive="$(nix build .#ociImage --print-out-paths --no-link)"
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
-
-      - name: Log in and push image with crane
+      - name: Validate publish tag contract
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESOLVED_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          archive_tar="$(mktemp --suffix=.tar)"
-          trap 'rm -f "$archive_tar"' EXIT
-          gzip -dc "${{ steps.build.outputs.archive }}" > "$archive_tar"
-          nix shell nixpkgs#go-containerregistry -c crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
-          nix shell nixpkgs#go-containerregistry -c crane push "$archive_tar" "${{ steps.coords.outputs.image }}:${{ steps.coords.outputs.tag }}"
+          expected_tag="${GITHUB_REF_NAME//\//-}"
+          mapfile -t tags < <(printf "%s\n" "$RESOLVED_TAGS" | sed '/^$/d')
+          if [ "${#tags[@]}" -ne 1 ]; then
+            echo "expected exactly one publish tag, got ${#tags[@]}: ${tags[*]}" >&2
+            exit 1
+          fi
+          actual_ref="${tags[0]}"
+          actual_tag="${actual_ref##*:}"
+          if [ "$actual_tag" != "$expected_tag" ]; then
+            echo "expected publish tag '$expected_tag' but got '$actual_tag'" >&2
+            exit 1
+          fi
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ github.ref_name }}
