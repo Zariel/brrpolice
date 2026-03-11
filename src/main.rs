@@ -28,7 +28,11 @@ async fn main() -> Result<()> {
 
     info!(
         qbittorrent_base_url = %config.qbittorrent.base_url,
-        qbittorrent_username = %config.qbittorrent.username,
+        qbittorrent_username = if config.qbittorrent.username.trim().is_empty() {
+            "<unset>"
+        } else {
+            config.qbittorrent.username.as_str()
+        },
         poll_interval_seconds = config.qbittorrent.poll_interval.as_secs(),
         request_timeout_seconds = config.qbittorrent.request_timeout.as_secs(),
         database_path = %config.database.path.display(),
@@ -49,7 +53,9 @@ async fn main() -> Result<()> {
     metrics.set_sqlite_size_bytes(persistence.sqlite_size_bytes().await?);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let qb_password =
+    let qb_password = if config.qbittorrent.username.trim().is_empty() {
+        SecretString::from(String::new())
+    } else {
         SecretString::from(std::env::var(&config.qbittorrent.password_env).with_context(
             || {
                 format!(
@@ -57,7 +63,8 @@ async fn main() -> Result<()> {
                     config.qbittorrent.password_env
                 )
             },
-        )?);
+        )?)
+    };
 
     let qbittorrent = Arc::new(QbittorrentClient::new(
         config.qbittorrent.clone(),

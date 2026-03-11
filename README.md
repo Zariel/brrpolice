@@ -9,7 +9,7 @@ This repository currently covers the local binary and container-friendly runtime
 - Docker (for local OCI image build/run)
 - Rust toolchain with `cargo` (the pinned version is in `rust-toolchain.toml`)
 - Reachable qBittorrent WebUI API
-- A qBittorrent password provided through an environment variable
+- qBittorrent credentials only if your WebUI requires auth
 - A writable location for the SQLite database when not using `:memory:`
 
 ## Build
@@ -51,15 +51,16 @@ Configuration resolution order is:
 
 The default config file path is `./config.toml`. Override it with `BRRPOLICE_CONFIG=/path/to/config.toml`.
 
-The qBittorrent password is not read from the TOML file. `main` resolves it from the env var named by `qbittorrent.password_env`, which defaults to `QBITTORRENT_PASSWORD`.
+If auth is enabled, `main` resolves the qBittorrent password from the env var named by `qbittorrent.password_env`. `qbittorrent.username` and `qbittorrent.password_env` must either both be set or both be unset.
 
 Example `config.toml`:
 
 ```toml
 [qbittorrent]
 base_url = "http://127.0.0.1:8080"
-username = "admin"
-password_env = "QBITTORRENT_PASSWORD"
+# set both fields to enable auth, or leave both unset to disable it
+username = ""
+password_env = ""
 poll_interval = "30s"
 request_timeout = "10s"
 
@@ -128,7 +129,7 @@ Supported environment overrides:
 
 ## Run locally
 
-Set the qBittorrent password env var, then start the service:
+If auth is enabled, set the qBittorrent password env var, then start the service:
 
 ```bash
 export QBITTORRENT_PASSWORD='your-password'
@@ -139,7 +140,7 @@ To point at a non-default config file:
 
 ```bash
 export BRRPOLICE_CONFIG=/path/to/config.toml
-export QBITTORRENT_PASSWORD='your-password'
+export QBITTORRENT_PASSWORD='your-password' # only when auth is enabled
 cargo run
 ```
 

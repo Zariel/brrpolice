@@ -43,8 +43,8 @@ impl AppConfig {
     ) -> Result<Self> {
         let raw = Config::builder()
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
-            .set_default("qbittorrent.username", "admin")?
-            .set_default("qbittorrent.password_env", "QBITTORRENT_PASSWORD")?
+            .set_default("qbittorrent.username", "")?
+            .set_default("qbittorrent.password_env", "")?
             .set_default("qbittorrent.poll_interval", "30s")?
             .set_default("qbittorrent.request_timeout", "10s")?
             .set_default("policy.slow_rate_bps", 262_144_u64)?
@@ -172,13 +172,17 @@ impl AppConfig {
             bail!("qbittorrent.base_url must not include URL credentials");
         }
 
-        if self.qbittorrent.username.trim().is_empty() {
-            bail!("qbittorrent.username must not be empty");
+        let username = self.qbittorrent.username.trim();
+        let password_env = self.qbittorrent.password_env.trim();
+        match (username.is_empty(), password_env.is_empty()) {
+            (true, true) => {}
+            (false, false) => validate_env_var_name(password_env)?,
+            _ => {
+                bail!(
+                    "qbittorrent.username and qbittorrent.password_env must either both be set or both be unset"
+                );
+            }
         }
-        if self.qbittorrent.password_env.trim().is_empty() {
-            bail!("qbittorrent.password_env must not be empty");
-        }
-        validate_env_var_name(&self.qbittorrent.password_env)?;
         require_positive_duration(self.qbittorrent.poll_interval, "qbittorrent.poll_interval")?;
         require_positive_duration(
             self.qbittorrent.request_timeout,
@@ -250,8 +254,8 @@ impl Default for QbittorrentConfig {
     fn default() -> Self {
         Self {
             base_url: "http://qbittorrent:8080".to_string(),
-            username: "admin".to_string(),
-            password_env: "QBITTORRENT_PASSWORD".to_string(),
+            username: String::new(),
+            password_env: String::new(),
             poll_interval: Duration::from_secs(30),
             request_timeout: Duration::from_secs(10),
         }
@@ -484,6 +488,8 @@ mod tests {
         let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
+        assert_eq!(config.qbittorrent.username, "");
+        assert_eq!(config.qbittorrent.password_env, "");
         assert_eq!(config.policy.slow_rate_bps, 262_144);
         assert_eq!(
             config.policy.ban_ladder.durations,
@@ -586,6 +592,10 @@ allowlist_peer_ips = ["127.0.0.1"]
                     "from-env".to_string(),
                 ),
                 (
+                    "BRRPOLICE_QBITTORRENT__PASSWORD_ENV".to_string(),
+                    "QB_PASSWORD".to_string(),
+                ),
+                (
                     "BRRPOLICE_POLICY__SLOW_RATE_BPS".to_string(),
                     "4096".to_string(),
                 ),
@@ -598,6 +608,7 @@ allowlist_peer_ips = ["127.0.0.1"]
         .unwrap();
 
         assert_eq!(config.qbittorrent.username, "from-env");
+        assert_eq!(config.qbittorrent.password_env, "QB_PASSWORD");
         assert_eq!(config.policy.slow_rate_bps, 4096);
         assert_eq!(
             config.filters.allowlist_peer_ips,
@@ -643,12 +654,51 @@ request_timeout = "10s"
             temp_dir.path(),
             r#"
 [qbittorrent]
+username = "admin"
 password_env = "1NOT_VALID"
 "#,
         );
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("password_env must start"));
+    }
+
+    #[test]
+    fn rejects_username_without_password_env() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+username = "admin"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must either both be set or both be unset")
+        );
+    }
+
+    #[test]
+    fn rejects_password_env_without_username() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+password_env = "QBITTORRENT_PASSWORD"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must either both be set or both be unset")
+        );
     }
 
     #[test]

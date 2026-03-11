@@ -74,9 +74,14 @@ impl QbittorrentClient {
     }
 
     pub async fn authenticate(&self) -> Result<()> {
+        if !self.auth_enabled() {
+            return Ok(());
+        }
+
+        let username = self.config.username.trim();
         let response = self
             .execute_request(self.client.post(self.api_url(AUTH_LOGIN_PATH)?).form(&[
-                ("username", self.config.username.as_str()),
+                ("username", username),
                 ("password", self.password.expose_secret()),
             ]))
             .await
@@ -91,7 +96,7 @@ impl QbittorrentClient {
                 status = %status,
                 response_body = body.trim(),
                 base_url = %self.base_url,
-                username = %self.config.username,
+                username = username,
                 "qbittorrent authentication failed"
             );
             bail!(
@@ -103,7 +108,7 @@ impl QbittorrentClient {
         info!(
             login_url = %self.api_url(AUTH_LOGIN_PATH)?,
             base_url = %self.base_url,
-            username = %self.config.username,
+            username = username,
             "qbittorrent authentication succeeded"
         );
         Ok(())
@@ -188,7 +193,7 @@ impl QbittorrentClient {
         F: Fn() -> RequestBuilder,
     {
         let response = self.execute_request(build()).await?;
-        if response.status() == StatusCode::FORBIDDEN {
+        if response.status() == StatusCode::FORBIDDEN && self.auth_enabled() {
             self.authenticate().await?;
             let retried = self
                 .execute_request(build())
@@ -518,6 +523,10 @@ impl QbittorrentClient {
         Ok(BanSyncResult {
             banned_ips: managed_banned_ips.to_vec(),
         })
+    }
+
+    fn auth_enabled(&self) -> bool {
+        !self.config.username.trim().is_empty() && !self.config.password_env.trim().is_empty()
     }
 }
 
@@ -1124,6 +1133,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticate_is_noop_when_credentials_are_unset() {
+        let server = MockServer::start().await;
+        let client = network_test_client_without_auth(&server.uri());
+        client.authenticate().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn authenticated_requests_retry_after_login_and_reuse_cookie() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1634,6 +1650,24 @@ mod tests {
 
     fn network_test_client(base_url: &str) -> QbittorrentClient {
         network_scoped_test_client(base_url, FiltersConfig::default())
+    }
+
+    fn network_test_client_without_auth(base_url: &str) -> QbittorrentClient {
+        QbittorrentClient::new(
+            QbittorrentConfig {
+                base_url: format!("{}/", base_url.trim_end_matches('/')),
+                username: String::new(),
+                password_env: String::new(),
+                poll_interval: std::time::Duration::from_secs(30),
+                request_timeout: std::time::Duration::from_secs(5),
+            },
+            String::new(),
+            FiltersConfig::default(),
+            3,
+            std::time::Duration::from_secs(5),
+            Arc::new(AppMetrics::new()),
+        )
+        .unwrap()
     }
 
     fn network_scoped_test_client(base_url: &str, filters: FiltersConfig) -> QbittorrentClient {
