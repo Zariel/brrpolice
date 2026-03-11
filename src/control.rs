@@ -901,10 +901,7 @@ mod tests {
         sync::watch,
         time::{self, timeout},
     };
-    use wiremock::{
-        Mock, MockServer, Request, Respond, ResponseTemplate,
-        matchers::any,
-    };
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::any};
 
     use crate::{
         config::{
@@ -2089,7 +2086,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 remaining = expected_requests.lock().unwrap().len();
             }
-            assert_eq!(remaining, 0, "{remaining} expected request(s) were not observed");
+            assert_eq!(
+                remaining, 0,
+                "{remaining} expected request(s) were not observed"
+            );
             drop(server);
         });
 

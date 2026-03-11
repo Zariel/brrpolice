@@ -725,7 +725,10 @@ mod tests {
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let initial = seeded_peer(60, 0.10, 500);
-        let first = engine.evaluate_peer(&seeded_peer(120, 0.111, 500), Some(&engine.begin_session(&initial, None)));
+        let first = engine.evaluate_peer(
+            &seeded_peer(120, 0.111, 500),
+            Some(&engine.begin_session(&initial, None)),
+        );
         assert!(!first.is_bad_sample);
 
         let second = engine.evaluate_peer(&seeded_peer(180, 0.127, 500), Some(&first.session));

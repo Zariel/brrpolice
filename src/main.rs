@@ -42,14 +42,14 @@ async fn main() -> Result<()> {
     let qb_password = if config.qbittorrent.username.trim().is_empty() {
         SecretString::from(String::new())
     } else {
-        SecretString::from(std::env::var(&config.qbittorrent.password_env).with_context(
-            || {
+        SecretString::from(
+            std::env::var(&config.qbittorrent.password_env).with_context(|| {
                 format!(
                     "missing qbittorrent password env `{}`",
                     config.qbittorrent.password_env
                 )
-            },
-        )?)
+            })?,
+        )
     };
 
     let qbittorrent = Arc::new(QbittorrentClient::new(

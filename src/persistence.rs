@@ -622,7 +622,10 @@ impl Persistence {
 }
 
 fn resolve_migrations_path() -> Result<PathBuf> {
-    let mut candidates = vec![PathBuf::from("./migrations"), PathBuf::from("/app/migrations")];
+    let mut candidates = vec![
+        PathBuf::from("./migrations"),
+        PathBuf::from("/app/migrations"),
+    ];
     if let Ok(executable) = env::current_exe()
         && let Some(parent) = executable.parent()
     {
@@ -815,9 +818,7 @@ fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
         baseline_progress: row.baseline_progress,
         latest_progress: row.latest_progress,
         rolling_avg_up_rate_bps: u64::try_from(row.rolling_avg_up_rate_bps)?,
-        observed_duration: Duration::from_secs(u64::try_from(
-            row.observed_seconds,
-        )?),
+        observed_duration: Duration::from_secs(u64::try_from(row.observed_seconds)?),
         bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
         sample_count: u32::try_from(row.sample_count)?,
         last_torrent_seeder_count: u32::try_from(row.last_torrent_seeder_count)?,
@@ -1774,11 +1775,7 @@ mod tests {
         .unwrap();
 
         let error = persistence.run_migrations().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to run sqlx migrations")
-        );
+        assert!(error.to_string().contains("failed to run sqlx migrations"));
         assert!(!persistence.is_ready().await);
     }
 

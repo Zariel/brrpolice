@@ -511,10 +511,7 @@ mod tests {
         assert_eq!(config.logging.level, "warn");
         assert_eq!(config.policy.slow_rate_bps, 65_536);
         assert_eq!(config.policy.min_progress_delta, 0.005);
-        assert_eq!(
-            config.policy.new_peer_grace_period,
-            Duration::from_secs(60)
-        );
+        assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
         assert_eq!(
             config.policy.min_observation_duration,
             Duration::from_secs(300)
@@ -867,7 +864,11 @@ request_timeout = "10s"
         path: &Path,
         overrides: HashMap<String, String>,
     ) -> anyhow::Result<AppConfig> {
-        AppConfig::load_from_path_with_env_source(path, Some(overrides.into_iter().collect()), false)
+        AppConfig::load_from_path_with_env_source(
+            path,
+            Some(overrides.into_iter().collect()),
+            false,
+        )
     }
 
     fn load_test_config_via_env_var(path: PathBuf) -> anyhow::Result<AppConfig> {
