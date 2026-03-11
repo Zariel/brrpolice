@@ -27,16 +27,6 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
-const SQLX_MIGRATIONS_TABLE_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-    version BIGINT PRIMARY KEY,
-    description TEXT NOT NULL,
-    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    success BOOLEAN NOT NULL,
-    checksum BLOB NOT NULL,
-    execution_time BIGINT NOT NULL
-)
-"#;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -152,7 +142,6 @@ impl Persistence {
     pub async fn run_migrations(&self) -> Result<()> {
         self.migrations_succeeded.store(false, Ordering::Relaxed);
 
-        self.bootstrap_legacy_migration_state().await?;
         MIGRATOR
             .run(&self.pool)
             .await
@@ -168,79 +157,6 @@ impl Persistence {
             "migration complete"
         );
         Ok(())
-    }
-
-    async fn bootstrap_legacy_migration_state(&self) -> Result<()> {
-        if self.table_exists("_sqlx_migrations").await?
-            || !self.table_exists("schema_migrations").await?
-        {
-            return Ok(());
-        }
-
-        let max_version =
-            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM schema_migrations")
-                .fetch_one(&self.pool)
-                .await?
-                .unwrap_or(0);
-        if max_version <= 0 {
-            return Ok(());
-        }
-        if max_version > CURRENT_SCHEMA_VERSION {
-            bail!(
-                "database schema version {} is newer than supported version {}",
-                max_version,
-                CURRENT_SCHEMA_VERSION
-            );
-        }
-        for version in 1..=max_version {
-            if !MIGRATOR.version_exists(version) {
-                bail!(
-                    "legacy schema version {} has no matching sqlx migration version",
-                    version
-                );
-            }
-        }
-
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(SQLX_MIGRATIONS_TABLE_SQL)
-            .execute(&mut *tx)
-            .await?;
-        for migration in MIGRATOR.iter() {
-            if migration.version > max_version || migration.migration_type.is_down_migration() {
-                continue;
-            }
-
-            sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO _sqlx_migrations (
-                    version,
-                    description,
-                    success,
-                    checksum,
-                    execution_time
-                )
-                VALUES (?, ?, TRUE, ?, -1)
-                "#,
-            )
-            .bind(migration.version)
-            .bind(&*migration.description)
-            .bind(&*migration.checksum)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-
-        Ok(())
-    }
-
-    async fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table_name)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count > 0)
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -1724,27 +1640,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_upgrade_existing_version_one_schema() {
+    async fn migrations_can_run_repeatedly() {
         let persistence = test_persistence().await;
-        let mut tx = persistence.pool.begin().await.unwrap();
-        sqlx::query(include_str!("../migrations/0001_initial_schema.sql"))
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-        )
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema')",
-        )
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-
+        persistence.run_migrations().await.unwrap();
         persistence.run_migrations().await.unwrap();
 
         let bannable_since_exists = sqlx::query_scalar::<_, i64>(
@@ -1768,40 +1666,30 @@ mod tests {
         assert_eq!(bannable_since_exists, 1);
         assert_eq!(last_ban_decision_exists, 1);
         assert_eq!(pending_ban_intents_exists, 1);
-        let applied_sqlx_migrations = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
-        )
-        .fetch_one(&persistence.pool)
-        .await
-        .unwrap();
-        assert_eq!(applied_sqlx_migrations, CURRENT_SCHEMA_VERSION);
     }
 
     #[tokio::test]
-    async fn migrations_fail_on_newer_schema_version() {
+    async fn migrations_fail_when_db_has_unknown_applied_version() {
         let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
 
         sqlx::query(
             r#"
-            CREATE TABLE schema_migrations (
-                version INTEGER PRIMARY KEY,
-                description TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
+            INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+            VALUES (?, 'future', TRUE, X'00', -1)
             "#,
         )
+        .bind(CURRENT_SCHEMA_VERSION + 1)
         .execute(&persistence.pool)
         .await
         .unwrap();
 
-        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, 'future')")
-            .bind(CURRENT_SCHEMA_VERSION + 1)
-            .execute(&persistence.pool)
-            .await
-            .unwrap();
-
         let error = persistence.run_migrations().await.unwrap_err();
-        assert!(error.to_string().contains("newer than supported version"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to run sqlx migrations")
+        );
         assert!(!persistence.is_ready().await);
     }
 
