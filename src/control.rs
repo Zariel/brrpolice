@@ -763,12 +763,17 @@ fn has_active_ban(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        sync::watch,
+    use tokio::sync::watch;
+    use wiremock::{
+        Mock, MockServer, Request, Respond, ResponseTemplate,
+        matchers::any,
     };
 
     use crate::{
@@ -1789,65 +1794,110 @@ mod tests {
         response: &'static str,
     }
 
+    struct SequenceResponder {
+        expected_requests: Arc<Mutex<VecDeque<ExpectedRequest>>>,
+    }
+
+    impl Respond for SequenceResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let expected = self
+                .expected_requests
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected request: {}", format_request(request)));
+
+            assert_eq!(
+                request.method.as_str(),
+                expected.method,
+                "method mismatch for request: {}",
+                format_request(request)
+            );
+            assert_eq!(
+                request_path_and_query(request),
+                expected.path,
+                "path mismatch for request: {}",
+                format_request(request)
+            );
+            let rendered = format_request(request);
+            for needle in expected.must_contain {
+                assert!(
+                    rendered.contains(needle),
+                    "request missing `{needle}`: {rendered}"
+                );
+            }
+
+            response_template(expected.response)
+        }
+    }
+
     async fn spawn_server(
         expected_requests: Vec<ExpectedRequest>,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = MockServer::start().await;
+        let expected_requests = Arc::new(Mutex::new(VecDeque::from(expected_requests)));
+        Mock::given(any())
+            .respond_with(SequenceResponder {
+                expected_requests: expected_requests.clone(),
+            })
+            .mount(&server)
+            .await;
+        let base_url = format!("{}/", server.uri());
         let handle = tokio::spawn(async move {
-            for expected in expected_requests {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await.unwrap();
-                assert!(request.starts_with(&format!("{} {} ", expected.method, expected.path)));
-                for needle in expected.must_contain {
-                    assert!(
-                        request.contains(needle),
-                        "request missing `{needle}`: {request}"
-                    );
+            let mut remaining = expected_requests.lock().unwrap().len();
+            for _ in 0..500 {
+                if remaining == 0 {
+                    break;
                 }
-                stream
-                    .write_all(expected.response.as_bytes())
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                remaining = expected_requests.lock().unwrap().len();
             }
+            assert_eq!(remaining, 0, "{remaining} expected request(s) were not observed");
+            drop(server);
         });
 
-        (format!("http://{address}/"), handle)
+        (base_url, handle)
     }
 
-    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> io::Result<String> {
-        let mut buffer = Vec::new();
-        let mut header = [0_u8; 1024];
-        loop {
-            let read = stream.read(&mut header).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&header[..read]);
-            if let Some(request) = complete_request(&buffer) {
-                return Ok(request);
-            }
+    fn request_path_and_query(request: &Request) -> String {
+        let mut path = request.url.path().to_string();
+        if let Some(query) = request.url.query() {
+            path.push('?');
+            path.push_str(query);
         }
-        Ok(String::from_utf8_lossy(&buffer).to_string())
+        path
     }
 
-    fn complete_request(buffer: &[u8]) -> Option<String> {
-        let marker = b"\r\n\r\n";
-        let header_end = buffer
-            .windows(marker.len())
-            .position(|window| window == marker)?;
-        let header_end = header_end + marker.len();
-        let request = String::from_utf8_lossy(buffer).to_string();
-        let content_length = request
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if buffer.len() >= header_end + content_length {
-            Some(request)
-        } else {
-            None
+    fn format_request(request: &Request) -> String {
+        let mut rendered = format!("{} {}", request.method, request_path_and_query(request));
+        for (name, value) in &request.headers {
+            rendered.push_str("\r\n");
+            rendered.push_str(name.as_str().to_ascii_lowercase().as_str());
+            rendered.push_str(": ");
+            rendered.push_str(value.to_str().unwrap_or_default());
         }
+        rendered.push_str("\r\n\r\n");
+        rendered.push_str(String::from_utf8_lossy(&request.body).as_ref());
+        rendered
+    }
+
+    fn response_template(raw: &str) -> ResponseTemplate {
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(200);
+        let mut response = ResponseTemplate::new(status);
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                response = response.insert_header(name.trim(), value.trim());
+            }
+        }
+        if !body.is_empty() {
+            response = response.set_body_string(body.to_string());
+        }
+        response
     }
 }
