@@ -130,7 +130,7 @@ qBittorrent auth rule:
 | `database.path` | `BRRPOLICE_DATABASE__PATH` | `/data/brrpolice.sqlite` | SQLite database location for sessions, bans, and offence history. |
 | `database.busy_timeout` | `BRRPOLICE_DATABASE__BUSY_TIMEOUT` | `5s` | SQLite busy timeout for lock contention. |
 | `http.bind` | `BRRPOLICE_HTTP__BIND` | `0.0.0.0:9090` | HTTP bind address for `/healthz`, `/readyz`, and `/metrics`. |
-| `logging.level` | `BRRPOLICE_LOGGING__LEVEL` | `info` | Log level filter (for example `trace`, `debug`, `info`, `warn`, `error`). |
+| `logging.level` | `BRRPOLICE_LOGGING__LEVEL` | `warn` | Log level filter (for example `trace`, `debug`, `info`, `warn`, `error`). At `info`, peer policy decisions are emitted; at `warn`, non-fatal errors and peer bans are emitted. |
 | `logging.format` | `BRRPOLICE_LOGGING__FORMAT` | `json` | Output format: `json`, `plain`, or `text`. |
 
 ## Environment Overrides

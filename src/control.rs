@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::{sync::watch, time};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::AppConfig,
@@ -133,7 +133,7 @@ impl ControlLoop {
                             );
                         }
                         Err(error) => {
-                            error!(?error, "control loop tick failed after retries");
+                            warn!(?error, "control loop tick failed after retries");
                         }
                     }
                 }
@@ -261,7 +261,7 @@ impl ControlLoop {
                     .await?;
 
                 if evaluation.is_bad_sample {
-                    warn!(
+                    info!(
                         torrent_hash = %torrent.hash,
                         peer_ip = %peer.peer.ip,
                         peer_port = peer.peer.port,
@@ -320,7 +320,7 @@ impl ControlLoop {
                             .await
                         {
                             self.metrics.record_ban_failure();
-                            error!(
+                            warn!(
                                 torrent_hash = %torrent.hash,
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
@@ -349,7 +349,7 @@ impl ControlLoop {
                             Ok(stored) => stored,
                             Err(error) => {
                                 self.metrics.record_ban_failure();
-                                error!(
+                                warn!(
                                     torrent_hash = %torrent.hash,
                                     peer_ip = %decision.peer_ip,
                                     peer_port = decision.peer_port,
@@ -386,7 +386,7 @@ impl ControlLoop {
                             ban_count += 1;
                             self.metrics
                                 .record_ban_applied(evaluation.session.bad_duration);
-                            info!(
+                            warn!(
                                 torrent_hash = %torrent.hash,
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
@@ -403,7 +403,7 @@ impl ControlLoop {
                         }
                     }
                     BanDisposition::Exempt(reason) => {
-                        debug!(
+                        info!(
                             torrent_hash = %torrent.hash,
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
@@ -418,7 +418,57 @@ impl ControlLoop {
                             .upsert_peer_session(&evaluation.session, "policy-v1")
                             .await?;
                     }
-                    _ => {
+                    BanDisposition::NotBannableYet {
+                        observed_duration,
+                        required_observation,
+                        bad_duration,
+                        required_bad_duration,
+                    } => {
+                        info!(
+                            torrent_hash = %torrent.hash,
+                            peer_ip = %peer.peer.ip,
+                            peer_port = peer.peer.port,
+                            observed_at = ?observed_at,
+                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            progress_delta = evaluation.progress_delta,
+                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                            observed_duration_seconds = observed_duration.as_secs(),
+                            required_observation_seconds = required_observation.as_secs(),
+                            observed_bad_duration_seconds = bad_duration.as_secs(),
+                            required_bad_duration_seconds = required_bad_duration.as_secs(),
+                            "peer not bannable yet decision"
+                        );
+                        self.persistence
+                            .upsert_peer_session(&evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                    BanDisposition::RebanCooldown { remaining } => {
+                        info!(
+                            torrent_hash = %torrent.hash,
+                            peer_ip = %peer.peer.ip,
+                            peer_port = peer.peer.port,
+                            observed_at = ?observed_at,
+                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            progress_delta = evaluation.progress_delta,
+                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                            reban_cooldown_remaining_seconds = remaining.as_secs(),
+                            "peer reban cooldown decision"
+                        );
+                        self.persistence
+                            .upsert_peer_session(&evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                    BanDisposition::DuplicateSuppressed => {
+                        info!(
+                            torrent_hash = %torrent.hash,
+                            peer_ip = %peer.peer.ip,
+                            peer_port = peer.peer.port,
+                            observed_at = ?observed_at,
+                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            progress_delta = evaluation.progress_delta,
+                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                            "peer duplicate ban suppression decision"
+                        );
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
                             .await?;
@@ -491,7 +541,7 @@ impl ControlLoop {
             .reconcile_expired_bans(&remaining_active_bans, &expired_bans)
             .await
             .inspect_err(|error| {
-                error!(
+                warn!(
                     expired_ban_count = expired_bans.len(),
                     remaining_active_ban_count = remaining_active_bans.len(),
                     reconciled_at = ?reconciled_at,
@@ -708,7 +758,7 @@ impl ControlLoop {
             self.metrics.record_ban_applied(intent.bad_duration);
         }
 
-        info!(
+        warn!(
             torrent_hash = %intent.torrent_hash,
             peer_ip = %intent.peer_ip,
             peer_port = intent.peer_port,

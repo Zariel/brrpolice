@@ -67,7 +67,7 @@ impl AppConfig {
             .set_default("database.path", "/data/brrpolice.sqlite")?
             .set_default("database.busy_timeout", "5s")?
             .set_default("http.bind", "0.0.0.0:9090")?
-            .set_default("logging.level", "info")?
+            .set_default("logging.level", "warn")?
             .set_default("logging.format", "json")?
             .add_source(
                 File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(require_file),
@@ -391,7 +391,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info".to_string(),
+            level: "warn".to_string(),
             format: "json".to_string(),
         }
     }
@@ -507,6 +507,7 @@ mod tests {
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
+        assert_eq!(config.logging.level, "warn");
         assert_eq!(config.policy.slow_rate_bps, 262_144);
         assert_eq!(
             config.policy.ban_ladder.durations,

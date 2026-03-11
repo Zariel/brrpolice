@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{FiltersConfig, QbittorrentConfig},
@@ -92,7 +92,7 @@ impl QbittorrentClient {
             .context("failed to read qbittorrent login response")?;
         if status != StatusCode::OK || body.trim() != "Ok." {
             self.metrics.record_qbittorrent_api_error();
-            error!(
+            warn!(
                 status = %status,
                 response_body = body.trim(),
                 base_url = %self.base_url,
