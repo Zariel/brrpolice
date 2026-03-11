@@ -258,6 +258,9 @@ impl ControlLoop {
                         self.persistence
                             .upsert_pending_ban_intent(&pending_intent)
                             .await?;
+                        self.persistence
+                            .upsert_peer_session(&evaluation.session, "policy-v1")
+                            .await?;
                         let active_ban = ActiveBanRecord {
                             peer_ip: decision.peer_ip,
                             peer_port: decision.peer_port,
@@ -1683,6 +1686,18 @@ mod tests {
                 .last_error
                 .contains("failed to apply qbittorrent peer ban")
         );
+        let persisted_session = persistence
+            .get_peer_session(&PeerObservationId {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: "10.0.0.10".parse().unwrap(),
+                peer_port: 51413,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_session.sample_count, 3);
+        assert_eq!(persisted_session.latest_progress, 0.1005);
+        assert_eq!(persisted_session.last_ban_decision_at, None);
         assert!(persistence.load_active_bans().await.unwrap().is_empty());
         assert!(
             persistence
