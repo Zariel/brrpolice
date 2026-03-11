@@ -1,14 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
-    env,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use config::{Config, File, FileFormat};
+use config::{Config, Environment, File, FileFormat, Map};
 use humantime::parse_duration;
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -33,57 +32,45 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let file = path
-            .or_else(|| env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from))
+            .or_else(|| std::env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.toml"));
-        Self::load_from_path_with_env(&file, &read_env_var)
+        Self::load_from_path_with_env_source(&file, None)
     }
 
-    fn load_from_path_with_env<F>(path: &Path, read_env: &F) -> Result<Self>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        Self::from_builder_with_env(
-            Config::builder()
-                .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
-                .set_default("qbittorrent.username", "admin")?
-                .set_default("qbittorrent.password_env", "QBITTORRENT_PASSWORD")?
-                .set_default("qbittorrent.poll_interval", "30s")?
-                .set_default("qbittorrent.request_timeout", "10s")?
-                .set_default("policy.slow_rate_bps", 262_144_u64)?
-                .set_default("policy.min_progress_delta", 0.0025_f64)?
-                .set_default("policy.new_peer_grace_period", "5m")?
-                .set_default("policy.min_observation_duration", "20m")?
-                .set_default("policy.bad_for_duration", "15m")?
-                .set_default("policy.decay_window", "60m")?
-                .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
-                .set_default("policy.min_total_seeders", 3_u32)?
-                .set_default("policy.reban_cooldown", "30m")?
-                .set_default(
-                    "policy.ban_ladder.durations",
-                    vec!["1h", "6h", "24h", "168h"],
-                )?
-                .set_default("database.path", "/data/brrpolice.sqlite")?
-                .set_default("database.busy_timeout", "5s")?
-                .set_default("http.bind", "0.0.0.0:9090")?
-                .set_default("logging.level", "info")?
-                .set_default("logging.format", "json")?
-                .add_source(
-                    File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
-                ),
-            read_env,
-        )
-    }
-
-    fn from_builder_with_env<F>(
-        builder: config::ConfigBuilder<config::builder::DefaultState>,
-        read_env: &F,
-    ) -> Result<Self>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        let raw = builder.build()?;
-        let mut parsed = raw.try_deserialize::<AppConfig>()?;
-        parsed.apply_env_overrides(read_env)?;
+    fn load_from_path_with_env_source(
+        path: &Path,
+        env_source: Option<Map<String, String>>,
+    ) -> Result<Self> {
+        let raw = Config::builder()
+            .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
+            .set_default("qbittorrent.username", "admin")?
+            .set_default("qbittorrent.password_env", "QBITTORRENT_PASSWORD")?
+            .set_default("qbittorrent.poll_interval", "30s")?
+            .set_default("qbittorrent.request_timeout", "10s")?
+            .set_default("policy.slow_rate_bps", 262_144_u64)?
+            .set_default("policy.min_progress_delta", 0.0025_f64)?
+            .set_default("policy.new_peer_grace_period", "5m")?
+            .set_default("policy.min_observation_duration", "20m")?
+            .set_default("policy.bad_for_duration", "15m")?
+            .set_default("policy.decay_window", "60m")?
+            .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
+            .set_default("policy.min_total_seeders", 3_u32)?
+            .set_default("policy.reban_cooldown", "30m")?
+            .set_default(
+                "policy.ban_ladder.durations",
+                vec!["1h", "6h", "24h", "168h"],
+            )?
+            .set_default("database.path", "/data/brrpolice.sqlite")?
+            .set_default("database.busy_timeout", "5s")?
+            .set_default("http.bind", "0.0.0.0:9090")?
+            .set_default("logging.level", "info")?
+            .set_default("logging.format", "json")?
+            .add_source(
+                File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
+            )
+            .add_source(environment_source(env_source))
+            .build()?;
+        let parsed = raw.try_deserialize::<AppConfig>()?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -169,144 +156,6 @@ impl AppConfig {
             self.logging.level,
             self.logging.format,
         )
-    }
-
-    fn apply_env_overrides<F>(&mut self, read_env: &F) -> Result<()>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        apply_string_override(
-            "BRRPOLICE_QBITTORRENT__BASE_URL",
-            &mut self.qbittorrent.base_url,
-            read_env,
-        );
-        apply_string_override(
-            "BRRPOLICE_QBITTORRENT__USERNAME",
-            &mut self.qbittorrent.username,
-            read_env,
-        );
-        apply_string_override(
-            "BRRPOLICE_QBITTORRENT__PASSWORD_ENV",
-            &mut self.qbittorrent.password_env,
-            read_env,
-        );
-        apply_duration_override(
-            "BRRPOLICE_QBITTORRENT__POLL_INTERVAL",
-            &mut self.qbittorrent.poll_interval,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT",
-            &mut self.qbittorrent.request_timeout,
-            read_env,
-        )?;
-
-        apply_u64_override(
-            "BRRPOLICE_POLICY__SLOW_RATE_BPS",
-            &mut self.policy.slow_rate_bps,
-            read_env,
-        )?;
-        apply_f64_override(
-            "BRRPOLICE_POLICY__MIN_PROGRESS_DELTA",
-            &mut self.policy.min_progress_delta,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD",
-            &mut self.policy.new_peer_grace_period,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION",
-            &mut self.policy.min_observation_duration,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_POLICY__BAD_FOR_DURATION",
-            &mut self.policy.bad_for_duration,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_POLICY__DECAY_WINDOW",
-            &mut self.policy.decay_window,
-            read_env,
-        )?;
-        apply_f64_override(
-            "BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE",
-            &mut self.policy.ignore_peer_progress_at_or_above,
-            read_env,
-        )?;
-        apply_u32_override(
-            "BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS",
-            &mut self.policy.min_total_seeders,
-            read_env,
-        )?;
-        apply_duration_override(
-            "BRRPOLICE_POLICY__REBAN_COOLDOWN",
-            &mut self.policy.reban_cooldown,
-            read_env,
-        )?;
-        apply_duration_list_override(
-            "BRRPOLICE_POLICY__BAN_LADDER__DURATIONS",
-            &mut self.policy.ban_ladder.durations,
-            read_env,
-        )?;
-
-        apply_list_override(
-            "BRRPOLICE_FILTERS__INCLUDE_CATEGORIES",
-            &mut self.filters.include_categories,
-            read_env,
-        );
-        apply_list_override(
-            "BRRPOLICE_FILTERS__EXCLUDE_CATEGORIES",
-            &mut self.filters.exclude_categories,
-            read_env,
-        );
-        apply_list_override(
-            "BRRPOLICE_FILTERS__INCLUDE_TAGS",
-            &mut self.filters.include_tags,
-            read_env,
-        );
-        apply_list_override(
-            "BRRPOLICE_FILTERS__EXCLUDE_TAGS",
-            &mut self.filters.exclude_tags,
-            read_env,
-        );
-        apply_list_override(
-            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
-            &mut self.filters.allowlist_peer_ips,
-            read_env,
-        );
-        apply_list_override(
-            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS",
-            &mut self.filters.allowlist_peer_cidrs,
-            read_env,
-        );
-
-        apply_path_override(
-            "BRRPOLICE_DATABASE__PATH",
-            &mut self.database.path,
-            read_env,
-        );
-        apply_duration_override(
-            "BRRPOLICE_DATABASE__BUSY_TIMEOUT",
-            &mut self.database.busy_timeout,
-            read_env,
-        )?;
-
-        apply_string_override("BRRPOLICE_HTTP__BIND", &mut self.http.bind, read_env);
-        apply_string_override(
-            "BRRPOLICE_LOGGING__LEVEL",
-            &mut self.logging.level,
-            read_env,
-        );
-        apply_string_override(
-            "BRRPOLICE_LOGGING__FORMAT",
-            &mut self.logging.format,
-            read_env,
-        );
-
-        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -535,7 +384,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = String::deserialize(deserializer)?;
-    parse_duration(&raw).map_err(serde::de::Error::custom)
+    parse_duration(raw.trim()).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_duration_vec<'de, D>(deserializer: D) -> Result<Vec<Duration>, D::Error>
@@ -544,7 +393,7 @@ where
 {
     let raw = Vec::<String>::deserialize(deserializer)?;
     raw.into_iter()
-        .map(|value| parse_duration(&value).map_err(serde::de::Error::custom))
+        .map(|value| parse_duration(value.trim()).map_err(serde::de::Error::custom))
         .collect()
 }
 
@@ -556,116 +405,25 @@ fn require_positive_duration(duration: Duration, field_name: &str) -> Result<()>
     Ok(())
 }
 
-fn apply_string_override<F>(key: &str, target: &mut String, read_env: &F)
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = value;
+fn environment_source(source: Option<Map<String, String>>) -> Environment {
+    let mut env = Environment::with_prefix("BRRPOLICE")
+        .prefix_separator("_")
+        .separator("__")
+        .ignore_empty(true)
+        .list_separator(",")
+        .try_parsing(true);
+    for key in [
+        "policy.ban_ladder.durations",
+        "filters.include_categories",
+        "filters.exclude_categories",
+        "filters.include_tags",
+        "filters.exclude_tags",
+        "filters.allowlist_peer_ips",
+        "filters.allowlist_peer_cidrs",
+    ] {
+        env = env.with_list_parse_key(key);
     }
-}
-
-fn apply_path_override<F>(key: &str, target: &mut PathBuf, read_env: &F)
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = PathBuf::from(value);
-    }
-}
-
-fn apply_duration_override<F>(key: &str, target: &mut Duration, read_env: &F) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = parse_duration(&value)
-            .with_context(|| format!("invalid duration in environment variable `{key}`"))?;
-    }
-
-    Ok(())
-}
-
-fn apply_duration_list_override<F>(
-    key: &str,
-    target: &mut Vec<Duration>,
-    read_env: &F,
-) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = split_env_list(&value)
-            .into_iter()
-            .map(|item| {
-                parse_duration(&item)
-                    .with_context(|| format!("invalid duration in environment variable `{key}`"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-    }
-
-    Ok(())
-}
-
-fn apply_u64_override<F>(key: &str, target: &mut u64, read_env: &F) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = value
-            .parse()
-            .with_context(|| format!("invalid u64 in environment variable `{key}`"))?;
-    }
-
-    Ok(())
-}
-
-fn apply_u32_override<F>(key: &str, target: &mut u32, read_env: &F) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = value
-            .parse()
-            .with_context(|| format!("invalid u32 in environment variable `{key}`"))?;
-    }
-
-    Ok(())
-}
-
-fn apply_f64_override<F>(key: &str, target: &mut f64, read_env: &F) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = value
-            .parse()
-            .with_context(|| format!("invalid f64 in environment variable `{key}`"))?;
-    }
-
-    Ok(())
-}
-
-fn apply_list_override<F>(key: &str, target: &mut Vec<String>, read_env: &F)
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = read_env(key) {
-        *target = split_env_list(&value);
-    }
-}
-
-fn read_env_var(key: &str) -> Option<String> {
-    env::var(key).ok().map(|value| value.trim().to_string())
-}
-
-fn split_env_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    env.source(source)
 }
 
 fn validate_env_var_name(name: &str) -> Result<()> {
@@ -947,6 +705,6 @@ format = "yaml"
         path: &Path,
         overrides: HashMap<String, String>,
     ) -> anyhow::Result<AppConfig> {
-        AppConfig::load_from_path_with_env(path, &|key| overrides.get(key).cloned())
+        AppConfig::load_from_path_with_env_source(path, Some(overrides.into_iter().collect()))
     }
 }
