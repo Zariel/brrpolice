@@ -467,7 +467,13 @@ mod tests {
 
     #[test]
     fn classifies_grace_period_exemption() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
+        let engine = PolicyEngine::new(
+            PolicyConfig {
+                new_peer_grace_period: Duration::from_secs(300),
+                ..PolicyConfig::default()
+            },
+            &FiltersConfig::default(),
+        );
 
         match engine.classify_exemption(&test_peer()) {
             Some(ExemptionReason::NewPeerGracePeriod { grace_period, .. }) => {

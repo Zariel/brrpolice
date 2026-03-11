@@ -51,9 +51,9 @@ impl AppConfig {
             .set_default("qbittorrent.password_env", "")?
             .set_default("qbittorrent.poll_interval", "30s")?
             .set_default("qbittorrent.request_timeout", "10s")?
-            .set_default("policy.slow_rate_bps", 262_144_u64)?
+            .set_default("policy.slow_rate_bps", 65_536_u64)?
             .set_default("policy.min_progress_delta", 0.0025_f64)?
-            .set_default("policy.new_peer_grace_period", "5m")?
+            .set_default("policy.new_peer_grace_period", "60s")?
             .set_default("policy.min_observation_duration", "20m")?
             .set_default("policy.bad_for_duration", "15m")?
             .set_default("policy.decay_window", "60m")?
@@ -296,9 +296,9 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            slow_rate_bps: 262_144,
+            slow_rate_bps: 65_536,
             min_progress_delta: 0.0025,
-            new_peer_grace_period: Duration::from_secs(300),
+            new_peer_grace_period: Duration::from_secs(60),
             min_observation_duration: Duration::from_secs(1_200),
             bad_for_duration: Duration::from_secs(900),
             decay_window: Duration::from_secs(3_600),
@@ -508,7 +508,11 @@ mod tests {
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
         assert_eq!(config.logging.level, "warn");
-        assert_eq!(config.policy.slow_rate_bps, 262_144);
+        assert_eq!(config.policy.slow_rate_bps, 65_536);
+        assert_eq!(
+            config.policy.new_peer_grace_period,
+            Duration::from_secs(60)
+        );
         assert_eq!(
             config.policy.ban_ladder.durations,
             vec![
