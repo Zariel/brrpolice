@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod http;
+mod metrics;
 mod persistence;
 mod policy;
 mod qbittorrent;
@@ -14,8 +15,9 @@ use tokio::{signal, sync::watch};
 use tracing::{error, info};
 
 use crate::{
-    config::AppConfig, control::ControlLoop, http::HttpServer, persistence::Persistence,
-    policy::PolicyEngine, qbittorrent::QbittorrentClient, runtime::ServiceState,
+    config::AppConfig, control::ControlLoop, http::HttpServer, metrics::AppMetrics,
+    persistence::Persistence, policy::PolicyEngine, qbittorrent::QbittorrentClient,
+    runtime::ServiceState,
 };
 
 #[tokio::main]
@@ -28,7 +30,9 @@ async fn main() -> Result<()> {
     let persistence = Arc::new(Persistence::connect(&config.database).await?);
     persistence.run_migrations().await?;
     let state = Arc::new(ServiceState::new());
+    let metrics = Arc::new(AppMetrics::new());
     state.mark_database_ready();
+    metrics.set_sqlite_size_bytes(persistence.sqlite_size_bytes().await?);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let qb_password = std::env::var(&config.qbittorrent.password_env).with_context(|| {
@@ -44,6 +48,7 @@ async fn main() -> Result<()> {
         config.filters.clone(),
         config.policy.min_total_seeders,
         config.qbittorrent.request_timeout,
+        metrics.clone(),
     )?);
     qbittorrent.authenticate().await?;
     state.mark_qbittorrent_ready();
@@ -53,6 +58,7 @@ async fn main() -> Result<()> {
         config.clone(),
         persistence.clone(),
         state.clone(),
+        metrics.clone(),
         shutdown_rx.clone(),
     );
     let control_loop = ControlLoop::new(
@@ -61,6 +67,7 @@ async fn main() -> Result<()> {
         qbittorrent,
         policy,
         state.clone(),
+        metrics,
         shutdown_rx,
     );
     let _startup_snapshot = control_loop.recover_startup_state().await?;

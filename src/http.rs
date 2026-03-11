@@ -12,10 +12,13 @@ use axum::{
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::{config::AppConfig, persistence::Persistence, runtime::ServiceState};
+use crate::{
+    config::AppConfig, metrics::AppMetrics, persistence::Persistence, runtime::ServiceState,
+};
 
 #[derive(Clone)]
 struct HttpState {
+    metrics: Arc<AppMetrics>,
     persistence: Arc<Persistence>,
     service_state: Arc<ServiceState>,
 }
@@ -31,11 +34,13 @@ impl HttpServer {
         config: Arc<AppConfig>,
         persistence: Arc<Persistence>,
         service_state: Arc<ServiceState>,
+        metrics: Arc<AppMetrics>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
             config,
             state: HttpState {
+                metrics,
                 persistence,
                 service_state,
             },
@@ -84,8 +89,12 @@ async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
     }
 }
 
-async fn metrics() -> Response {
-    let mut response = Response::new(Body::from("# metrics exporter not wired yet\n"));
+async fn metrics(State(state): State<HttpState>) -> Response {
+    let body = state
+        .metrics
+        .render()
+        .unwrap_or_else(|_| "# metrics encoding failed\n".to_string());
+    let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
@@ -104,7 +113,10 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
-    use crate::{config::DatabaseConfig, persistence::Persistence, runtime::ServiceState};
+    use crate::{
+        config::DatabaseConfig, metrics::AppMetrics, persistence::Persistence,
+        runtime::ServiceState,
+    };
 
     use super::{HttpState, build_router};
 
@@ -164,10 +176,9 @@ mod tests {
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            "# metrics exporter not wired yet\n"
-        );
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("# TYPE brrpolice_active_bans gauge"));
+        assert!(body.contains("brrpolice_peers_evaluated"));
     }
 
     async fn test_router() -> Router {
@@ -181,8 +192,10 @@ mod tests {
         );
         persistence.run_migrations().await.unwrap();
         let service_state = Arc::new(ServiceState::new());
+        let metrics = Arc::new(AppMetrics::new());
 
         build_router(HttpState {
+            metrics,
             persistence,
             service_state,
         })

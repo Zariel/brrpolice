@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::AppConfig,
+    metrics::AppMetrics,
     persistence::{ActiveBanRecord, Persistence, RecoverySnapshot},
     policy::PolicyEngine,
     qbittorrent::QbittorrentClient,
@@ -20,6 +21,7 @@ pub struct ControlLoop {
     qbittorrent: Arc<QbittorrentClient>,
     policy: Arc<PolicyEngine>,
     service_state: Arc<ServiceState>,
+    metrics: Arc<AppMetrics>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -40,6 +42,7 @@ impl ControlLoop {
         qbittorrent: Arc<QbittorrentClient>,
         policy: Arc<PolicyEngine>,
         service_state: Arc<ServiceState>,
+        metrics: Arc<AppMetrics>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
@@ -48,6 +51,7 @@ impl ControlLoop {
             qbittorrent,
             policy,
             service_state,
+            metrics,
             shutdown,
         }
     }
@@ -73,6 +77,7 @@ impl ControlLoop {
             .await?;
         self.mark_expired_bans_reconciled(&expired_bans, now)
             .await?;
+        self.refresh_gauges().await?;
         self.service_state.mark_recovery_complete();
         info!(
             peer_session_count = snapshot.peer_sessions.len(),
@@ -120,6 +125,7 @@ impl ControlLoop {
         let observed_at = std::time::SystemTime::now();
         self.reconcile_expired_bans(observed_at).await?;
         let torrents = self.qbittorrent.list_in_scope_torrents().await?;
+        self.metrics.set_in_scope_torrents(torrents.len());
         let mut active_bans = self.persistence.load_active_bans().await?;
         let mut peer_count = 0;
         let mut ban_count = 0;
@@ -168,6 +174,7 @@ impl ControlLoop {
                     has_active_ban,
                 };
                 let evaluation = self.policy.evaluate_peer(&peer_context, existing.as_ref());
+                self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
                 let history = self
                     .persistence
                     .load_offence_history(&evaluation.session.offence_identity)
@@ -196,16 +203,20 @@ impl ControlLoop {
                                 },
                                 &active_before,
                             )
-                            .await?;
+                            .await
+                            .inspect_err(|_| self.metrics.record_ban_failure())?;
                         let stored = self
                             .persistence
                             .record_ban_enforcement(&evaluation, &decision, observed_at)
-                            .await?;
+                            .await
+                            .inspect_err(|_| self.metrics.record_ban_failure())?;
                         if let Some(active_ban) = stored.active_ban {
                             active_bans.push(active_ban);
                         }
                         if !stored.duplicate_suppressed {
                             ban_count += 1;
+                            self.metrics
+                                .record_ban_applied(evaluation.session.bad_duration);
                         }
                     }
                     _ => {
@@ -217,6 +228,8 @@ impl ControlLoop {
             }
         }
 
+        self.refresh_gauges().await?;
+
         Ok(PollCycleResult {
             torrent_count: torrents.len(),
             peer_count,
@@ -227,12 +240,17 @@ impl ControlLoop {
     async fn run_poll_cycle_with_retry(&mut self) -> Result<PollCycleResult> {
         let mut attempt = 0;
         loop {
+            let started = std::time::Instant::now();
             match self.run_poll_cycle().await {
                 Ok(result) => {
+                    self.metrics.record_poll_loop_duration(started.elapsed());
+                    self.metrics
+                        .mark_successful_poll(std::time::SystemTime::now());
                     self.service_state.mark_runtime_healthy();
                     return Ok(result);
                 }
                 Err(error) => {
+                    self.metrics.record_poll_loop_duration(started.elapsed());
                     self.service_state.mark_runtime_unhealthy();
                     if attempt >= MAX_CYCLE_RETRIES {
                         return Err(error);
@@ -276,8 +294,20 @@ impl ControlLoop {
 
         self.mark_expired_bans_reconciled(&expired_bans, reconciled_at)
             .await?;
+        self.metrics.record_bans_expired(expired_bans.len());
+        self.refresh_gauges().await?;
 
         Ok(expired_bans.len())
+    }
+
+    async fn refresh_gauges(&self) -> Result<()> {
+        self.metrics
+            .set_active_tracked_peers(self.persistence.count_peer_sessions().await?);
+        self.metrics
+            .set_active_bans(self.persistence.count_active_bans().await?);
+        self.metrics
+            .set_sqlite_size_bytes(self.persistence.sqlite_size_bytes().await?);
+        Ok(())
     }
 
     async fn mark_expired_bans_reconciled(
@@ -359,6 +389,7 @@ mod tests {
             AppConfig, BanLadderConfig, DatabaseConfig, FiltersConfig, HttpConfig, LoggingConfig,
             PolicyConfig, QbittorrentConfig,
         },
+        metrics::AppMetrics,
         persistence::{ActiveBanRecord, Persistence},
         policy::PolicyEngine,
         runtime::ServiceState,
@@ -371,6 +402,7 @@ mod tests {
     async fn startup_recovery_loads_snapshot_and_marks_recovery_complete() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
         let rounded_now = std::time::UNIX_EPOCH
             + Duration::from_secs(
                 std::time::SystemTime::now()
@@ -424,6 +456,7 @@ mod tests {
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
+                metrics.clone(),
             )
             .unwrap(),
         );
@@ -435,6 +468,7 @@ mod tests {
             qbittorrent,
             policy,
             state.clone(),
+            metrics,
             shutdown_rx,
         );
 
@@ -451,6 +485,7 @@ mod tests {
     async fn startup_recovery_reconciles_expired_bans_and_revokes_offence() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
 
         let expired_ban = ActiveBanRecord {
             peer_ip: "10.0.0.10".parse().unwrap(),
@@ -502,6 +537,7 @@ mod tests {
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
+                metrics.clone(),
             )
             .unwrap(),
         );
@@ -513,6 +549,7 @@ mod tests {
             qbittorrent,
             policy,
             state,
+            metrics,
             shutdown_rx,
         );
 
@@ -536,6 +573,7 @@ mod tests {
     async fn run_poll_cycle_orchestrates_ban_and_persistence() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
         persistence
             .upsert_peer_session(
                 &PeerSessionState {
@@ -633,6 +671,7 @@ mod tests {
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
+                metrics.clone(),
             )
             .unwrap(),
         );
@@ -644,6 +683,7 @@ mod tests {
             qbittorrent,
             policy,
             state,
+            metrics,
             shutdown_rx,
         );
 
@@ -686,6 +726,7 @@ mod tests {
     async fn run_poll_cycle_skips_torrent_after_peer_fetch_failure() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
 
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
@@ -722,6 +763,7 @@ mod tests {
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
+                metrics.clone(),
             )
             .unwrap(),
         );
@@ -733,6 +775,7 @@ mod tests {
             qbittorrent,
             policy,
             state,
+            metrics,
             shutdown_rx,
         );
 
@@ -764,6 +807,7 @@ mod tests {
     async fn run_poll_cycle_with_retry_restores_readiness_after_transient_failure() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
 
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
@@ -802,6 +846,7 @@ mod tests {
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
+                metrics.clone(),
             )
             .unwrap(),
         );
@@ -813,6 +858,7 @@ mod tests {
             qbittorrent,
             policy,
             state.clone(),
+            metrics,
             shutdown_rx,
         );
 

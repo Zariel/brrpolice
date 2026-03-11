@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,6 +13,7 @@ use tracing::debug;
 
 use crate::{
     config::{FiltersConfig, QbittorrentConfig},
+    metrics::AppMetrics,
     persistence::ActiveBanRecord,
     types::{PeerObservationId, PeerSnapshot, TorrentPeer, TorrentSummary},
 };
@@ -31,6 +33,7 @@ pub struct QbittorrentClient {
     password: String,
     filters: FiltersConfig,
     min_total_seeders: u32,
+    metrics: Arc<AppMetrics>,
     client: Client,
     base_url: Url,
 }
@@ -47,6 +50,7 @@ impl QbittorrentClient {
         filters: FiltersConfig,
         min_total_seeders: u32,
         timeout: Duration,
+        metrics: Arc<AppMetrics>,
     ) -> Result<Self> {
         let base_url = Url::parse(&config.base_url).context("invalid qbittorrent.base_url")?;
         let client = Client::builder()
@@ -59,6 +63,7 @@ impl QbittorrentClient {
             password,
             filters,
             min_total_seeders,
+            metrics,
             client,
             base_url,
         })
@@ -66,13 +71,10 @@ impl QbittorrentClient {
 
     pub async fn authenticate(&self) -> Result<()> {
         let response = self
-            .client
-            .post(self.api_url(AUTH_LOGIN_PATH)?)
-            .form(&[
+            .execute_request(self.client.post(self.api_url(AUTH_LOGIN_PATH)?).form(&[
                 ("username", self.config.username.as_str()),
                 ("password", self.password.as_str()),
-            ])
-            .send()
+            ]))
             .await
             .context("qbittorrent login request failed")?;
         let status = response.status();
@@ -81,6 +83,7 @@ impl QbittorrentClient {
             .await
             .context("failed to read qbittorrent login response")?;
         if status != StatusCode::OK || body.trim() != "Ok." {
+            self.metrics.record_qbittorrent_api_error();
             bail!(
                 "qbittorrent login failed: status={} body={}",
                 status,
@@ -165,17 +168,35 @@ impl QbittorrentClient {
     where
         F: Fn() -> RequestBuilder,
     {
-        let response = build().send().await.context("qbittorrent request failed")?;
+        let response = self.execute_request(build()).await?;
         if response.status() == StatusCode::FORBIDDEN {
             self.authenticate().await?;
-            let retried = build()
-                .send()
+            let retried = self
+                .execute_request(build())
                 .await
                 .context("qbittorrent authenticated retry failed")?;
             return Self::ensure_success(retried).await;
         }
 
         Self::ensure_success(response).await
+    }
+
+    async fn execute_request(&self, request: RequestBuilder) -> Result<reqwest::Response> {
+        let started = std::time::Instant::now();
+        let result = request.send().await.context("qbittorrent request failed");
+        self.metrics.record_qbittorrent_request(started.elapsed());
+        match result {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    self.metrics.record_qbittorrent_api_error();
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.metrics.record_qbittorrent_api_error();
+                Err(error)
+            }
+        }
     }
 
     async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -450,6 +471,7 @@ mod tests {
     use std::{
         io,
         net::{IpAddr, Ipv4Addr},
+        sync::Arc,
     };
 
     use tokio::{
@@ -464,6 +486,7 @@ mod tests {
     };
     use crate::{
         config::{FiltersConfig, QbittorrentConfig},
+        metrics::AppMetrics,
         persistence::ActiveBanRecord,
         types::{PeerObservationId, TorrentSummary},
     };
@@ -847,6 +870,7 @@ mod tests {
             filters,
             3,
             std::time::Duration::from_secs(10),
+            Arc::new(AppMetrics::new()),
         )
         .unwrap()
     }
@@ -1300,6 +1324,7 @@ mod tests {
             filters,
             3,
             std::time::Duration::from_secs(10),
+            Arc::new(AppMetrics::new()),
         )
         .unwrap()
     }

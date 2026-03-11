@@ -1,6 +1,6 @@
 use std::{
     net::IpAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -81,6 +81,7 @@ pub struct RecoverySnapshot {
 
 #[derive(Clone)]
 pub struct Persistence {
+    database_path: Option<PathBuf>,
     pool: SqlitePool,
     migrations_succeeded: Arc<AtomicBool>,
 }
@@ -114,6 +115,7 @@ impl Persistence {
             .await?;
 
         Ok(Self {
+            database_path: (config.path != Path::new(":memory:")).then(|| config.path.clone()),
             pool,
             migrations_succeeded: Arc::new(AtomicBool::new(false)),
         })
@@ -224,6 +226,33 @@ impl Persistence {
         .await?;
 
         rows.into_iter().map(decode_peer_session).collect()
+    }
+
+    pub async fn count_peer_sessions(&self) -> Result<usize> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM peer_sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as usize)
+    }
+
+    pub async fn count_active_bans(&self) -> Result<usize> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM active_bans WHERE reconciled_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
+    pub async fn sqlite_size_bytes(&self) -> Result<Option<u64>> {
+        let Some(path) = &self.database_path else {
+            return Ok(None);
+        };
+
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to read sqlite metadata `{}`", path.display()))?;
+        Ok(Some(metadata.len()))
     }
 
     pub async fn get_peer_session(
