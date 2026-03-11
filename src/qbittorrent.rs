@@ -140,26 +140,34 @@ impl QbittorrentClient {
             )
         })?;
 
-        let banned_ips = self.managed_banned_ips(active_bans.iter().chain(std::iter::once(ban)));
-        self.sync_banned_ips(&banned_ips).await.with_context(|| {
-            format!(
-                "failed to persist managed banned IPs after banning {}:{}",
-                ban.peer_ip, ban.peer_port
-            )
-        })
+        let previous_managed_ips = self.managed_banned_ips(active_bans.iter());
+        let managed_banned_ips =
+            self.managed_banned_ips(active_bans.iter().chain(std::iter::once(ban)));
+        self.sync_banned_ips(&managed_banned_ips, &previous_managed_ips)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to persist managed banned IPs after banning {}:{}",
+                    ban.peer_ip, ban.peer_port
+                )
+            })
     }
 
     pub async fn reconcile_expired_bans(
         &self,
         active_bans: &[ActiveBanRecord],
+        previous_managed_bans: &[ActiveBanRecord],
     ) -> Result<BanSyncResult> {
-        let banned_ips = self.managed_banned_ips(active_bans.iter());
-        self.sync_banned_ips(&banned_ips).await.with_context(|| {
-            format!(
-                "failed to reconcile qbittorrent banned IPs from {} active bans",
-                active_bans.len()
-            )
-        })
+        let managed_banned_ips = self.managed_banned_ips(active_bans.iter());
+        let previous_managed_ips = self.managed_banned_ips(previous_managed_bans.iter());
+        self.sync_banned_ips(&managed_banned_ips, &previous_managed_ips)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to reconcile qbittorrent banned IPs from {} active bans",
+                    active_bans.len()
+                )
+            })
     }
 
     async fn authenticated_get_text(&self, url: Url) -> Result<String> {
@@ -244,6 +252,10 @@ impl QbittorrentClient {
 
     fn ban_peers_url(&self) -> Result<Url> {
         self.api_url(TRANSFER_BAN_PEERS_PATH)
+    }
+
+    fn preferences_url(&self) -> Result<Url> {
+        self.api_url(APP_PREFERENCES_PATH)
     }
 
     fn set_preferences_url(&self) -> Result<Url> {
@@ -423,14 +435,14 @@ impl QbittorrentClient {
     fn encode_ban_peers(&self, peers: &[(IpAddr, u16)]) -> String {
         peers
             .iter()
-            .map(|(ip, port)| format!("{ip}:{port}"))
+            .map(|(ip, port)| SocketAddr::new(*ip, *port).to_string())
             .collect::<Vec<_>>()
             .join("|")
     }
 
-    fn encode_banned_ips_preferences(&self, banned_ips: &[IpAddr]) -> Result<String> {
+    fn encode_banned_ips_preferences(&self, banned_ip_entries: &[String]) -> Result<String> {
         Ok(serde_json::json!({
-            "banned_IPs": banned_ips.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+            "banned_IPs": banned_ip_entries.join("\n")
         })
         .to_string())
     }
@@ -447,9 +459,53 @@ impl QbittorrentClient {
             .collect()
     }
 
-    async fn sync_banned_ips(&self, banned_ips: &[IpAddr]) -> Result<BanSyncResult> {
+    fn merge_banned_ip_entries(
+        &self,
+        existing_entries: &BTreeSet<String>,
+        managed_banned_ips: &[IpAddr],
+        previous_managed_ips: &[IpAddr],
+    ) -> Vec<String> {
+        let mut merged_entries = existing_entries.clone();
+        for ip in previous_managed_ips {
+            merged_entries.remove(&ip.to_string());
+        }
+        for ip in managed_banned_ips {
+            merged_entries.insert(ip.to_string());
+        }
+        merged_entries.into_iter().collect()
+    }
+
+    fn parse_banned_ip_entries(&self, body: &str) -> Result<BTreeSet<String>> {
+        let preferences: QbPreferences =
+            serde_json::from_str(body).context("invalid qbittorrent app preferences payload")?;
+        Ok(preferences
+            .banned_ips
+            .lines()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn load_banned_ip_entries(&self) -> Result<BTreeSet<String>> {
+        let preferences_url = self.preferences_url()?;
+        let body = self.authenticated_get_text(preferences_url).await?;
+        self.parse_banned_ip_entries(&body)
+    }
+
+    async fn sync_banned_ips(
+        &self,
+        managed_banned_ips: &[IpAddr],
+        previous_managed_ips: &[IpAddr],
+    ) -> Result<BanSyncResult> {
+        let existing_entries = self.load_banned_ip_entries().await?;
+        let merged_entries = self.merge_banned_ip_entries(
+            &existing_entries,
+            managed_banned_ips,
+            previous_managed_ips,
+        );
         let preferences_url = self.set_preferences_url()?;
-        let payload = self.encode_banned_ips_preferences(banned_ips)?;
+        let payload = self.encode_banned_ips_preferences(&merged_entries)?;
         self.send_authenticated(|| {
             self.client
                 .post(preferences_url.clone())
@@ -458,7 +514,7 @@ impl QbittorrentClient {
         .await?;
 
         Ok(BanSyncResult {
-            banned_ips: banned_ips.to_vec(),
+            banned_ips: managed_banned_ips.to_vec(),
         })
     }
 }
@@ -502,6 +558,12 @@ struct QbPeer {
     up_speed: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct QbPreferences {
+    #[serde(rename = "banned_IPs", default)]
+    banned_ips: String,
+}
+
 fn empty_string_to_none(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
@@ -530,7 +592,7 @@ fn parse_peer_key(key: &str) -> Option<SocketAddr> {
 mod tests {
     use std::{
         io,
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
         sync::Arc,
     };
 
@@ -569,6 +631,10 @@ mod tests {
         );
         assert_eq!(
             client.api_url(APP_PREFERENCES_PATH).unwrap().as_str(),
+            "http://qbittorrent:8080/api/v2/app/preferences"
+        );
+        assert_eq!(
+            client.preferences_url().unwrap().as_str(),
             "http://qbittorrent:8080/api/v2/app/preferences"
         );
         assert_eq!(
@@ -880,17 +946,17 @@ mod tests {
         assert_eq!(
             client.encode_ban_peers(&[
                 (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)), 51413),
-                (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)), 51414),
+                (
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                    51414,
+                ),
             ]),
-            "10.0.0.10:51413|10.0.0.11:51414"
+            "10.0.0.10:51413|[2001:db8::1]:51414"
         );
 
         assert_eq!(
             client
-                .encode_banned_ips_preferences(&[
-                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
-                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
-                ])
+                .encode_banned_ips_preferences(&["10.0.0.10".to_string(), "10.0.0.11".to_string(),])
                 .unwrap(),
             r#"{"banned_IPs":"10.0.0.10\n10.0.0.11"}"#
         );
@@ -909,6 +975,28 @@ mod tests {
             vec![
                 "10.0.0.10".parse::<IpAddr>().unwrap(),
                 "10.0.0.11".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_and_merges_banned_ip_entries_preserving_external_rules() {
+        let client = test_client();
+        let existing = client
+            .parse_banned_ip_entries(r#"{"banned_IPs":"10.0.0.10\n203.0.113.0/24\n"}"#)
+            .unwrap();
+        let merged = client.merge_banned_ip_entries(
+            &existing,
+            &["10.0.0.11".parse().unwrap(), "10.0.0.12".parse().unwrap()],
+            &["10.0.0.10".parse().unwrap()],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "10.0.0.11".to_string(),
+                "10.0.0.12".to_string(),
+                "203.0.113.0/24".to_string(),
             ]
         );
     }
@@ -1121,9 +1209,21 @@ mod tests {
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
             ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.11\\n198.51.100.0/24\"}",
+            },
+            ExpectedRequest {
                 method: "POST",
                 path: "/api/v2/app/setPreferences",
-                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.10", "10.0.0.11"],
+                must_contain: vec![
+                    "cookie: SID=abc",
+                    "json=",
+                    "10.0.0.10",
+                    "10.0.0.11",
+                    "198.51.100.0%2F24",
+                ],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
         ])
@@ -1135,9 +1235,8 @@ mod tests {
             .apply_peer_ban(
                 &ban,
                 &[
-                    ban.clone(),
                     active_ban("10.0.0.11", 51414, "torrent:def456"),
-                    active_ban("10.0.0.10", 51415, "torrent:ghi789"),
+                    active_ban("10.0.0.11", 51415, "torrent:ghi789"),
                 ],
             )
             .await
@@ -1160,9 +1259,9 @@ mod tests {
     async fn reconcile_expired_bans_syncs_remaining_managed_ips() {
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec!["json="],
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
                 response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
             },
             ExpectedRequest {
@@ -1172,9 +1271,21 @@ mod tests {
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
             },
             ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.10\\n10.0.0.12\\n203.0.113.0/24\"}",
+            },
+            ExpectedRequest {
                 method: "POST",
                 path: "/api/v2/app/setPreferences",
-                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11", "10.0.0.12"],
+                must_contain: vec![
+                    "cookie: SID=abc",
+                    "json=",
+                    "10.0.0.11",
+                    "10.0.0.12",
+                    "203.0.113.0%2F24",
+                ],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
         ])
@@ -1182,11 +1293,18 @@ mod tests {
 
         let client = network_test_client(&base_url);
         let result = client
-            .reconcile_expired_bans(&[
-                active_ban("10.0.0.12", 51416, "torrent:xyz999"),
-                active_ban("10.0.0.11", 51414, "torrent:def456"),
-                active_ban("10.0.0.11", 51415, "torrent:ghi789"),
-            ])
+            .reconcile_expired_bans(
+                &[
+                    active_ban("10.0.0.12", 51416, "torrent:xyz999"),
+                    active_ban("10.0.0.11", 51414, "torrent:def456"),
+                    active_ban("10.0.0.11", 51415, "torrent:ghi789"),
+                ],
+                &[
+                    active_ban("10.0.0.10", 51413, "torrent:old111"),
+                    active_ban("10.0.0.12", 51416, "torrent:xyz999"),
+                    active_ban("10.0.0.11", 51414, "torrent:def456"),
+                ],
+            )
             .await
             .unwrap();
 
@@ -1237,15 +1355,33 @@ mod tests {
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
             ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.10", "10.0.0.11"],
-                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.11\\n198.51.100.0/24\"}",
             },
             ExpectedRequest {
                 method: "POST",
                 path: "/api/v2/app/setPreferences",
-                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11"],
+                must_contain: vec![
+                    "cookie: SID=abc",
+                    "json=",
+                    "10.0.0.10",
+                    "10.0.0.11",
+                    "198.51.100.0%2F24",
+                ],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.10\\n10.0.0.11\\n198.51.100.0/24\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json=", "10.0.0.11", "198.51.100.0%2F24"],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             },
         ])
@@ -1284,7 +1420,13 @@ mod tests {
         );
 
         let reconcile_result = client
-            .reconcile_expired_bans(&[active_ban("10.0.0.11", 51414, "torrent:def456")])
+            .reconcile_expired_bans(
+                &[active_ban("10.0.0.11", 51414, "torrent:def456")],
+                &[
+                    active_ban("10.0.0.10", 51413, "torrent:abc123"),
+                    active_ban("10.0.0.11", 51414, "torrent:def456"),
+                ],
+            )
             .await
             .unwrap();
         assert_eq!(

@@ -71,9 +71,14 @@ impl ControlLoop {
             .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at <= now)
             .cloned()
             .collect::<Vec<_>>();
+        let previously_managed_bans = active_bans
+            .iter()
+            .chain(expired_bans.iter())
+            .cloned()
+            .collect::<Vec<_>>();
         let sync_result = self
             .qbittorrent
-            .reconcile_expired_bans(&active_bans)
+            .reconcile_expired_bans(&active_bans, &previously_managed_bans)
             .await?;
         self.mark_expired_bans_reconciled(&expired_bans, now)
             .await?;
@@ -389,7 +394,7 @@ impl ControlLoop {
             .collect::<Vec<_>>();
 
         self.qbittorrent
-            .reconcile_expired_bans(&remaining_active_bans)
+            .reconcile_expired_bans(&remaining_active_bans, &expired_bans)
             .await
             .inspect_err(|error| {
                 error!(
@@ -548,9 +553,9 @@ mod tests {
 
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
-                method: "POST",
-                path: "/api/v2/app/setPreferences",
-                must_contain: vec!["json=", "10.0.0.10"],
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
                 response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
             },
             ExpectedRequest {
@@ -558,6 +563,12 @@ mod tests {
                 path: "/api/v2/auth/login",
                 must_contain: vec!["username=admin", "password=secret"],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
             },
             ExpectedRequest {
                 method: "POST",
@@ -641,12 +652,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (base_url, server) = spawn_server(vec![ExpectedRequest {
-            method: "POST",
-            path: "/api/v2/app/setPreferences",
-            must_contain: vec!["json="],
-            response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-        }])
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"10.0.0.10\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json="],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
         .await;
 
         let state = Arc::new(ServiceState::new());
@@ -757,6 +776,12 @@ mod tests {
                 path: "/api/v2/transfer/banPeers",
                 must_contain: vec!["cookie: SID=abc", "peers=10.0.0.10%3A51413"],
                 response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
             },
             ExpectedRequest {
                 method: "POST",
