@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
 
     let persistence = Arc::new(Persistence::connect(&config.database).await?);
     persistence.run_migrations().await?;
+    persistence
+        .update_service_meta(env!("CARGO_PKG_VERSION"), &config.fingerprint())
+        .await?;
     let state = Arc::new(ServiceState::new());
     let metrics = Arc::new(AppMetrics::new());
     state.mark_database_ready();

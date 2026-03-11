@@ -102,6 +102,75 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn fingerprint(&self) -> String {
+        fn join(values: &[String]) -> String {
+            values.join(",")
+        }
+
+        format!(
+            concat!(
+                "qb.base_url={}\n",
+                "qb.username={}\n",
+                "qb.password_env={}\n",
+                "qb.poll_interval={}\n",
+                "qb.request_timeout={}\n",
+                "policy.slow_rate_bps={}\n",
+                "policy.min_progress_delta={:.6}\n",
+                "policy.new_peer_grace_period={}\n",
+                "policy.min_observation_duration={}\n",
+                "policy.bad_for_duration={}\n",
+                "policy.decay_window={}\n",
+                "policy.ignore_peer_progress_at_or_above={:.6}\n",
+                "policy.min_total_seeders={}\n",
+                "policy.reban_cooldown={}\n",
+                "policy.ban_ladder={}\n",
+                "filters.include_categories={}\n",
+                "filters.exclude_categories={}\n",
+                "filters.include_tags={}\n",
+                "filters.exclude_tags={}\n",
+                "filters.allowlist_peer_ips={}\n",
+                "filters.allowlist_peer_cidrs={}\n",
+                "database.path={}\n",
+                "database.busy_timeout={}\n",
+                "http.bind={}\n",
+                "logging.level={}\n",
+                "logging.format={}\n"
+            ),
+            self.qbittorrent.base_url,
+            self.qbittorrent.username,
+            self.qbittorrent.password_env,
+            self.qbittorrent.poll_interval.as_secs(),
+            self.qbittorrent.request_timeout.as_secs(),
+            self.policy.slow_rate_bps,
+            self.policy.min_progress_delta,
+            self.policy.new_peer_grace_period.as_secs(),
+            self.policy.min_observation_duration.as_secs(),
+            self.policy.bad_for_duration.as_secs(),
+            self.policy.decay_window.as_secs(),
+            self.policy.ignore_peer_progress_at_or_above,
+            self.policy.min_total_seeders,
+            self.policy.reban_cooldown.as_secs(),
+            self.policy
+                .ban_ladder
+                .durations
+                .iter()
+                .map(|duration| duration.as_secs().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            join(&self.filters.include_categories),
+            join(&self.filters.exclude_categories),
+            join(&self.filters.include_tags),
+            join(&self.filters.exclude_tags),
+            join(&self.filters.allowlist_peer_ips),
+            join(&self.filters.allowlist_peer_cidrs),
+            self.database.path.display(),
+            self.database.busy_timeout.as_secs(),
+            self.http.bind,
+            self.logging.level,
+            self.logging.format,
+        )
+    }
+
     fn apply_env_overrides<F>(&mut self, read_env: &F) -> Result<()>
     where
         F: Fn(&str) -> Option<String>,
@@ -843,6 +912,29 @@ format = "yaml"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("unsupported logging format"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_changes_when_config_changes() {
+        let temp_dir = tempdir().unwrap();
+        let baseline =
+            load_test_config(&temp_dir.path().join("missing.toml"), HashMap::new()).unwrap();
+        let changed = load_test_config(
+            &temp_dir.path().join("missing.toml"),
+            HashMap::from([(
+                "BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS".to_string(),
+                "7".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            baseline.fingerprint(),
+            load_test_config(&temp_dir.path().join("missing.toml"), HashMap::new())
+                .unwrap()
+                .fingerprint()
+        );
+        assert_ne!(baseline.fingerprint(), changed.fingerprint());
     }
 
     fn write_config(dir: &Path, content: &str) -> std::path::PathBuf {
