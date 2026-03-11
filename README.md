@@ -7,6 +7,7 @@ This repository currently covers the local binary and container-friendly runtime
 ## Requirements
 
 - Rust toolchain with `cargo`
+- Nix with flakes enabled (for OCI image build/publish)
 - Reachable qBittorrent WebUI API
 - A qBittorrent password provided through an environment variable
 - A writable location for the SQLite database when not using `:memory:`
@@ -23,24 +24,29 @@ Build an optimized binary with:
 cargo build --release
 ```
 
-## Docker image
+## OCI image (Nix + Crane)
 
-Build the image locally:
+Build an OCI image archive:
 
 ```bash
-docker build -t brrpolice:local .
+nix build .#ociImage
 ```
 
-Run it with a mounted database path:
+Load and run it with Docker:
 
 ```bash
+docker load -i "$(nix build .#ociImage --print-out-paths --no-link)"
 docker run --rm -p 9090:9090 \
   -e QBITTORRENT_PASSWORD='your-password' \
   -v "$(pwd)/.data:/data" \
-  brrpolice:local
+  brrpolice:latest
 ```
 
-The image is multi-stage and runs on `distroless` as a non-root user.
+Publish to a registry with crane after logging in:
+
+```bash
+nix run .#publish-image -- ghcr.io/<owner>/brrpolice:<tag>
+```
 
 ## Configuration
 
@@ -167,7 +173,7 @@ The tests are hermetic and should not depend on ambient qBittorrent credentials 
 Workflows under `.github/workflows` provide:
 
 - `ci.yml`: runs `cargo test` and `cargo clippy` on pushes and pull requests.
-- `docker-publish.yml`: builds and publishes to GHCR on branch and `v*` tag pushes.
+- `docker-publish.yml`: builds an OCI archive with Nix and publishes to GHCR with `crane` on branch and `v*` tag pushes.
 
 Published image naming:
 
