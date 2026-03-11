@@ -214,11 +214,10 @@ impl Persistence {
         torrent_hash: &str,
         peer_ip: IpAddr,
     ) -> Result<Option<PeerSessionState>> {
-        let row = sqlx::query(
+        let row = sqlx::query_as::<_, PeerSessionRow>(
             r#"
             SELECT
                 torrent_hash,
-                peer_key,
                 peer_ip,
                 peer_port,
                 first_seen_at,
@@ -317,7 +316,7 @@ impl Persistence {
         &self,
         as_of: SystemTime,
     ) -> Result<Vec<ActiveBanRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query_as::<_, ActiveBanRow>(
             r#"
             SELECT
                 peer_ip,
@@ -472,7 +471,7 @@ impl Persistence {
         &self,
         peer_ip: IpAddr,
     ) -> Result<Vec<PeerOffenceRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query_as::<_, PeerOffenceRow>(
             r#"
             SELECT
                 id,
@@ -613,6 +612,77 @@ impl Persistence {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct ServiceMetaRow {
+    schema_version: i64,
+    service_version: String,
+    config_hash: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PeerSessionRow {
+    torrent_hash: String,
+    peer_ip: String,
+    peer_port: i64,
+    first_seen_at: String,
+    last_seen_at: String,
+    baseline_progress: f64,
+    latest_progress: f64,
+    rolling_avg_up_rate_bps: i64,
+    observed_seconds: i64,
+    bad_seconds: i64,
+    sample_count: i64,
+    last_torrent_seeder_count: i64,
+    last_exemption_reason: Option<String>,
+    bannable_since: Option<String>,
+    last_ban_decision_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveBanRow {
+    peer_ip: String,
+    peer_port: i64,
+    scope: String,
+    offence_number: i64,
+    reason: String,
+    created_at: String,
+    expires_at: String,
+    reconciled_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PeerOffenceRow {
+    id: i64,
+    torrent_hash: String,
+    peer_ip: String,
+    peer_port: i64,
+    offence_number: i64,
+    reason_code: String,
+    observed_seconds: i64,
+    bad_seconds: i64,
+    progress_delta: f64,
+    avg_up_rate_bps: i64,
+    banned_at: String,
+    ban_expires_at: String,
+    ban_revoked_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingBanIntentRow {
+    torrent_hash: String,
+    peer_ip: String,
+    peer_port: i64,
+    offence_number: i64,
+    reason_code: String,
+    observed_at: String,
+    ban_expires_at: String,
+    bad_seconds: i64,
+    progress_delta: f64,
+    avg_up_rate_bps: i64,
+    last_error: String,
+}
+
 async fn upsert_service_meta(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
     let existing_version = sqlx::query("SELECT schema_version FROM service_meta WHERE id = 1")
         .fetch_optional(&mut **tx)
@@ -706,49 +776,48 @@ fn decode_exemption_reason(value: &str) -> Result<ExemptionReason> {
     }
 }
 
-fn decode_peer_session(row: sqlx::sqlite::SqliteRow) -> Result<PeerSessionState> {
-    let torrent_hash = row.get::<String, _>("torrent_hash");
-    let peer_ip = row.get::<String, _>("peer_ip").parse::<IpAddr>()?;
-    let peer_port = u16::try_from(row.get::<i64, _>("peer_port"))?;
+fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
+    let peer_ip = row.peer_ip.parse::<IpAddr>()?;
+    let peer_port = u16::try_from(row.peer_port)?;
     Ok(PeerSessionState {
         observation_id: PeerObservationId {
-            torrent_hash,
+            torrent_hash: row.torrent_hash,
             peer_ip,
             peer_port,
         },
         offence_identity: OffenceIdentity { peer_ip },
-        first_seen_at: parse_system_time(&row.get::<String, _>("first_seen_at"))?,
-        last_seen_at: parse_system_time(&row.get::<String, _>("last_seen_at"))?,
-        baseline_progress: row.get("baseline_progress"),
-        latest_progress: row.get("latest_progress"),
-        rolling_avg_up_rate_bps: u64::try_from(row.get::<i64, _>("rolling_avg_up_rate_bps"))?,
+        first_seen_at: parse_system_time(&row.first_seen_at)?,
+        last_seen_at: parse_system_time(&row.last_seen_at)?,
+        baseline_progress: row.baseline_progress,
+        latest_progress: row.latest_progress,
+        rolling_avg_up_rate_bps: u64::try_from(row.rolling_avg_up_rate_bps)?,
         observed_duration: Duration::from_secs(u64::try_from(
-            row.get::<i64, _>("observed_seconds"),
+            row.observed_seconds,
         )?),
-        bad_duration: Duration::from_secs(u64::try_from(row.get::<i64, _>("bad_seconds"))?),
-        sample_count: u32::try_from(row.get::<i64, _>("sample_count"))?,
-        last_torrent_seeder_count: u32::try_from(row.get::<i64, _>("last_torrent_seeder_count"))?,
+        bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
+        sample_count: u32::try_from(row.sample_count)?,
+        last_torrent_seeder_count: u32::try_from(row.last_torrent_seeder_count)?,
         last_exemption_reason: row
-            .get::<Option<String>, _>("last_exemption_reason")
+            .last_exemption_reason
             .map(|value| decode_exemption_reason(&value))
             .transpose()?,
         bannable_since: row
-            .get::<Option<String>, _>("bannable_since")
+            .bannable_since
             .map(|value| parse_system_time(&value))
             .transpose()?,
         last_ban_decision_at: row
-            .get::<Option<String>, _>("last_ban_decision_at")
+            .last_ban_decision_at
             .map(|value| parse_system_time(&value))
             .transpose()?,
     })
 }
 
-fn decode_service_meta(row: sqlx::sqlite::SqliteRow) -> Result<ServiceMetaRecord> {
+fn decode_service_meta(row: ServiceMetaRow) -> Result<ServiceMetaRecord> {
     Ok(ServiceMetaRecord {
-        schema_version: row.get("schema_version"),
-        service_version: row.get("service_version"),
-        config_hash: row.get("config_hash"),
-        updated_at: parse_system_time(&row.get::<String, _>("updated_at"))?,
+        schema_version: row.schema_version,
+        service_version: row.service_version,
+        config_hash: row.config_hash,
+        updated_at: parse_system_time(&row.updated_at)?,
     })
 }
 
@@ -756,7 +825,7 @@ async fn load_service_meta_exec<'e, E>(executor: E) -> Result<Option<ServiceMeta
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query(
+    let row = sqlx::query_as::<_, ServiceMetaRow>(
         r#"
         SELECT schema_version, service_version, config_hash, updated_at
         FROM service_meta
@@ -776,11 +845,10 @@ async fn get_peer_session_exec<'e, E>(
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query(
+    let row = sqlx::query_as::<_, PeerSessionRow>(
         r#"
         SELECT
             torrent_hash,
-            peer_key,
             peer_ip,
             peer_port,
             first_seen_at,
@@ -811,11 +879,10 @@ async fn load_peer_sessions_exec<'e, E>(executor: E) -> Result<Vec<PeerSessionSt
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
 {
-    let rows = sqlx::query(
+    let rows = sqlx::query_as::<_, PeerSessionRow>(
         r#"
         SELECT
             torrent_hash,
-            peer_key,
             peer_ip,
             peer_port,
             first_seen_at,
@@ -933,7 +1000,7 @@ async fn load_active_bans_exec<'e, E>(executor: E) -> Result<Vec<ActiveBanRecord
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
 {
-    let rows = sqlx::query(
+    let rows = sqlx::query_as::<_, ActiveBanRow>(
         r#"
         SELECT
             peer_ip,
@@ -996,7 +1063,7 @@ async fn load_pending_ban_intents_exec<'e, E>(executor: E) -> Result<Vec<Pending
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
 {
-    let rows = sqlx::query(
+    let rows = sqlx::query_as::<_, PendingBanIntentRow>(
         r#"
         SELECT
             torrent_hash,
@@ -1079,58 +1146,56 @@ fn progress_delta_per_mille(progress_delta: f64) -> u32 {
         .clamp(0.0, u32::MAX as f64) as u32
 }
 
-fn decode_active_ban(row: sqlx::sqlite::SqliteRow) -> Result<ActiveBanRecord> {
+fn decode_active_ban(row: ActiveBanRow) -> Result<ActiveBanRecord> {
     Ok(ActiveBanRecord {
-        peer_ip: row.get::<String, _>("peer_ip").parse()?,
-        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
-        scope: row.get("scope"),
-        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
-        reason: row.get("reason"),
-        created_at: parse_system_time(&row.get::<String, _>("created_at"))?,
-        expires_at: parse_system_time(&row.get::<String, _>("expires_at"))?,
+        peer_ip: row.peer_ip.parse()?,
+        peer_port: u16::try_from(row.peer_port)?,
+        scope: row.scope,
+        offence_number: u32::try_from(row.offence_number)?,
+        reason: row.reason,
+        created_at: parse_system_time(&row.created_at)?,
+        expires_at: parse_system_time(&row.expires_at)?,
         reconciled_at: row
-            .get::<Option<String>, _>("reconciled_at")
+            .reconciled_at
             .map(|value| parse_system_time(&value))
             .transpose()?,
     })
 }
 
-fn decode_peer_offence(row: sqlx::sqlite::SqliteRow) -> Result<PeerOffenceRecord> {
+fn decode_peer_offence(row: PeerOffenceRow) -> Result<PeerOffenceRecord> {
     Ok(PeerOffenceRecord {
-        id: Some(row.get("id")),
-        torrent_hash: row.get("torrent_hash"),
-        peer_ip: row.get::<String, _>("peer_ip").parse()?,
-        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
-        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
-        reason_code: row.get("reason_code"),
-        observed_duration: Duration::from_secs(u64::try_from(
-            row.get::<i64, _>("observed_seconds"),
-        )?),
-        bad_duration: Duration::from_secs(u64::try_from(row.get::<i64, _>("bad_seconds"))?),
-        progress_delta_per_mille: ((row.get::<f64, _>("progress_delta") * 1000.0).round()) as u32,
-        avg_up_rate_bps: u64::try_from(row.get::<i64, _>("avg_up_rate_bps"))?,
-        banned_at: parse_system_time(&row.get::<String, _>("banned_at"))?,
-        ban_expires_at: parse_system_time(&row.get::<String, _>("ban_expires_at"))?,
+        id: Some(row.id),
+        torrent_hash: row.torrent_hash,
+        peer_ip: row.peer_ip.parse()?,
+        peer_port: u16::try_from(row.peer_port)?,
+        offence_number: u32::try_from(row.offence_number)?,
+        reason_code: row.reason_code,
+        observed_duration: Duration::from_secs(u64::try_from(row.observed_seconds)?),
+        bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
+        progress_delta_per_mille: ((row.progress_delta * 1000.0).round()) as u32,
+        avg_up_rate_bps: u64::try_from(row.avg_up_rate_bps)?,
+        banned_at: parse_system_time(&row.banned_at)?,
+        ban_expires_at: parse_system_time(&row.ban_expires_at)?,
         ban_revoked_at: row
-            .get::<Option<String>, _>("ban_revoked_at")
+            .ban_revoked_at
             .map(|value| parse_system_time(&value))
             .transpose()?,
     })
 }
 
-fn decode_pending_ban_intent(row: sqlx::sqlite::SqliteRow) -> Result<PendingBanIntentRecord> {
+fn decode_pending_ban_intent(row: PendingBanIntentRow) -> Result<PendingBanIntentRecord> {
     Ok(PendingBanIntentRecord {
-        torrent_hash: row.get("torrent_hash"),
-        peer_ip: row.get::<String, _>("peer_ip").parse()?,
-        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
-        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
-        reason_code: row.get("reason_code"),
-        observed_at: parse_system_time(&row.get::<String, _>("observed_at"))?,
-        ban_expires_at: parse_system_time(&row.get::<String, _>("ban_expires_at"))?,
-        bad_duration: Duration::from_secs(u64::try_from(row.get::<i64, _>("bad_seconds"))?),
-        progress_delta_per_mille: ((row.get::<f64, _>("progress_delta") * 1000.0).round()) as u32,
-        avg_up_rate_bps: u64::try_from(row.get::<i64, _>("avg_up_rate_bps"))?,
-        last_error: row.get("last_error"),
+        torrent_hash: row.torrent_hash,
+        peer_ip: row.peer_ip.parse()?,
+        peer_port: u16::try_from(row.peer_port)?,
+        offence_number: u32::try_from(row.offence_number)?,
+        reason_code: row.reason_code,
+        observed_at: parse_system_time(&row.observed_at)?,
+        ban_expires_at: parse_system_time(&row.ban_expires_at)?,
+        bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
+        progress_delta_per_mille: ((row.progress_delta * 1000.0).round()) as u32,
+        avg_up_rate_bps: u64::try_from(row.avg_up_rate_bps)?,
+        last_error: row.last_error,
     })
 }
 
