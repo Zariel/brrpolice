@@ -73,5 +73,7 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ github.workflow }}-${{ github.ref_name }}
+          cache-from: |
+            type=gha,scope=${{ github.workflow }}-${{ github.ref_name }}
+            type=gha,scope=${{ github.workflow }}-main
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ github.ref_name }}

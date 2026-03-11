@@ -11,24 +11,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM chef AS planner
 
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
-COPY migrations ./migrations
-COPY src ./src
 
-RUN cargo chef prepare --recipe-path recipe.json
+RUN mkdir -p src \
+    && printf "fn main() {}\n" > src/main.rs \
+    && cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY migrations ./migrations
 COPY src ./src
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     rm -f /workspace/target/release/brrpolice /workspace/target/release/deps/brrpolice* \
     && cargo build --release --locked \
     && mkdir -p /workspace/data
