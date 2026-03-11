@@ -137,7 +137,7 @@ async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
         failing_gates.push("runtime_healthy");
     }
 
-    let ready = failing_gates.is_empty();
+    let ready = state.service_state.is_ready() && persistence_ready;
     let message = if ready {
         "ready".to_string()
     } else {
