@@ -23,6 +23,8 @@ pub struct PolicyEngine {
     allowlisted_cidrs: Vec<IpNet>,
 }
 
+const SLOW_NON_PROGRESSING_REASON_CODE: &str = "slow_non_progressing";
+
 impl PolicyEngine {
     pub fn new(config: PolicyConfig, filters: &FiltersConfig) -> Self {
         let allowlisted_ips = filters
@@ -299,7 +301,8 @@ impl PolicyEngine {
             peer_port: peer.peer.port,
             offence_number,
             ttl: self.ban_ttl_for_offence(offence_number),
-            reason: format!(
+            reason_code: SLOW_NON_PROGRESSING_REASON_CODE.to_string(),
+            reason_details: format!(
                 "slow peer: avg_up_rate_bps={} progress_delta={:.4} bad_seconds={} observed_seconds={}",
                 evaluation.session.rolling_avg_up_rate_bps,
                 evaluation.progress_delta,
@@ -734,7 +737,8 @@ mod tests {
                 assert_eq!(decision.ttl, Duration::from_secs(24 * 60 * 60));
                 assert_eq!(decision.peer_ip, peer.peer.ip);
                 assert_eq!(decision.peer_port, peer.peer.port);
-                assert!(decision.reason.contains("slow peer"));
+                assert_eq!(decision.reason_code, "slow_non_progressing");
+                assert!(decision.reason_details.contains("slow peer"));
             }
             other => panic!("expected ban decision, got {other:?}"),
         }

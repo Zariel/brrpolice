@@ -245,7 +245,7 @@ impl ControlLoop {
                             peer_ip: decision.peer_ip,
                             peer_port: decision.peer_port,
                             offence_number: decision.offence_number,
-                            reason_code: decision.reason.clone(),
+                            reason_code: decision.reason_code.clone(),
                             observed_at,
                             ban_expires_at: observed_at + decision.ttl,
                             bad_duration: evaluation.session.bad_duration,
@@ -266,7 +266,7 @@ impl ControlLoop {
                             peer_port: decision.peer_port,
                             scope: format!("torrent:{}", torrent.hash),
                             offence_number: decision.offence_number,
-                            reason: decision.reason.clone(),
+                            reason: decision.reason_code.clone(),
                             created_at: observed_at,
                             expires_at: observed_at + decision.ttl,
                             reconciled_at: None,
@@ -287,7 +287,8 @@ impl ControlLoop {
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                 selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                reason_code = %decision.reason,
+                                reason_code = %decision.reason_code,
+                                reason_details = %decision.reason_details,
                                 error = ?error,
                                 "peer ban application failed"
                             );
@@ -315,7 +316,8 @@ impl ControlLoop {
                                     progress_delta = evaluation.progress_delta,
                                     average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                     selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                    reason_code = %decision.reason,
+                                    reason_code = %decision.reason_code,
+                                    reason_details = %decision.reason_details,
                                     error = ?error,
                                     "peer ban persistence failed"
                                 );
@@ -351,7 +353,8 @@ impl ControlLoop {
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                 selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                reason_code = %decision.reason,
+                                reason_code = %decision.reason_code,
+                                reason_details = %decision.reason_details,
                                 "peer ban applied"
                             );
                         }
@@ -626,7 +629,8 @@ impl ControlLoop {
             peer_port: intent.peer_port,
             offence_number: intent.offence_number,
             ttl,
-            reason: intent.reason_code.clone(),
+            reason_code: intent.reason_code.clone(),
+            reason_details: "replayed pending intent".to_string(),
         };
 
         let stored = match self
@@ -807,7 +811,7 @@ mod tests {
             peer_port: 51413,
             scope: "torrent:abc123".to_string(),
             offence_number: 1,
-            reason: "slow peer".to_string(),
+            reason: "slow_non_progressing".to_string(),
             created_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
             expires_at: rounded_now + Duration::from_secs(3600),
             reconciled_at: None,
@@ -890,7 +894,7 @@ mod tests {
             peer_port: 51413,
             scope: "torrent:abc123".to_string(),
             offence_number: 2,
-            reason: "slow peer".to_string(),
+            reason: "slow_non_progressing".to_string(),
             created_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
             expires_at: std::time::UNIX_EPOCH + Duration::from_secs(120),
             reconciled_at: None,
@@ -903,7 +907,7 @@ mod tests {
                 peer_ip: "10.0.0.10".parse().unwrap(),
                 peer_port: 51413,
                 offence_number: 2,
-                reason_code: "slow peer".to_string(),
+                reason_code: "slow_non_progressing".to_string(),
                 observed_duration: Duration::from_secs(120),
                 bad_duration: Duration::from_secs(120),
                 progress_delta_per_mille: 0,
@@ -1776,7 +1780,7 @@ mod tests {
             peer_ip: peer_ip.parse().unwrap(),
             peer_port,
             offence_number,
-            reason_code: "slow peer".to_string(),
+            reason_code: "slow_non_progressing".to_string(),
             observed_at,
             ban_expires_at,
             bad_duration: Duration::from_secs(120),

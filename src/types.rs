@@ -118,7 +118,8 @@ pub struct BanDecision {
     pub peer_port: u16,
     pub offence_number: u32,
     pub ttl: Duration,
-    pub reason: String,
+    pub reason_code: String,
+    pub reason_details: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
