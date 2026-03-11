@@ -1,210 +1,166 @@
 # brrpolice
 
-`brrpolice` is a singleton Rust service that watches qBittorrent peers on seeding torrents, classifies slow non-progressing peers, and applies temporary bans backed by SQLite state.
+`brrpolice` is a Rust service for qBittorrent seeding nodes. It watches peers, identifies peers that stay slow and do not make progress, applies temporary bans, and stores state in SQLite so decisions survive restarts.
 
-This repository currently covers the local binary and container-friendly runtime only. Kubernetes manifests and deployment automation are intentionally out of scope.
+## What It Does
+
+`brrpolice` continuously:
+
+1. Polls qBittorrent for seeding torrents and connected peers.
+2. Tracks per-peer behavior over time (upload rate, progress change, observation window).
+3. Applies policy rules to decide whether a peer should be banned.
+4. Enforces bans in qBittorrent and reconciles ban expiry.
+
+## How It Works
+
+- Startup runs DB migrations, starts HTTP endpoints, then initializes qBittorrent access and recovery in the control loop.
+- Peer state, offence history, and active bans are stored in SQLite.
+- Ban duration increases by offence count using a configurable ban ladder.
+- Expired bans are reconciled so qBittorrent and the database stay consistent.
 
 ## Requirements
 
-- Docker (for local OCI image build/run)
-- Rust toolchain with `cargo` (the pinned version is in `rust-toolchain.toml`)
-- Reachable qBittorrent WebUI API
-- qBittorrent credentials only if your WebUI requires auth
-- A writable location for the SQLite database when not using `:memory:`
+- qBittorrent WebUI API reachable from this service
+- Docker (for container runs) or Rust toolchain (for local source runs)
+- Writable storage for SQLite (`/data` in the container image by default)
+- qBittorrent credentials only when WebUI auth is enabled
 
-## Build
+## Quick Start (Docker)
 
-```bash
-cargo build
+Create a `config.toml`:
+
+```toml
+[qbittorrent]
+base_url = "http://qbittorrent:8080"
+username = ""
+password_env = ""
+
+[database]
+path = "/data/brrpolice.sqlite"
 ```
 
-Build an optimized binary with:
-
-```bash
-cargo build --release
-```
-
-## OCI image (Docker)
-
-Build the image:
+Build and run:
 
 ```bash
 docker build -t brrpolice:latest .
-```
-
-Run it:
-
-```bash
 docker run --rm -p 9090:9090 \
-  -v "$(pwd)/.data:/data" \
+  -v "$(pwd)/config.toml:/app/config.toml:ro" \
+  -v "$(pwd)/data:/data" \
   brrpolice:latest
 ```
 
-If your qBittorrent WebUI requires auth, set both `qbittorrent.username` and
-`qbittorrent.password_env` in config, then provide the password env var at runtime:
+If qBittorrent auth is enabled, set both `qbittorrent.username` and `qbittorrent.password_env`, then pass the password env var:
 
 ```bash
 docker run --rm -p 9090:9090 \
   -e QBITTORRENT_PASSWORD='your-password' \
-  -v "$(pwd)/.data:/data" \
+  -v "$(pwd)/config.toml:/app/config.toml:ro" \
+  -v "$(pwd)/data:/data" \
   brrpolice:latest
+```
+
+## Run From Source
+
+```bash
+cargo run
+```
+
+Use a non-default config path:
+
+```bash
+BRRPOLICE_CONFIG=/path/to/config.toml cargo run
 ```
 
 ## Configuration
 
-Configuration resolution order is:
+Configuration load order:
 
-1. built-in defaults
-2. `config.toml`
-3. environment overrides
+1. Built-in defaults
+2. `config.toml` in the working directory
+3. Environment variable overrides (`BRRPOLICE_...`)
 
-The default config file path is `./config.toml`. Override it with `BRRPOLICE_CONFIG=/path/to/config.toml`.
+If `BRRPOLICE_CONFIG` is set, the file is required. Any missing file, parse error, or validation error causes startup to fail.
 
-If auth is enabled, `main` resolves the qBittorrent password from the env var named by `qbittorrent.password_env`. `qbittorrent.username` and `qbittorrent.password_env` must either both be set or both be unset.
+Duration values use human-readable strings such as `30s`, `5m`, `1h`.
 
-Example `config.toml`:
+qBittorrent auth rule:
 
-```toml
-[qbittorrent]
-base_url = "http://127.0.0.1:8080"
-# set both fields to enable auth, or leave both unset to disable it
-username = ""
-password_env = ""
-poll_interval = "30s"
-request_timeout = "10s"
+- `qbittorrent.username` and `qbittorrent.password_env` must both be set, or both be unset.
 
-[policy]
-slow_rate_bps = 262144
-min_progress_delta = 0.0025
-new_peer_grace_period = "5m"
-min_observation_duration = "20m"
-bad_for_duration = "15m"
-decay_window = "60m"
-ignore_peer_progress_at_or_above = 0.95
-min_total_seeders = 3
-reban_cooldown = "30m"
+### qBittorrent Settings
 
-[policy.ban_ladder]
-durations = ["1h", "6h", "24h", "168h"]
+| Setting | Default | Impact |
+|---|---|---|
+| `qbittorrent.base_url` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. |
+| `qbittorrent.username` | `""` | Enables authenticated API mode when set together with `password_env`. |
+| `qbittorrent.password_env` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
+| `qbittorrent.poll_interval` | `30s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
+| `qbittorrent.request_timeout` | `10s` | Timeout per qBittorrent API request. Must be `<= poll_interval`. |
 
-[filters]
-include_categories = []
-exclude_categories = []
-include_tags = []
-exclude_tags = []
-allowlist_peer_ips = []
-allowlist_peer_cidrs = []
+### Policy Settings
 
-[database]
-path = "/tmp/brrpolice.sqlite"
-busy_timeout = "5s"
+| Setting | Default | Impact |
+|---|---|---|
+| `policy.slow_rate_bps` | `262144` | Upload-rate threshold (bytes/sec). Peers below this may be treated as slow. |
+| `policy.min_progress_delta` | `0.0025` | Minimum progress increase per sample to be considered progressing. |
+| `policy.new_peer_grace_period` | `5m` | New peers are exempt during this initial age window. |
+| `policy.min_observation_duration` | `20m` | Minimum tracked duration before a peer can become bannable. |
+| `policy.bad_for_duration` | `15m` | Required accumulated "bad" time before ban eligibility. |
+| `policy.decay_window` | `60m` | Window used to decay bad history and carry over peer state between sightings. |
+| `policy.ignore_peer_progress_at_or_above` | `0.95` | Exempts peers at or above this completion ratio. |
+| `policy.min_total_seeders` | `3` | Skips torrents below this seeder count. |
+| `policy.reban_cooldown` | `30m` | Cooldown before re-banning a recently handled peer identity. |
+| `policy.ban_ladder.durations` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
 
-[http]
-bind = "0.0.0.0:9090"
+### Filter Settings
 
-[logging]
-level = "info"
-format = "json"
-```
+| Setting | Default | Impact |
+|---|---|---|
+| `filters.include_categories` | `[]` | Optional allow-list of torrent categories. If includes are configured, torrent category or tag must match. |
+| `filters.exclude_categories` | `[]` | Deny-list of torrent categories. Excludes are applied before includes. |
+| `filters.include_tags` | `[]` | Optional allow-list of torrent tags. Works with `include_categories`. |
+| `filters.exclude_tags` | `[]` | Deny-list of torrent tags. Excludes are applied before includes. |
+| `filters.allowlist_peer_ips` | `[]` | Peer IPs that are never banned. |
+| `filters.allowlist_peer_cidrs` | `[]` | Peer CIDR ranges that are never banned. |
 
-Supported environment overrides:
+### Storage, HTTP, and Logging Settings
 
-- `BRRPOLICE_QBITTORRENT__BASE_URL`
-- `BRRPOLICE_QBITTORRENT__USERNAME`
-- `BRRPOLICE_QBITTORRENT__PASSWORD_ENV`
-- `BRRPOLICE_QBITTORRENT__POLL_INTERVAL`
-- `BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT`
-- `BRRPOLICE_POLICY__SLOW_RATE_BPS`
-- `BRRPOLICE_POLICY__MIN_PROGRESS_DELTA`
-- `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD`
-- `BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION`
-- `BRRPOLICE_POLICY__BAD_FOR_DURATION`
-- `BRRPOLICE_POLICY__DECAY_WINDOW`
-- `BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE`
-- `BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS`
-- `BRRPOLICE_POLICY__REBAN_COOLDOWN`
-- `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS`
-- `BRRPOLICE_FILTERS__INCLUDE_CATEGORIES`
-- `BRRPOLICE_FILTERS__EXCLUDE_CATEGORIES`
-- `BRRPOLICE_FILTERS__INCLUDE_TAGS`
-- `BRRPOLICE_FILTERS__EXCLUDE_TAGS`
-- `BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS`
-- `BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS`
-- `BRRPOLICE_DATABASE__PATH`
-- `BRRPOLICE_DATABASE__BUSY_TIMEOUT`
-- `BRRPOLICE_HTTP__BIND`
-- `BRRPOLICE_LOGGING__LEVEL`
-- `BRRPOLICE_LOGGING__FORMAT`
+| Setting | Default | Impact |
+|---|---|---|
+| `database.path` | `/data/brrpolice.sqlite` | SQLite database location for sessions, bans, and offence history. |
+| `database.busy_timeout` | `5s` | SQLite busy timeout for lock contention. |
+| `http.bind` | `0.0.0.0:9090` | HTTP bind address for `/healthz`, `/readyz`, and `/metrics`. |
+| `logging.level` | `info` | Log level filter (for example `trace`, `debug`, `info`, `warn`, `error`). |
+| `logging.format` | `json` | Output format: `json`, `plain`, or `text`. |
 
-## Run locally
+## Environment Overrides
 
-Start the service:
+Any setting can be overridden with env vars using:
+
+`BRRPOLICE_<SECTION>__<KEY>`
+
+Examples:
 
 ```bash
-cargo run
+BRRPOLICE_QBITTORRENT__BASE_URL=http://qbittorrent.svc:8080
+BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS=5
+BRRPOLICE_POLICY__BAN_LADDER__DURATIONS=1h,12h,48h
+BRRPOLICE_FILTERS__EXCLUDE_TAGS=private,whitelist
+BRRPOLICE_HTTP__BIND=0.0.0.0:9090
 ```
 
-If qBittorrent auth is enabled in config (both `qbittorrent.username` and `qbittorrent.password_env` are set), export the password env var before starting:
+For list values, use comma-separated entries.
 
-```bash
-export QBITTORRENT_PASSWORD='your-password'
-cargo run
-```
+## HTTP Endpoints
 
-To point at a non-default config file:
+- `/healthz`: process liveness
+- `/readyz`: readiness with gate diagnostics in JSON
+- `/metrics`: Prometheus metrics
 
-```bash
-export BRRPOLICE_CONFIG=/path/to/config.toml
-export QBITTORRENT_PASSWORD='your-password' # only when auth is enabled
-cargo run
-```
-
-The service runs migrations and starts the HTTP server immediately; qBittorrent initialization, recovery, and poll-loop readiness happen asynchronously with retries.
-
-## Test
-
-Run the full test suite with:
-
-```bash
-cargo test
-```
-
-If you want dependencies isolated inside the repo, use:
-
-```bash
-CARGO_HOME=.cargo-home cargo test
-```
-
-The tests are hermetic and should not depend on ambient qBittorrent credentials or mutate the process environment.
-
-## GitHub Actions
-
-Workflows under `.github/workflows` provide:
-
-- `ci.yml`: runs `cargo test` and `cargo clippy` on pushes and pull requests.
-- `docker-publish.yml`: builds and publishes the Docker image to GHCR with Buildx on branch and `v*` tag pushes.
-
-Published image naming:
-
-- branch push: `ghcr.io/<owner>/brrpolice:<branch>`
-- tag push: `ghcr.io/<owner>/brrpolice:<tag>` (for example `v1.0.0`)
-
-## HTTP endpoints
-
-The HTTP server exposes:
-
-- `/healthz` for liveness
-- `/readyz` for readiness after DB, qBittorrent initialization, recovery, and poll-loop entry
-- `/metrics` for Prometheus metrics
-
-Example checks:
+Example:
 
 ```bash
 curl -fsS http://127.0.0.1:9090/healthz
 curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
-
-## Logging
-
-Use `logging.format = "json"` for structured logs. The service emits startup, migration, qBittorrent authentication, torrent filter, exemption, bad-peer, ban, expiry, and retry/failure events with machine-parseable fields.
