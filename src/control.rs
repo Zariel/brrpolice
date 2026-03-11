@@ -228,6 +228,24 @@ impl ControlLoop {
                             })
                             .cloned()
                             .collect::<Vec<_>>();
+                        let mut pending_intent = PendingBanIntentRecord {
+                            torrent_hash: torrent.hash.clone(),
+                            peer_ip: decision.peer_ip,
+                            peer_port: decision.peer_port,
+                            offence_number: decision.offence_number,
+                            reason_code: decision.reason.clone(),
+                            observed_at,
+                            ban_expires_at: observed_at + decision.ttl,
+                            bad_duration: evaluation.session.bad_duration,
+                            progress_delta_per_mille: progress_delta_per_mille(
+                                evaluation.progress_delta,
+                            ),
+                            avg_up_rate_bps: evaluation.session.rolling_avg_up_rate_bps,
+                            last_error: "pending qbittorrent enforcement".to_string(),
+                        };
+                        self.persistence
+                            .upsert_pending_ban_intent(&pending_intent)
+                            .await?;
                         let active_ban = ActiveBanRecord {
                             peer_ip: decision.peer_ip,
                             peer_port: decision.peer_port,
@@ -258,30 +276,19 @@ impl ControlLoop {
                                 error = ?error,
                                 "peer ban application failed"
                             );
+                            pending_intent.last_error = error.to_string();
                             self.persistence
-                                .upsert_pending_ban_intent(&PendingBanIntentRecord {
-                                    torrent_hash: torrent.hash.clone(),
-                                    peer_ip: decision.peer_ip,
-                                    peer_port: decision.peer_port,
-                                    offence_number: decision.offence_number,
-                                    reason_code: decision.reason.clone(),
-                                    observed_at,
-                                    ban_expires_at: observed_at + decision.ttl,
-                                    bad_duration: evaluation.session.bad_duration,
-                                    progress_delta_per_mille: progress_delta_per_mille(
-                                        evaluation.progress_delta,
-                                    ),
-                                    avg_up_rate_bps: evaluation.session.rolling_avg_up_rate_bps,
-                                    last_error: error.to_string(),
-                                })
+                                .upsert_pending_ban_intent(&pending_intent)
                                 .await?;
                             return Err(error);
                         }
-                        let stored = self
+                        let stored = match self
                             .persistence
                             .record_ban_enforcement(&evaluation, &decision, observed_at)
                             .await
-                            .inspect_err(|error| {
+                        {
+                            Ok(stored) => stored,
+                            Err(error) => {
                                 self.metrics.record_ban_failure();
                                 error!(
                                     torrent_hash = %torrent.hash,
@@ -297,7 +304,13 @@ impl ControlLoop {
                                     error = ?error,
                                     "peer ban persistence failed"
                                 );
-                            })?;
+                                pending_intent.last_error = error.to_string();
+                                self.persistence
+                                    .upsert_pending_ban_intent(&pending_intent)
+                                    .await?;
+                                return Err(error);
+                            }
+                        };
                         self.persistence
                             .delete_pending_ban_intent(
                                 &torrent.hash,
@@ -874,6 +887,13 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert!(
+            persistence
+                .load_pending_ban_intents()
+                .await
+                .unwrap()
+                .is_empty()
         );
         assert!(
             persistence
