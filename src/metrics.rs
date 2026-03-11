@@ -23,6 +23,7 @@ pub struct AppMetrics {
     bans_expired_total: Counter,
     ban_failures_total: Counter,
     qbittorrent_api_errors_total: Counter,
+    metrics_encode_errors_total: Counter,
     active_tracked_peers: Gauge,
     active_bans: Gauge,
     in_scope_torrents: Gauge,
@@ -77,6 +78,13 @@ impl AppMetrics {
             "brrpolice_qbittorrent_api_errors",
             "Total qBittorrent API request failures.",
             qbittorrent_api_errors_total.clone(),
+        );
+
+        let metrics_encode_errors_total = Counter::default();
+        registry.register(
+            "brrpolice_metrics_encode_errors",
+            "Total failures while encoding Prometheus metrics output.",
+            metrics_encode_errors_total.clone(),
         );
 
         let active_tracked_peers = Gauge::default();
@@ -144,6 +152,7 @@ impl AppMetrics {
             bans_expired_total,
             ban_failures_total,
             qbittorrent_api_errors_total,
+            metrics_encode_errors_total,
             active_tracked_peers,
             active_bans,
             in_scope_torrents,
@@ -191,6 +200,10 @@ impl AppMetrics {
 
     pub fn record_qbittorrent_api_error(&self) {
         self.qbittorrent_api_errors_total.inc();
+    }
+
+    pub fn record_metrics_encode_error(&self) {
+        self.metrics_encode_errors_total.inc();
     }
 
     pub fn record_poll_loop_duration(&self, duration: Duration) {

@@ -90,11 +90,22 @@ async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 async fn metrics(State(state): State<HttpState>) -> Response {
-    let body = state
-        .metrics
-        .render()
-        .unwrap_or_else(|_| "# metrics encoding failed\n".to_string());
+    metrics_response(&state.metrics, state.metrics.render())
+}
+
+fn metrics_response(metrics: &AppMetrics, rendered: Result<String, std::fmt::Error>) -> Response {
+    let (status, body) = match rendered {
+        Ok(body) => (StatusCode::OK, body),
+        Err(_) => {
+            metrics.record_metrics_encode_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "# metrics encoding failed\n".to_string(),
+            )
+        }
+    };
     let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
@@ -118,7 +129,7 @@ mod tests {
         runtime::ServiceState,
     };
 
-    use super::{HttpState, build_router};
+    use super::{HttpState, build_router, metrics_response};
 
     #[tokio::test]
     async fn healthz_is_ok_when_service_is_live() {
@@ -179,6 +190,19 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("# TYPE brrpolice_active_bans gauge"));
         assert!(body.contains("brrpolice_peers_evaluated"));
+    }
+
+    #[test]
+    fn metrics_returns_500_and_records_counter_when_encoding_fails() {
+        let metrics = AppMetrics::new();
+        let response = metrics_response(&metrics, Err(std::fmt::Error));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("brrpolice_metrics_encode_errors_total 1"));
     }
 
     async fn test_router() -> Router {
