@@ -27,6 +27,18 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
+const SQLX_MIGRATIONS_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN NOT NULL,
+    checksum BLOB NOT NULL,
+    execution_time BIGINT NOT NULL
+)
+"#;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceMetaRecord {
@@ -140,70 +152,13 @@ impl Persistence {
     pub async fn run_migrations(&self) -> Result<()> {
         self.migrations_succeeded.store(false, Ordering::Relaxed);
 
+        self.bootstrap_legacy_migration_state().await?;
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .context("failed to run sqlx migrations")?;
+
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                description TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        let max_version =
-            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM schema_migrations")
-                .fetch_one(&mut *tx)
-                .await?
-                .unwrap_or(0);
-
-        if max_version > CURRENT_SCHEMA_VERSION {
-            bail!(
-                "database schema version {} is newer than supported version {}",
-                max_version,
-                CURRENT_SCHEMA_VERSION
-            );
-        }
-
-        if max_version < 1 {
-            apply_migration_1(&mut tx).await?;
-            sqlx::query(
-                r#"
-                INSERT INTO schema_migrations (version, description)
-                VALUES (1, 'initial schema')
-                "#,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if max_version < 2 {
-            apply_migration_2(&mut tx).await?;
-            sqlx::query(
-                r#"
-                INSERT INTO schema_migrations (version, description)
-                VALUES (2, 'persist bannable timestamps for peer sessions')
-                "#,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if max_version < 3 {
-            apply_migration_3(&mut tx).await?;
-            sqlx::query(
-                r#"
-                INSERT INTO schema_migrations (version, description)
-                VALUES (3, 'persist pending ban intents after enforcement failures')
-                "#,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
         upsert_service_meta(&mut tx).await?;
         tx.commit().await?;
 
@@ -213,6 +168,79 @@ impl Persistence {
             "migration complete"
         );
         Ok(())
+    }
+
+    async fn bootstrap_legacy_migration_state(&self) -> Result<()> {
+        if self.table_exists("_sqlx_migrations").await?
+            || !self.table_exists("schema_migrations").await?
+        {
+            return Ok(());
+        }
+
+        let max_version =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM schema_migrations")
+                .fetch_one(&self.pool)
+                .await?
+                .unwrap_or(0);
+        if max_version <= 0 {
+            return Ok(());
+        }
+        if max_version > CURRENT_SCHEMA_VERSION {
+            bail!(
+                "database schema version {} is newer than supported version {}",
+                max_version,
+                CURRENT_SCHEMA_VERSION
+            );
+        }
+        for version in 1..=max_version {
+            if !MIGRATOR.version_exists(version) {
+                bail!(
+                    "legacy schema version {} has no matching sqlx migration version",
+                    version
+                );
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(SQLX_MIGRATIONS_TABLE_SQL)
+            .execute(&mut *tx)
+            .await?;
+        for migration in MIGRATOR.iter() {
+            if migration.version > max_version || migration.migration_type.is_down_migration() {
+                continue;
+            }
+
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO _sqlx_migrations (
+                    version,
+                    description,
+                    success,
+                    checksum,
+                    execution_time
+                )
+                VALUES (?, ?, TRUE, ?, -1)
+                "#,
+            )
+            .bind(migration.version)
+            .bind(&*migration.description)
+            .bind(&*migration.checksum)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    async fn table_exists(&self, table_name: &str) -> Result<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table_name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -667,126 +695,6 @@ impl Persistence {
 
         Ok(result.rows_affected() > 0)
     }
-}
-
-async fn apply_migration_1(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS peer_sessions (
-            torrent_hash TEXT NOT NULL,
-            peer_key TEXT NOT NULL,
-            peer_ip TEXT NOT NULL,
-            peer_port INTEGER NOT NULL,
-            client_name TEXT,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            baseline_progress REAL NOT NULL,
-            latest_progress REAL NOT NULL,
-            rolling_avg_up_rate_bps INTEGER NOT NULL,
-            observed_seconds INTEGER NOT NULL,
-            bad_seconds INTEGER NOT NULL,
-            sample_count INTEGER NOT NULL,
-            last_torrent_seeder_count INTEGER NOT NULL,
-            last_exemption_reason TEXT,
-            policy_version TEXT NOT NULL,
-            PRIMARY KEY (torrent_hash, peer_key)
-        )
-        "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS peer_offences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            torrent_hash TEXT NOT NULL,
-            peer_ip TEXT NOT NULL,
-            peer_port INTEGER NOT NULL,
-            offence_number INTEGER NOT NULL,
-            reason_code TEXT NOT NULL,
-            observed_seconds INTEGER NOT NULL,
-            bad_seconds INTEGER NOT NULL,
-            progress_delta REAL NOT NULL,
-            avg_up_rate_bps INTEGER NOT NULL,
-            banned_at TEXT NOT NULL,
-            ban_expires_at TEXT NOT NULL,
-            ban_revoked_at TEXT
-        )
-        "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS active_bans (
-            peer_ip TEXT NOT NULL,
-            peer_port INTEGER NOT NULL,
-            scope TEXT NOT NULL,
-            offence_number INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            reconciled_at TEXT,
-            PRIMARY KEY (peer_ip, peer_port, scope)
-        )
-        "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS service_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            schema_version INTEGER NOT NULL,
-            service_version TEXT NOT NULL,
-            config_hash TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
-async fn apply_migration_2(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
-    sqlx::query("ALTER TABLE peer_sessions ADD COLUMN bannable_since TEXT")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("ALTER TABLE peer_sessions ADD COLUMN last_ban_decision_at TEXT")
-        .execute(&mut **tx)
-        .await?;
-
-    Ok(())
-}
-
-async fn apply_migration_3(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS pending_ban_intents (
-            torrent_hash TEXT NOT NULL,
-            peer_ip TEXT NOT NULL,
-            peer_port INTEGER NOT NULL,
-            offence_number INTEGER NOT NULL,
-            reason_code TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            ban_expires_at TEXT NOT NULL,
-            bad_seconds INTEGER NOT NULL,
-            progress_delta REAL NOT NULL,
-            avg_up_rate_bps INTEGER NOT NULL,
-            last_error TEXT NOT NULL,
-            PRIMARY KEY (torrent_hash, peer_ip, peer_port, offence_number)
-        )
-        "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
 }
 
 async fn upsert_service_meta(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -1341,7 +1249,7 @@ mod tests {
         assert!(persistence.is_ready().await);
 
         for table in [
-            "schema_migrations",
+            "_sqlx_migrations",
             "peer_sessions",
             "peer_offences",
             "active_bans",
@@ -1819,7 +1727,10 @@ mod tests {
     async fn migrations_upgrade_existing_version_one_schema() {
         let persistence = test_persistence().await;
         let mut tx = persistence.pool.begin().await.unwrap();
-        super::apply_migration_1(&mut tx).await.unwrap();
+        sqlx::query(include_str!("../migrations/0001_initial_schema.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
         )
@@ -1857,6 +1768,13 @@ mod tests {
         assert_eq!(bannable_since_exists, 1);
         assert_eq!(last_ban_decision_exists, 1);
         assert_eq!(pending_ban_intents_exists, 1);
+        let applied_sqlx_migrations = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
+        )
+        .fetch_one(&persistence.pool)
+        .await
+        .unwrap();
+        assert_eq!(applied_sqlx_migrations, CURRENT_SCHEMA_VERSION);
     }
 
     #[tokio::test]
