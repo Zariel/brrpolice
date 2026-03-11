@@ -81,6 +81,7 @@
           runtimeInputs = [
             pkgs.nix
             pkgs.go-containerregistry
+            pkgs.gzip
           ];
           text = ''
             set -euo pipefail
@@ -92,7 +93,10 @@
 
             image_ref="$1"
             archive_path="$(nix build .#ociImage --print-out-paths --no-link)"
-            crane push "$archive_path" "$image_ref"
+            archive_tar="$(mktemp --suffix=.tar)"
+            trap 'rm -f "$archive_tar"' EXIT
+            gzip -dc "$archive_path" > "$archive_tar"
+            crane push "$archive_tar" "$image_ref"
           '';
         };
       in

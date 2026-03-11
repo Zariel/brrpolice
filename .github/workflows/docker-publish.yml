@@ -19,19 +19,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Restore nix eval/download cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/nix
-          key: ${{ runner.os }}-nix-${{ hashFiles('flake.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-nix-
-
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v15
 
       - name: Enable Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@v13
+        with:
+          use-gha-cache: "enabled"
+          use-flakehub: "disabled"
 
       - name: Resolve image coordinates
         id: coords
@@ -54,5 +49,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          archive_tar="$(mktemp --suffix=.tar)"
+          trap 'rm -f "$archive_tar"' EXIT
+          gzip -dc "${{ steps.build.outputs.archive }}" > "$archive_tar"
           nix shell nixpkgs#go-containerregistry -c crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
-          nix shell nixpkgs#go-containerregistry -c crane push "${{ steps.build.outputs.archive }}" "${{ steps.coords.outputs.image }}:${{ steps.coords.outputs.tag }}"
+          nix shell nixpkgs#go-containerregistry -c crane push "$archive_tar" "${{ steps.coords.outputs.image }}:${{ steps.coords.outputs.tag }}"
