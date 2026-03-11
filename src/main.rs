@@ -87,36 +87,17 @@ async fn main() -> Result<()> {
 
     info!("startup complete; waiting for poll loop readiness");
 
-    let mut http_handle = tokio::spawn(async move { http_server.run().await });
-    let mut control_handle = tokio::spawn(async move { control_loop.run().await });
+    let http_handle = tokio::spawn(async move { http_server.run().await });
+    let control_handle = tokio::spawn(async move { control_loop.run().await });
 
-    tokio::select! {
-        result = &mut http_handle => {
-            state.begin_shutdown();
-            let _ = shutdown_tx.send(true);
-            result??;
-        }
-        result = &mut control_handle => {
-            state.begin_shutdown();
-            let _ = shutdown_tx.send(true);
-            result??;
-        }
-        _ = shutdown_signal() => {
-            info!("shutdown signal received");
-            state.begin_shutdown();
-            let _ = shutdown_tx.send(true);
-            if let Err(error) = http_handle.await? {
-                error!(?error, "http server shutdown failed");
-                return Err(error);
-            }
-            if let Err(error) = control_handle.await? {
-                error!(?error, "control loop shutdown failed");
-                return Err(error);
-            }
-        }
-    }
-
-    Ok(())
+    run_until_shutdown(
+        state,
+        shutdown_tx,
+        http_handle,
+        control_handle,
+        shutdown_signal(),
+    )
+    .await
 }
 
 async fn shutdown_signal() {
@@ -142,5 +123,110 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+async fn run_until_shutdown<F>(
+    state: Arc<ServiceState>,
+    shutdown_tx: watch::Sender<bool>,
+    mut http_handle: tokio::task::JoinHandle<Result<()>>,
+    mut control_handle: tokio::task::JoinHandle<Result<()>>,
+    shutdown_signal: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        result = &mut http_handle => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            let primary = result?;
+            let mut primary_error = None;
+            if let Err(error) = primary {
+                primary_error = Some(error);
+            }
+            if let Err(error) = control_handle.await? {
+                error!(?error, "control loop shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
+            }
+            if let Some(error) = primary_error {
+                return Err(error);
+            }
+        }
+        result = &mut control_handle => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            let primary = result?;
+            let mut primary_error = None;
+            if let Err(error) = primary {
+                primary_error = Some(error);
+            }
+            if let Err(error) = http_handle.await? {
+                error!(?error, "http server shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
+            }
+            if let Some(error) = primary_error {
+                return Err(error);
+            }
+        }
+        _ = shutdown_signal => {
+            info!("shutdown signal received");
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            if let Err(error) = http_handle.await? {
+                error!(?error, "http server shutdown failed");
+                return Err(error);
+            }
+            if let Err(error) = control_handle.await? {
+                error!(?error, "control loop shutdown failed");
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio::{sync::watch, time::Duration};
+
+    use crate::{run_until_shutdown, runtime::ServiceState};
+
+    #[tokio::test]
+    async fn waits_for_sibling_task_when_one_task_exits_first() {
+        let state = Arc::new(ServiceState::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sibling_finished = Arc::new(AtomicBool::new(false));
+        let sibling_flag = sibling_finished.clone();
+        let control_handle = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            let _ = shutdown_rx.changed().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sibling_flag.store(true, Ordering::Relaxed);
+            Ok::<(), anyhow::Error>(())
+        });
+        let http_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+        let result = run_until_shutdown(
+            state,
+            shutdown_tx,
+            http_handle,
+            control_handle,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(sibling_finished.load(Ordering::Relaxed));
     }
 }
