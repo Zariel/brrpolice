@@ -191,6 +191,7 @@ impl ControlLoop {
 
     pub async fn run_poll_cycle(&self) -> Result<PollCycleResult> {
         let observed_at = std::time::SystemTime::now();
+        let observed_at_rfc3339 = humantime::format_rfc3339_millis(observed_at).to_string();
         self.reconcile_expired_bans(observed_at).await?;
         let torrents = self.qbittorrent.list_in_scope_torrents().await?;
         self.metrics.set_in_scope_torrents(torrents.len());
@@ -212,13 +213,14 @@ impl ControlLoop {
                 total_seeders: torrent.total_seeders,
                 in_scope: true,
             };
+            let torrent_tracker = tracker_hostname(torrent.tracker.as_deref());
             let peers = match self.qbittorrent.list_torrent_peers(&torrent.hash).await {
                 Ok(peers) => peers,
                 Err(error) => {
                     warn!(
                         torrent_hash = %torrent.hash,
                         torrent_name = %torrent.name,
-                        torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                        torrent_tracker = %torrent_tracker,
                         error = ?error,
                         "skipping torrent after peer fetch failure"
                     );
@@ -284,10 +286,10 @@ impl ControlLoop {
                     info!(
                         torrent_hash = %torrent.hash,
                         torrent_name = %torrent.name,
-                        torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                        torrent_tracker = %torrent_tracker,
                         peer_ip = %peer.peer.ip,
                         peer_port = peer.peer.port,
-                        observed_at = ?observed_at,
+                        observed_at = %observed_at_rfc3339,
                         sample_duration_seconds = evaluation.sample_duration.as_secs(),
                         bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                         progress_delta = evaluation.progress_delta,
@@ -345,11 +347,11 @@ impl ControlLoop {
                             warn!(
                                 torrent_hash = %torrent.hash,
                                 torrent_name = %torrent.name,
-                                torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                                torrent_tracker = %torrent_tracker,
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
                                 offence_number = decision.offence_number,
-                                observed_at = ?observed_at,
+                                observed_at = %observed_at_rfc3339,
                                 bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -376,11 +378,11 @@ impl ControlLoop {
                                 warn!(
                                     torrent_hash = %torrent.hash,
                                     torrent_name = %torrent.name,
-                                    torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                                    torrent_tracker = %torrent_tracker,
                                     peer_ip = %decision.peer_ip,
                                     peer_port = decision.peer_port,
                                     offence_number = decision.offence_number,
-                                    observed_at = ?observed_at,
+                                    observed_at = %observed_at_rfc3339,
                                     bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                                     progress_delta = evaluation.progress_delta,
                                     average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -415,11 +417,11 @@ impl ControlLoop {
                             warn!(
                                 torrent_hash = %torrent.hash,
                                 torrent_name = %torrent.name,
-                                torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                                torrent_tracker = %torrent_tracker,
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
                                 offence_number = decision.offence_number,
-                                observed_at = ?observed_at,
+                                observed_at = %observed_at_rfc3339,
                                 bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -434,10 +436,10 @@ impl ControlLoop {
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
-                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                            torrent_tracker = %torrent_tracker,
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
-                            observed_at = ?observed_at,
+                            observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -457,10 +459,10 @@ impl ControlLoop {
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
-                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                            torrent_tracker = %torrent_tracker,
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
-                            observed_at = ?observed_at,
+                            observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -478,10 +480,10 @@ impl ControlLoop {
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
-                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                            torrent_tracker = %torrent_tracker,
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
-                            observed_at = ?observed_at,
+                            observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -496,10 +498,10 @@ impl ControlLoop {
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
-                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
+                            torrent_tracker = %torrent_tracker,
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
-                            observed_at = ?observed_at,
+                            observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
@@ -919,6 +921,22 @@ fn progress_delta_per_mille(progress_delta: f64) -> u32 {
     (progress_delta.max(0.0) * 1000.0).round() as u32
 }
 
+fn tracker_hostname(tracker: Option<&str>) -> String {
+    let Some(tracker) = tracker.map(str::trim).filter(|tracker| !tracker.is_empty()) else {
+        return String::new();
+    };
+
+    parse_hostname(tracker)
+        .or_else(|| parse_hostname(&format!("https://{tracker}")))
+        .unwrap_or_default()
+}
+
+fn parse_hostname(input: &str) -> Option<String> {
+    reqwest::Url::parse(input)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
 fn has_active_ban(
     active_bans: &[ActiveBanRecord],
     peer_ip: std::net::IpAddr,
@@ -966,7 +984,30 @@ mod tests {
         types::{OffenceIdentity, PeerObservationId, PeerSessionState},
     };
 
-    use super::ControlLoop;
+    use super::{ControlLoop, tracker_hostname};
+
+    #[test]
+    fn tracker_hostname_extracts_hostname_from_url() {
+        assert_eq!(
+            tracker_hostname(Some("https://tracker.example.org/announce")),
+            "tracker.example.org"
+        );
+        assert_eq!(
+            tracker_hostname(Some("udp://tracker.example.org:1337/announce")),
+            "tracker.example.org"
+        );
+    }
+
+    #[test]
+    fn tracker_hostname_handles_plain_hosts_and_invalid_values() {
+        assert_eq!(
+            tracker_hostname(Some("tracker.example.org:443")),
+            "tracker.example.org"
+        );
+        assert_eq!(tracker_hostname(Some("not a valid tracker value")), "");
+        assert_eq!(tracker_hostname(Some("")), "");
+        assert_eq!(tracker_hostname(None), "");
+    }
 
     #[tokio::test]
     async fn startup_recovery_loads_snapshot_and_marks_recovery_complete() {
