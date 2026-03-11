@@ -193,6 +193,8 @@ impl ControlLoop {
         for torrent in &torrents {
             let torrent_scope = TorrentScope {
                 hash: torrent.hash.clone(),
+                name: torrent.name.clone(),
+                tracker: torrent.tracker.clone(),
                 category: torrent.category.clone(),
                 tags: torrent.tags.clone(),
                 total_seeders: torrent.total_seeders,
@@ -203,6 +205,8 @@ impl ControlLoop {
                 Err(error) => {
                     warn!(
                         torrent_hash = %torrent.hash,
+                        torrent_name = %torrent.name,
+                        torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                         error = ?error,
                         "skipping torrent after peer fetch failure"
                     );
@@ -263,6 +267,8 @@ impl ControlLoop {
                 if evaluation.is_bad_sample {
                     info!(
                         torrent_hash = %torrent.hash,
+                        torrent_name = %torrent.name,
+                        torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                         peer_ip = %peer.peer.ip,
                         peer_port = peer.peer.port,
                         observed_at = ?observed_at,
@@ -322,6 +328,8 @@ impl ControlLoop {
                             self.metrics.record_ban_failure();
                             warn!(
                                 torrent_hash = %torrent.hash,
+                                torrent_name = %torrent.name,
+                                torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
                                 offence_number = decision.offence_number,
@@ -351,6 +359,8 @@ impl ControlLoop {
                                 self.metrics.record_ban_failure();
                                 warn!(
                                     torrent_hash = %torrent.hash,
+                                    torrent_name = %torrent.name,
+                                    torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                                     peer_ip = %decision.peer_ip,
                                     peer_port = decision.peer_port,
                                     offence_number = decision.offence_number,
@@ -388,6 +398,8 @@ impl ControlLoop {
                                 .record_ban_applied(evaluation.session.bad_duration);
                             warn!(
                                 torrent_hash = %torrent.hash,
+                                torrent_name = %torrent.name,
+                                torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                                 peer_ip = %decision.peer_ip,
                                 peer_port = decision.peer_port,
                                 offence_number = decision.offence_number,
@@ -405,6 +417,8 @@ impl ControlLoop {
                     BanDisposition::Exempt(reason) => {
                         info!(
                             torrent_hash = %torrent.hash,
+                            torrent_name = %torrent.name,
+                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
                             observed_at = ?observed_at,
@@ -426,6 +440,8 @@ impl ControlLoop {
                     } => {
                         info!(
                             torrent_hash = %torrent.hash,
+                            torrent_name = %torrent.name,
+                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
                             observed_at = ?observed_at,
@@ -445,6 +461,8 @@ impl ControlLoop {
                     BanDisposition::RebanCooldown { remaining } => {
                         info!(
                             torrent_hash = %torrent.hash,
+                            torrent_name = %torrent.name,
+                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
                             observed_at = ?observed_at,
@@ -461,6 +479,8 @@ impl ControlLoop {
                     BanDisposition::DuplicateSuppressed => {
                         info!(
                             torrent_hash = %torrent.hash,
+                            torrent_name = %torrent.name,
+                            torrent_tracker = torrent.tracker.as_deref().unwrap_or(""),
                             peer_ip = %peer.peer.ip,
                             peer_port = peer.peer.port,
                             observed_at = ?observed_at,

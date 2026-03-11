@@ -277,6 +277,7 @@ impl QbittorrentClient {
             .map(|torrent| TorrentSummary {
                 hash: torrent.hash,
                 name: torrent.name,
+                tracker: empty_string_to_none(torrent.tracker),
                 total_seeders: torrent.num_complete.max(0) as u32,
                 category: empty_string_to_none(torrent.category),
                 tags: split_tags(&torrent.tags),
@@ -542,6 +543,8 @@ fn normalized_base_url(raw: &str) -> Result<Url> {
 struct QbTorrent {
     hash: String,
     name: String,
+    #[serde(default)]
+    tracker: String,
     category: String,
     tags: String,
     num_complete: i64,
@@ -738,6 +741,7 @@ mod tests {
                     {
                         "hash":"abc123",
                         "name":"Example Torrent",
+                        "tracker":"https://tracker.example/announce",
                         "category":"tv",
                         "tags":"seed,public",
                         "num_complete":17
@@ -745,6 +749,7 @@ mod tests {
                     {
                         "hash":"def456",
                         "name":"No Category",
+                        "tracker":"",
                         "category":"",
                         "tags":"",
                         "num_complete":0
@@ -756,12 +761,17 @@ mod tests {
         assert_eq!(torrents.len(), 2);
         assert_eq!(torrents[0].hash, "abc123");
         assert_eq!(torrents[0].name, "Example Torrent");
+        assert_eq!(
+            torrents[0].tracker.as_deref(),
+            Some("https://tracker.example/announce")
+        );
         assert_eq!(torrents[0].category.as_deref(), Some("tv"));
         assert_eq!(
             torrents[0].tags,
             vec!["seed".to_string(), "public".to_string()]
         );
         assert_eq!(torrents[0].total_seeders, 17);
+        assert_eq!(torrents[1].tracker, None);
         assert_eq!(torrents[1].category, None);
         assert!(torrents[1].tags.is_empty());
     }
@@ -1110,6 +1120,7 @@ mod tests {
         TorrentSummary {
             hash: hash.to_string(),
             name: format!("torrent-{hash}"),
+            tracker: None,
             total_seeders,
             category: category.map(str::to_string),
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),

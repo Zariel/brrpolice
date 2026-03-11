@@ -9,6 +9,7 @@ use std::{
 pub struct TorrentSummary {
     pub hash: String,
     pub name: String,
+    pub tracker: Option<String>,
     pub total_seeders: u32,
     pub category: Option<String>,
     pub tags: Vec<String>,
@@ -17,6 +18,8 @@ pub struct TorrentSummary {
 #[derive(Debug, Clone)]
 pub struct TorrentScope {
     pub hash: String,
+    pub name: String,
+    pub tracker: Option<String>,
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub total_seeders: u32,

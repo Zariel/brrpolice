@@ -1029,6 +1029,8 @@ mod tests {
         PeerContext {
             torrent: TorrentScope {
                 hash: "abc123".to_string(),
+                name: "torrent-abc123".to_string(),
+                tracker: None,
                 category: Some("tv".to_string()),
                 tags: vec!["seed".to_string()],
                 total_seeders: 5,
