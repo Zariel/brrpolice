@@ -54,7 +54,7 @@ impl QbittorrentClient {
         timeout: Duration,
         metrics: Arc<AppMetrics>,
     ) -> Result<Self> {
-        let base_url = Url::parse(&config.base_url).context("invalid qbittorrent.base_url")?;
+        let base_url = normalized_base_url(&config.base_url)?;
         let client = Client::builder()
             .cookie_store(true)
             .timeout(timeout)
@@ -521,6 +521,14 @@ impl QbittorrentClient {
     }
 }
 
+fn normalized_base_url(raw: &str) -> Result<Url> {
+    let mut url = Url::parse(raw).context("invalid qbittorrent.base_url")?;
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
 #[derive(Debug, Deserialize)]
 struct QbTorrent {
     hash: String,
@@ -658,6 +666,27 @@ mod tests {
         assert_eq!(SYNC_TORRENT_PEERS_PATH, "api/v2/sync/torrentPeers");
         assert_eq!(TORRENTS_INFO_PATH, "api/v2/torrents/info");
         assert_eq!(TRANSFER_BAN_PEERS_PATH, "api/v2/transfer/banPeers");
+    }
+
+    #[test]
+    fn preserves_base_url_path_prefix_without_trailing_slash() {
+        let client = scoped_test_client_with_base_url(
+            "http://qbittorrent:8080/qb",
+            FiltersConfig::default(),
+        );
+
+        assert_eq!(
+            client.api_url(AUTH_LOGIN_PATH).unwrap().as_str(),
+            "http://qbittorrent:8080/qb/api/v2/auth/login"
+        );
+        assert_eq!(
+            client.torrent_info_url().unwrap().as_str(),
+            "http://qbittorrent:8080/qb/api/v2/torrents/info"
+        );
+        assert_eq!(
+            client.ban_peers_url().unwrap().as_str(),
+            "http://qbittorrent:8080/qb/api/v2/transfer/banPeers"
+        );
     }
 
     #[test]
@@ -1008,9 +1037,16 @@ mod tests {
     }
 
     fn scoped_test_client(filters: FiltersConfig) -> QbittorrentClient {
+        scoped_test_client_with_base_url("http://qbittorrent:8080/", filters)
+    }
+
+    fn scoped_test_client_with_base_url(
+        base_url: &str,
+        filters: FiltersConfig,
+    ) -> QbittorrentClient {
         QbittorrentClient::new(
             QbittorrentConfig {
-                base_url: "http://qbittorrent:8080/".to_string(),
+                base_url: base_url.to_string(),
                 username: "admin".to_string(),
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
