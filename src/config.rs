@@ -82,7 +82,7 @@ impl AppConfig {
 
     pub fn init_tracing(&self) -> Result<()> {
         let env_filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(self.logging.level.clone()))
+            .or_else(|_| EnvFilter::try_new(default_env_filter_expression(&self.logging.level)))
             .context("failed to initialize tracing env filter")?;
 
         match self.logging.format.as_str() {
@@ -242,6 +242,12 @@ impl AppConfig {
 
         Ok(())
     }
+}
+
+fn default_env_filter_expression(level: &str) -> String {
+    let level = level.trim();
+    let base_level = if level.is_empty() { "info" } else { level };
+    format!("{base_level},hyper_util::client::legacy::pool=warn")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -763,6 +769,12 @@ format = "yaml"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("unsupported logging format"));
+    }
+
+    #[test]
+    fn debug_logging_filter_suppresses_hyper_connection_pool_noise() {
+        let filter = super::default_env_filter_expression("debug");
+        assert!(filter.contains("hyper_util::client::legacy::pool=warn"));
     }
 
     #[test]
