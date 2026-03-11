@@ -104,7 +104,7 @@ qBittorrent auth rule:
 | `policy.slow_rate_bps` | `BRRPOLICE_POLICY__SLOW_RATE_BPS` | `65536` | Upload-rate threshold (bytes/sec). Peers below this may be treated as slow. |
 | `policy.min_progress_delta` | `BRRPOLICE_POLICY__MIN_PROGRESS_DELTA` | `0.0025` | Minimum progress increase per sample to be considered progressing. |
 | `policy.new_peer_grace_period` | `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD` | `60s` | New peers are exempt during this initial age window. |
-| `policy.min_observation_duration` | `BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION` | `20m` | Minimum tracked duration before a peer can become bannable. |
+| `policy.min_observation_duration` | `BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked duration before a peer can become bannable. |
 | `policy.bad_for_duration` | `BRRPOLICE_POLICY__BAD_FOR_DURATION` | `15m` | Required accumulated "bad" time before ban eligibility. |
 | `policy.decay_window` | `BRRPOLICE_POLICY__DECAY_WINDOW` | `60m` | Window used to decay bad history and carry over peer state between sightings. |
 | `policy.ignore_peer_progress_at_or_above` | `BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE` | `0.95` | Exempts peers at or above this completion ratio. |

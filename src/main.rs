@@ -26,21 +26,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(AppConfig::load(None)?);
     config.init_tracing()?;
 
-    info!(
-        qbittorrent_base_url = %config.qbittorrent.base_url,
-        qbittorrent_username = if config.qbittorrent.username.trim().is_empty() {
-            "<unset>"
-        } else {
-            config.qbittorrent.username.as_str()
-        },
-        poll_interval_seconds = config.qbittorrent.poll_interval.as_secs(),
-        request_timeout_seconds = config.qbittorrent.request_timeout.as_secs(),
-        database_path = %config.database.path.display(),
-        http_bind = %config.http.bind,
-        logging_format = %config.logging.format,
-        logging_level = %config.logging.level,
-        "configuration loaded"
-    );
+    info!(resolved_config = %config.fingerprint(), "resolved configuration loaded");
 
     let persistence = Arc::new(Persistence::connect(&config.database).await?);
     persistence.run_migrations().await?;

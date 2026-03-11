@@ -54,7 +54,7 @@ impl AppConfig {
             .set_default("policy.slow_rate_bps", 65_536_u64)?
             .set_default("policy.min_progress_delta", 0.0025_f64)?
             .set_default("policy.new_peer_grace_period", "60s")?
-            .set_default("policy.min_observation_duration", "20m")?
+            .set_default("policy.min_observation_duration", "5m")?
             .set_default("policy.bad_for_duration", "15m")?
             .set_default("policy.decay_window", "60m")?
             .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
@@ -299,7 +299,7 @@ impl Default for PolicyConfig {
             slow_rate_bps: 65_536,
             min_progress_delta: 0.0025,
             new_peer_grace_period: Duration::from_secs(60),
-            min_observation_duration: Duration::from_secs(1_200),
+            min_observation_duration: Duration::from_secs(300),
             bad_for_duration: Duration::from_secs(900),
             decay_window: Duration::from_secs(3_600),
             ignore_peer_progress_at_or_above: 0.95,
@@ -512,6 +512,10 @@ mod tests {
         assert_eq!(
             config.policy.new_peer_grace_period,
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            config.policy.min_observation_duration,
+            Duration::from_secs(300)
         );
         assert_eq!(
             config.policy.ban_ladder.durations,
