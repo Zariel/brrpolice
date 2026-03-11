@@ -36,6 +36,15 @@ Run it:
 
 ```bash
 docker run --rm -p 9090:9090 \
+  -v "$(pwd)/.data:/data" \
+  brrpolice:latest
+```
+
+If your qBittorrent WebUI requires auth, set both `qbittorrent.username` and
+`qbittorrent.password_env` in config, then provide the password env var at runtime:
+
+```bash
+docker run --rm -p 9090:9090 \
   -e QBITTORRENT_PASSWORD='your-password' \
   -v "$(pwd)/.data:/data" \
   brrpolice:latest
@@ -91,7 +100,7 @@ path = "/tmp/brrpolice.sqlite"
 busy_timeout = "5s"
 
 [http]
-bind = "127.0.0.1:9090"
+bind = "0.0.0.0:9090"
 
 [logging]
 level = "info"
@@ -129,7 +138,13 @@ Supported environment overrides:
 
 ## Run locally
 
-If auth is enabled, set the qBittorrent password env var, then start the service:
+Start the service:
+
+```bash
+cargo run
+```
+
+If qBittorrent auth is enabled in config (both `qbittorrent.username` and `qbittorrent.password_env` are set), export the password env var before starting:
 
 ```bash
 export QBITTORRENT_PASSWORD='your-password'
@@ -144,7 +159,7 @@ export QBITTORRENT_PASSWORD='your-password' # only when auth is enabled
 cargo run
 ```
 
-The service runs migrations on startup, authenticates to qBittorrent, restores persisted state, starts the HTTP server, and then enters the polling loop.
+The service runs migrations and starts the HTTP server immediately; qBittorrent initialization, recovery, and poll-loop readiness happen asynchronously with retries.
 
 ## Test
 

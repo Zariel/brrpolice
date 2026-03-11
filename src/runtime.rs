@@ -57,14 +57,34 @@ impl ServiceState {
         self.live.load(Ordering::Relaxed)
     }
 
+    pub fn is_database_ready(&self) -> bool {
+        self.database_ready.load(Ordering::Relaxed)
+    }
+
+    pub fn is_qbittorrent_ready(&self) -> bool {
+        self.qbittorrent_ready.load(Ordering::Relaxed)
+    }
+
+    pub fn is_recovery_complete(&self) -> bool {
+        self.recovery_complete.load(Ordering::Relaxed)
+    }
+
+    pub fn is_poll_loop_entered(&self) -> bool {
+        self.poll_loop_entered.load(Ordering::Relaxed)
+    }
+
+    pub fn is_runtime_healthy(&self) -> bool {
+        self.runtime_healthy.load(Ordering::Relaxed)
+    }
+
     pub fn is_ready(&self) -> bool {
-        self.live.load(Ordering::Relaxed)
-            && !self.shutting_down.load(Ordering::Relaxed)
-            && self.database_ready.load(Ordering::Relaxed)
-            && self.qbittorrent_ready.load(Ordering::Relaxed)
-            && self.recovery_complete.load(Ordering::Relaxed)
-            && self.poll_loop_entered.load(Ordering::Relaxed)
-            && self.runtime_healthy.load(Ordering::Relaxed)
+        self.is_live()
+            && !self.is_shutting_down()
+            && self.is_database_ready()
+            && self.is_qbittorrent_ready()
+            && self.is_recovery_complete()
+            && self.is_poll_loop_entered()
+            && self.is_runtime_healthy()
     }
 
     pub fn is_shutting_down(&self) -> bool {

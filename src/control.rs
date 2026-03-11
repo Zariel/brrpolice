@@ -37,6 +37,8 @@ pub struct PollCycleResult {
 
 const MAX_CYCLE_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const STARTUP_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
+const STARTUP_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const MAX_PENDING_REPLAY_RETRIES: usize = 3;
 const PENDING_REPLAY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
@@ -107,11 +109,16 @@ impl ControlLoop {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        info!("control loop starting");
+        if !self.initialize_until_ready().await? {
+            info!("control loop stopped before initialization completed");
+            return Ok(());
+        }
+
         let mut interval = time::interval(self.config.qbittorrent.poll_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         self.service_state.mark_poll_loop_entered();
-
-        info!("control loop started");
+        info!("control loop initialized and started");
 
         loop {
             tokio::select! {
@@ -136,6 +143,42 @@ impl ControlLoop {
                 }
             }
         }
+    }
+
+    async fn initialize_until_ready(&mut self) -> Result<bool> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.initialize_once().await {
+                Ok(()) => {
+                    self.service_state.mark_runtime_healthy();
+                    return Ok(true);
+                }
+                Err(error) => {
+                    self.service_state.mark_runtime_unhealthy();
+                    let delay = startup_retry_backoff(attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms = delay.as_millis(),
+                        error = ?error,
+                        "control loop startup initialization failed; retrying"
+                    );
+                    attempt = attempt.saturating_add(1);
+                    tokio::select! {
+                        _ = time::sleep(delay) => {}
+                        _ = self.shutdown.changed() => {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn initialize_once(&self) -> Result<()> {
+        self.qbittorrent.authenticate().await?;
+        self.service_state.mark_qbittorrent_ready();
+        let _ = self.recover_startup_state().await?;
+        Ok(())
     }
 
     pub async fn run_poll_cycle(&self) -> Result<PollCycleResult> {
@@ -407,8 +450,8 @@ impl ControlLoop {
                 }
                 Err(error) => {
                     self.metrics.record_poll_loop_duration(started.elapsed());
-                    self.service_state.mark_runtime_unhealthy();
                     if attempt >= MAX_CYCLE_RETRIES {
+                        self.service_state.mark_runtime_unhealthy();
                         return Err(error);
                     }
 
@@ -744,6 +787,13 @@ impl ControlLoop {
     }
 }
 
+fn startup_retry_backoff(attempt: u32) -> Duration {
+    let shift = attempt.min(6);
+    let multiplier = 1_u32 << shift;
+    let delay = STARTUP_RETRY_BACKOFF_BASE * multiplier;
+    delay.min(STARTUP_RETRY_BACKOFF_MAX)
+}
+
 fn progress_delta_per_mille(progress_delta: f64) -> u32 {
     (progress_delta.max(0.0) * 1000.0).round() as u32
 }
@@ -770,7 +820,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -1254,6 +1307,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_retries_startup_until_qb_becomes_available() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/auth/login",
+                must_contain: vec!["username=admin", "password=secret"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["cookie: SID=abc", "json="],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec!["cookie: SID=abc"],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        assert!(!state.is_ready());
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence,
+            qbittorrent,
+            policy,
+            state.clone(),
+            metrics,
+            shutdown_rx,
+        );
+
+        let task = tokio::spawn(async move { control.run().await });
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if state.is_ready() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("service should become ready after startup retry succeeds");
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn run_poll_cycle_orchestrates_ban_and_persistence() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
@@ -1502,7 +1641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_poll_cycle_with_retry_restores_readiness_after_transient_failure() {
+    async fn run_poll_cycle_with_retry_keeps_readiness_during_transient_failure() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
         let metrics = Arc::new(AppMetrics::new());
@@ -1561,18 +1700,27 @@ mod tests {
         );
 
         let task = tokio::spawn(async move { control.run_poll_cycle_with_retry().await.unwrap() });
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if !state.is_ready() {
-                    break;
+        let monitor_running = Arc::new(AtomicBool::new(true));
+        let saw_unready = Arc::new(AtomicBool::new(false));
+        let monitor_running_flag = monitor_running.clone();
+        let saw_unready_flag = saw_unready.clone();
+        let monitor_state = state.clone();
+        let monitor = tokio::spawn(async move {
+            while monitor_running_flag.load(Ordering::Relaxed) {
+                if !monitor_state.is_ready() {
+                    saw_unready_flag.store(true, Ordering::Relaxed);
                 }
                 time::sleep(Duration::from_millis(5)).await;
             }
-        })
-        .await
-        .expect("service state should become unhealthy during retry backoff");
+        });
 
-        let result = task.await.unwrap();
+        let result = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("poll cycle retry task should complete")
+            .unwrap();
+        monitor_running.store(false, Ordering::Relaxed);
+        monitor.await.unwrap();
+
         assert_eq!(
             result,
             super::PollCycleResult {
@@ -1580,6 +1728,10 @@ mod tests {
                 peer_count: 0,
                 ban_count: 0,
             }
+        );
+        assert!(
+            !saw_unready.load(Ordering::Relaxed),
+            "service readiness should not flap during retry backoff"
         );
         assert!(state.is_ready());
 

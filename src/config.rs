@@ -31,15 +31,19 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
-        let file = path
-            .or_else(|| std::env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("config.toml"));
-        Self::load_from_path_with_env_source(&file, None)
+        let env_path = std::env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from);
+        let (file, require_file) = match (path, env_path) {
+            (Some(path), _) => (path, true),
+            (None, Some(path)) => (path, true),
+            (None, None) => (PathBuf::from("config.toml"), false),
+        };
+        Self::load_from_path_with_env_source(&file, None, require_file)
     }
 
     fn load_from_path_with_env_source(
         path: &Path,
         env_source: Option<Map<String, String>>,
+        require_file: bool,
     ) -> Result<Self> {
         let raw = Config::builder()
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
@@ -62,14 +66,15 @@ impl AppConfig {
             )?
             .set_default("database.path", "/data/brrpolice.sqlite")?
             .set_default("database.busy_timeout", "5s")?
-            .set_default("http.bind", "127.0.0.1:9090")?
+            .set_default("http.bind", "0.0.0.0:9090")?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "json")?
             .add_source(
-                File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
+                File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(require_file),
             )
             .add_source(environment_source(env_source))
-            .build()?;
+            .build()
+            .with_context(|| format!("failed to load configuration file `{}`", path.display()))?;
         let parsed = raw.try_deserialize::<AppConfig>()?;
         parsed.validate()?;
         Ok(parsed)
@@ -358,7 +363,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:9090".to_string(),
+            bind: "0.0.0.0:9090".to_string(),
         }
     }
 }
@@ -475,7 +480,13 @@ fn validate_logging_format(format: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, path::Path, time::Duration};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock},
+        time::Duration,
+    };
 
     use super::AppConfig;
     use tempfile::tempdir;
@@ -503,13 +514,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_http_bind_to_loopback() {
+    fn defaults_http_bind_to_all_interfaces() {
         let temp_dir = tempdir().unwrap();
         let config_path = temp_dir.path().join("missing.toml");
 
         let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
-        assert_eq!(config.http.bind, "127.0.0.1:9090");
+        assert_eq!(config.http.bind, "0.0.0.0:9090");
     }
 
     #[test]
@@ -777,6 +788,52 @@ format = "yaml"
         assert_ne!(baseline.fingerprint(), changed.fingerprint());
     }
 
+    #[test]
+    fn errors_when_config_env_path_is_missing() {
+        let temp_dir = tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.toml");
+        let error = load_test_config_via_env_var(missing_path).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("failed to load configuration file")
+                && chain.contains("missing.toml")
+                && chain.contains("not found")
+        );
+    }
+
+    #[test]
+    fn errors_when_config_env_path_has_parse_error() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("invalid.toml");
+        fs::write(
+            &config_path,
+            r#"
+[qbittorrent
+base_url = "http://qbittorrent:8080"
+"#,
+        )
+        .unwrap();
+
+        let error = load_test_config_via_env_var(config_path).unwrap_err();
+        assert!(format!("{error:#}").contains("failed to load configuration file"));
+    }
+
+    #[test]
+    fn errors_when_config_env_path_has_validation_error() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+poll_interval = "5s"
+request_timeout = "10s"
+"#,
+        );
+
+        let error = load_test_config_via_env_var(config_path).unwrap_err();
+        assert!(format!("{error:#}").contains("request_timeout"));
+    }
+
     fn write_config(dir: &Path, content: &str) -> std::path::PathBuf {
         let path = dir.join("config.toml");
         fs::write(&path, content).unwrap();
@@ -787,6 +844,20 @@ format = "yaml"
         path: &Path,
         overrides: HashMap<String, String>,
     ) -> anyhow::Result<AppConfig> {
-        AppConfig::load_from_path_with_env_source(path, Some(overrides.into_iter().collect()))
+        AppConfig::load_from_path_with_env_source(path, Some(overrides.into_iter().collect()), false)
+    }
+
+    fn load_test_config_via_env_var(path: PathBuf) -> anyhow::Result<AppConfig> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap();
+        unsafe {
+            std::env::set_var("BRRPOLICE_CONFIG", path);
+        }
+        let result = AppConfig::load(None);
+        unsafe {
+            std::env::remove_var("BRRPOLICE_CONFIG");
+        }
+        result
     }
 }

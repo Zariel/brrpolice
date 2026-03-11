@@ -74,8 +74,6 @@ async fn main() -> Result<()> {
         config.qbittorrent.request_timeout,
         metrics.clone(),
     )?);
-    qbittorrent.authenticate().await?;
-    state.mark_qbittorrent_ready();
 
     let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
     let http_server = HttpServer::new(
@@ -94,12 +92,11 @@ async fn main() -> Result<()> {
         metrics,
         shutdown_rx,
     );
-    let _startup_snapshot = control_loop.recover_startup_state().await?;
-
-    info!("startup complete; waiting for poll loop readiness");
 
     let http_handle = tokio::spawn(async move { http_server.run().await });
     let control_handle = tokio::spawn(async move { control_loop.run().await });
+
+    info!("startup complete; readiness will follow control-loop initialization");
 
     run_until_shutdown(
         state,
