@@ -8,6 +8,7 @@ pub struct ServiceState {
     qbittorrent_ready: AtomicBool,
     recovery_complete: AtomicBool,
     poll_loop_entered: AtomicBool,
+    runtime_healthy: AtomicBool,
 }
 
 impl ServiceState {
@@ -19,6 +20,7 @@ impl ServiceState {
             qbittorrent_ready: AtomicBool::new(false),
             recovery_complete: AtomicBool::new(false),
             poll_loop_entered: AtomicBool::new(false),
+            runtime_healthy: AtomicBool::new(true),
         }
     }
 
@@ -38,6 +40,14 @@ impl ServiceState {
         self.poll_loop_entered.store(true, Ordering::Relaxed);
     }
 
+    pub fn mark_runtime_healthy(&self) {
+        self.runtime_healthy.store(true, Ordering::Relaxed);
+    }
+
+    pub fn mark_runtime_unhealthy(&self) {
+        self.runtime_healthy.store(false, Ordering::Relaxed);
+    }
+
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
         self.live.store(false, Ordering::Relaxed);
@@ -54,6 +64,7 @@ impl ServiceState {
             && self.qbittorrent_ready.load(Ordering::Relaxed)
             && self.recovery_complete.load(Ordering::Relaxed)
             && self.poll_loop_entered.load(Ordering::Relaxed)
+            && self.runtime_healthy.load(Ordering::Relaxed)
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -96,5 +107,21 @@ mod tests {
         assert!(!state.is_live());
         assert!(!state.is_ready());
         assert!(state.is_shutting_down());
+    }
+
+    #[test]
+    fn runtime_health_clears_readiness_until_recovered() {
+        let state = ServiceState::new();
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+        state.mark_poll_loop_entered();
+        assert!(state.is_ready());
+
+        state.mark_runtime_unhealthy();
+        assert!(!state.is_ready());
+
+        state.mark_runtime_healthy();
+        assert!(state.is_ready());
     }
 }

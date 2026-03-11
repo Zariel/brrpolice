@@ -1093,9 +1093,18 @@ async fn upsert_peer_session_tx(
     .bind(format_system_time(session.last_seen_at))
     .bind(session.baseline_progress)
     .bind(session.latest_progress)
-    .bind(i64::try_from(session.rolling_avg_up_rate_bps).context("rolling avg up rate exceeds sqlite integer range")?)
-    .bind(i64::try_from(session.observed_duration.as_secs()).context("observed duration exceeds sqlite integer range")?)
-    .bind(i64::try_from(session.bad_duration.as_secs()).context("bad duration exceeds sqlite integer range")?)
+    .bind(
+        i64::try_from(session.rolling_avg_up_rate_bps)
+            .context("rolling avg up rate exceeds sqlite integer range")?,
+    )
+    .bind(
+        i64::try_from(session.observed_duration.as_secs())
+            .context("observed duration exceeds sqlite integer range")?,
+    )
+    .bind(
+        i64::try_from(session.bad_duration.as_secs())
+            .context("bad duration exceeds sqlite integer range")?,
+    )
     .bind(i64::from(session.sample_count))
     .bind(i64::from(session.last_torrent_seeder_count))
     .bind(
@@ -1178,10 +1187,19 @@ async fn insert_peer_offence_tx(
     .bind(i64::from(offence.peer_port))
     .bind(i64::from(offence.offence_number))
     .bind(&offence.reason_code)
-    .bind(i64::try_from(offence.observed_duration.as_secs()).context("observed duration exceeds sqlite integer range")?)
-    .bind(i64::try_from(offence.bad_duration.as_secs()).context("bad duration exceeds sqlite integer range")?)
+    .bind(
+        i64::try_from(offence.observed_duration.as_secs())
+            .context("observed duration exceeds sqlite integer range")?,
+    )
+    .bind(
+        i64::try_from(offence.bad_duration.as_secs())
+            .context("bad duration exceeds sqlite integer range")?,
+    )
     .bind(f64::from(offence.progress_delta_per_mille) / 1000.0)
-    .bind(i64::try_from(offence.avg_up_rate_bps).context("avg up rate exceeds sqlite integer range")?)
+    .bind(
+        i64::try_from(offence.avg_up_rate_bps)
+            .context("avg up rate exceeds sqlite integer range")?,
+    )
     .bind(format_system_time(offence.banned_at))
     .bind(format_system_time(offence.ban_expires_at))
     .bind(offence.ban_revoked_at.map(format_system_time))
@@ -1196,7 +1214,9 @@ fn progress_delta_per_mille(progress_delta: f64) -> u32 {
         return 0;
     }
 
-    (progress_delta * 1000.0).round().clamp(0.0, u32::MAX as f64) as u32
+    (progress_delta * 1000.0)
+        .round()
+        .clamp(0.0, u32::MAX as f64) as u32
 }
 
 fn decode_active_ban(row: sqlx::sqlite::SqliteRow) -> Result<ActiveBanRecord> {

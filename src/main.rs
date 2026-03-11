@@ -9,7 +9,7 @@ mod types;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::{signal, sync::watch};
 use tracing::{error, info};
 
@@ -31,9 +31,16 @@ async fn main() -> Result<()> {
     state.mark_database_ready();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let qb_password = std::env::var(&config.qbittorrent.password_env).with_context(|| {
+        format!(
+            "missing qbittorrent password env `{}`",
+            config.qbittorrent.password_env
+        )
+    })?;
 
     let qbittorrent = Arc::new(QbittorrentClient::new(
         config.qbittorrent.clone(),
+        qb_password,
         config.filters.clone(),
         config.policy.min_total_seeders,
         config.qbittorrent.request_timeout,

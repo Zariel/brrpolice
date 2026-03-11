@@ -1,8 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::{sync::watch, time};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::AppConfig,
@@ -28,6 +29,9 @@ pub struct PollCycleResult {
     pub peer_count: usize,
     pub ban_count: usize,
 }
+
+const MAX_CYCLE_RETRIES: usize = 3;
+const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
 impl ControlLoop {
     pub fn new(
@@ -57,12 +61,24 @@ impl ControlLoop {
             .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > now)
             .cloned()
             .collect::<Vec<_>>();
-        let sync_result = self.qbittorrent.reconcile_expired_bans(&active_bans).await?;
+        let expired_bans = snapshot
+            .active_bans
+            .iter()
+            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at <= now)
+            .cloned()
+            .collect::<Vec<_>>();
+        let sync_result = self
+            .qbittorrent
+            .reconcile_expired_bans(&active_bans)
+            .await?;
+        self.mark_expired_bans_reconciled(&expired_bans, now)
+            .await?;
         self.service_state.mark_recovery_complete();
         info!(
             peer_session_count = snapshot.peer_sessions.len(),
             active_ban_count = snapshot.active_bans.len(),
             enforced_banned_ip_count = sync_result.banned_ips.len(),
+            expired_ban_count = expired_bans.len(),
             "startup recovery completed"
         );
         Ok(snapshot)
@@ -78,13 +94,19 @@ impl ControlLoop {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let cycle = self.run_poll_cycle().await?;
-                    debug!(
-                        torrent_count = cycle.torrent_count,
-                        peer_count = cycle.peer_count,
-                        ban_count = cycle.ban_count,
-                        "control loop tick completed"
-                    );
+                    match self.run_poll_cycle_with_retry().await {
+                        Ok(cycle) => {
+                            debug!(
+                                torrent_count = cycle.torrent_count,
+                                peer_count = cycle.peer_count,
+                                ban_count = cycle.ban_count,
+                                "control loop tick completed"
+                            );
+                        }
+                        Err(error) => {
+                            error!(?error, "control loop tick failed after retries");
+                        }
+                    }
                 }
                 _ = self.shutdown.changed() => {
                     info!("control loop stopping");
@@ -96,6 +118,7 @@ impl ControlLoop {
 
     pub async fn run_poll_cycle(&self) -> Result<PollCycleResult> {
         let observed_at = std::time::SystemTime::now();
+        self.reconcile_expired_bans(observed_at).await?;
         let torrents = self.qbittorrent.list_in_scope_torrents().await?;
         let mut active_bans = self.persistence.load_active_bans().await?;
         let mut peer_count = 0;
@@ -109,7 +132,17 @@ impl ControlLoop {
                 total_seeders: torrent.total_seeders,
                 in_scope: true,
             };
-            let peers = self.qbittorrent.list_torrent_peers(&torrent.hash).await?;
+            let peers = match self.qbittorrent.list_torrent_peers(&torrent.hash).await {
+                Ok(peers) => peers,
+                Err(error) => {
+                    warn!(
+                        torrent_hash = %torrent.hash,
+                        error = ?error,
+                        "skipping torrent after peer fetch failure"
+                    );
+                    continue;
+                }
+            };
             for peer in peers {
                 peer_count += 1;
                 let existing = self
@@ -144,7 +177,9 @@ impl ControlLoop {
                     BanDisposition::Ban(decision) => {
                         let active_before = active_bans
                             .iter()
-                            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > observed_at)
+                            .filter(|ban| {
+                                ban.reconciled_at.is_none() && ban.expires_at > observed_at
+                            })
                             .cloned()
                             .collect::<Vec<_>>();
                         self.qbittorrent
@@ -188,6 +223,108 @@ impl ControlLoop {
             ban_count,
         })
     }
+
+    async fn run_poll_cycle_with_retry(&mut self) -> Result<PollCycleResult> {
+        let mut attempt = 0;
+        loop {
+            match self.run_poll_cycle().await {
+                Ok(result) => {
+                    self.service_state.mark_runtime_healthy();
+                    return Ok(result);
+                }
+                Err(error) => {
+                    self.service_state.mark_runtime_unhealthy();
+                    if attempt >= MAX_CYCLE_RETRIES {
+                        return Err(error);
+                    }
+
+                    let delay = RETRY_BACKOFF_BASE * (1_u32 << attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        max_retries = MAX_CYCLE_RETRIES,
+                        backoff_ms = delay.as_millis(),
+                        error = ?error,
+                        "control loop tick failed; retrying"
+                    );
+                    time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn reconcile_expired_bans(&self, reconciled_at: std::time::SystemTime) -> Result<usize> {
+        let expired_bans = self
+            .persistence
+            .list_expired_active_bans(reconciled_at)
+            .await?;
+        if expired_bans.is_empty() {
+            return Ok(0);
+        }
+
+        let remaining_active_bans = self
+            .persistence
+            .load_active_bans()
+            .await?
+            .into_iter()
+            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > reconciled_at)
+            .collect::<Vec<_>>();
+
+        self.qbittorrent
+            .reconcile_expired_bans(&remaining_active_bans)
+            .await?;
+
+        self.mark_expired_bans_reconciled(&expired_bans, reconciled_at)
+            .await?;
+
+        Ok(expired_bans.len())
+    }
+
+    async fn mark_expired_bans_reconciled(
+        &self,
+        expired_bans: &[ActiveBanRecord],
+        reconciled_at: std::time::SystemTime,
+    ) -> Result<()> {
+        for ban in expired_bans {
+            self.persistence
+                .mark_active_ban_reconciled(ban.peer_ip, ban.peer_port, &ban.scope, reconciled_at)
+                .await?;
+            self.revoke_expired_offence(ban, reconciled_at).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn revoke_expired_offence(
+        &self,
+        ban: &ActiveBanRecord,
+        revoked_at: std::time::SystemTime,
+    ) -> Result<()> {
+        let Some(torrent_hash) = ban.scope.strip_prefix("torrent:") else {
+            return Ok(());
+        };
+
+        let offences = self
+            .persistence
+            .load_peer_offences_by_ip(ban.peer_ip)
+            .await?;
+        if let Some(offence_id) = offences
+            .into_iter()
+            .find(|offence| {
+                offence.torrent_hash == torrent_hash
+                    && offence.peer_port == ban.peer_port
+                    && offence.offence_number == ban.offence_number
+                    && offence.ban_revoked_at.is_none()
+            })
+            .and_then(|offence| offence.id)
+        {
+            self.persistence
+                .revoke_peer_offence(offence_id, revoked_at)
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 fn has_active_ban(
@@ -209,7 +346,7 @@ fn has_active_ban(
 
 #[cfg(test)]
 mod tests {
-    use std::{env, io, path::PathBuf, sync::Arc, time::Duration};
+    use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -275,9 +412,6 @@ mod tests {
         ])
         .await;
 
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
-
         let state = Arc::new(ServiceState::new());
         state.mark_database_ready();
         state.mark_qbittorrent_ready();
@@ -286,6 +420,7 @@ mod tests {
         let qbittorrent = Arc::new(
             crate::qbittorrent::QbittorrentClient::new(
                 config.qbittorrent.clone(),
+                "secret".to_string(),
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
@@ -309,7 +444,91 @@ mod tests {
         state.mark_poll_loop_entered();
         assert!(state.is_ready());
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reconciles_expired_bans_and_revokes_offence() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+
+        let expired_ban = ActiveBanRecord {
+            peer_ip: "10.0.0.10".parse().unwrap(),
+            peer_port: 51413,
+            scope: "torrent:abc123".to_string(),
+            offence_number: 2,
+            reason: "slow peer".to_string(),
+            created_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
+            expires_at: std::time::UNIX_EPOCH + Duration::from_secs(120),
+            reconciled_at: None,
+        };
+        persistence.upsert_active_ban(&expired_ban).await.unwrap();
+        let offence_id = persistence
+            .insert_peer_offence(&crate::persistence::PeerOffenceRecord {
+                id: None,
+                torrent_hash: "abc123".to_string(),
+                peer_ip: "10.0.0.10".parse().unwrap(),
+                peer_port: 51413,
+                offence_number: 2,
+                reason_code: "slow peer".to_string(),
+                observed_duration: Duration::from_secs(120),
+                bad_duration: Duration::from_secs(120),
+                progress_delta_per_mille: 0,
+                avg_up_rate_bps: 128,
+                banned_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
+                ban_expires_at: std::time::UNIX_EPOCH + Duration::from_secs(120),
+                ban_revoked_at: None,
+            })
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![ExpectedRequest {
+            method: "POST",
+            path: "/api/v2/app/setPreferences",
+            must_contain: vec!["json="],
+            response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        }])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+
+        let active_bans = persistence.load_active_bans().await.unwrap();
+        assert_eq!(active_bans.len(), 1);
+        assert!(active_bans[0].reconciled_at.is_some());
+        let offences = persistence
+            .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(offences.len(), 1);
+        assert_eq!(offences[0].id, Some(offence_id));
+        assert!(offences[0].ban_revoked_at.is_some());
+
         server.await.unwrap();
     }
 
@@ -386,9 +605,6 @@ mod tests {
         ])
         .await;
 
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
-
         let state = Arc::new(ServiceState::new());
         state.mark_database_ready();
         state.mark_qbittorrent_ready();
@@ -413,6 +629,7 @@ mod tests {
         let qbittorrent = Arc::new(
             crate::qbittorrent::QbittorrentClient::new(
                 config.qbittorrent.clone(),
+                "secret".to_string(),
                 config.filters.clone(),
                 config.policy.min_total_seeders,
                 config.qbittorrent.request_timeout,
@@ -441,7 +658,11 @@ mod tests {
         );
         assert_eq!(persistence.load_active_bans().await.unwrap().len(), 1);
         assert_eq!(
-            persistence.load_peer_offences_by_ip("10.0.0.10".parse().unwrap()).await.unwrap().len(),
+            persistence
+                .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert!(
@@ -458,7 +679,158 @@ mod tests {
                 .is_some()
         );
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_cycle_skips_torrent_after_peer_fetch_failure() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"bad111\",\"name\":\"Broken\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5},{\"hash\":\"good222\",\"name\":\"Healthy\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=bad111&rid=0",
+                must_contain: vec![],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=good222&rid=0",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.20:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.20\",\"port\":51413,\"progress\":0.10,\"dl_speed\":1024,\"up_speed\":2048}},\"peers_removed\":[]}",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            shutdown_rx,
+        );
+
+        let result = control.run_poll_cycle().await.unwrap();
+        assert_eq!(
+            result,
+            super::PollCycleResult {
+                torrent_count: 2,
+                peer_count: 1,
+                ban_count: 0,
+            }
+        );
+        assert!(
+            persistence
+                .get_peer_session(&PeerObservationId {
+                    torrent_hash: "good222".to_string(),
+                    peer_ip: "10.0.0.20".parse().unwrap(),
+                    peer_port: 51413,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_cycle_with_retry_restores_readiness_after_transient_failure() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+        state.mark_poll_loop_entered();
+        assert!(state.is_ready());
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let mut control = ControlLoop::new(
+            config,
+            persistence,
+            qbittorrent,
+            policy,
+            state.clone(),
+            shutdown_rx,
+        );
+
+        let task = tokio::spawn(async move { control.run_poll_cycle_with_retry().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!state.is_ready());
+
+        let result = task.await.unwrap();
+        assert_eq!(
+            result,
+            super::PollCycleResult {
+                torrent_count: 0,
+                peer_count: 0,
+                ban_count: 0,
+            }
+        );
+        assert!(state.is_ready());
+
         server.await.unwrap();
     }
 
@@ -528,7 +900,10 @@ mod tests {
                 let request = read_http_request(&mut stream).await.unwrap();
                 assert!(request.starts_with(&format!("{} {} ", expected.method, expected.path)));
                 for needle in expected.must_contain {
-                    assert!(request.contains(needle), "request missing `{needle}`: {request}");
+                    assert!(
+                        request.contains(needle),
+                        "request missing `{needle}`: {request}"
+                    );
                 }
                 stream
                     .write_all(expected.response.as_bytes())
@@ -573,14 +948,6 @@ mod tests {
             Some(request)
         } else {
             None
-        }
-    }
-
-    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
-        if let Some(value) = previous {
-            unsafe { env::set_var(key, value) };
-        } else {
-            unsafe { env::remove_var(key) };
         }
     }
 }

@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     collections::HashMap,
-    env,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -29,6 +28,7 @@ const TRANSFER_BAN_PEERS_PATH: &str = "api/v2/transfer/banPeers";
 #[derive(Clone)]
 pub struct QbittorrentClient {
     config: QbittorrentConfig,
+    password: String,
     filters: FiltersConfig,
     min_total_seeders: u32,
     client: Client,
@@ -43,6 +43,7 @@ pub struct BanSyncResult {
 impl QbittorrentClient {
     pub fn new(
         config: QbittorrentConfig,
+        password: String,
         filters: FiltersConfig,
         min_total_seeders: u32,
         timeout: Duration,
@@ -55,6 +56,7 @@ impl QbittorrentClient {
 
         Ok(Self {
             config,
+            password,
             filters,
             min_total_seeders,
             client,
@@ -63,18 +65,12 @@ impl QbittorrentClient {
     }
 
     pub async fn authenticate(&self) -> Result<()> {
-        let password = env::var(&self.config.password_env).with_context(|| {
-            format!(
-                "missing qbittorrent password env `{}`",
-                self.config.password_env
-            )
-        })?;
         let response = self
             .client
             .post(self.api_url(AUTH_LOGIN_PATH)?)
             .form(&[
                 ("username", self.config.username.as_str()),
-                ("password", password.as_str()),
+                ("password", self.password.as_str()),
             ])
             .send()
             .await
@@ -120,9 +116,18 @@ impl QbittorrentClient {
     ) -> Result<BanSyncResult> {
         let ban_url = self.ban_peers_url()?;
         let peers = self.encode_ban_peers(&[(ban.peer_ip, ban.peer_port)]);
-        self.send_authenticated(|| self.client.post(ban_url.clone()).form(&[("peers", peers.clone())]))
-            .await
-            .with_context(|| format!("failed to apply qbittorrent peer ban for {}:{}", ban.peer_ip, ban.peer_port))?;
+        self.send_authenticated(|| {
+            self.client
+                .post(ban_url.clone())
+                .form(&[("peers", peers.clone())])
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to apply qbittorrent peer ban for {}:{}",
+                ban.peer_ip, ban.peer_port
+            )
+        })?;
 
         let banned_ips = self.managed_banned_ips(active_bans.iter().chain(std::iter::once(ban)));
         self.sync_banned_ips(&banned_ips).await.with_context(|| {
@@ -243,7 +248,10 @@ impl QbittorrentClient {
             return false;
         }
 
-        if matches_list(torrent.category.as_deref(), &self.filters.exclude_categories) {
+        if matches_list(
+            torrent.category.as_deref(),
+            &self.filters.exclude_categories,
+        ) {
             return false;
         }
 
@@ -255,17 +263,19 @@ impl QbittorrentClient {
             return false;
         }
 
-        let has_include_rules = !self.filters.include_categories.is_empty()
-            || !self.filters.include_tags.is_empty();
+        let has_include_rules =
+            !self.filters.include_categories.is_empty() || !self.filters.include_tags.is_empty();
         if !has_include_rules {
             return true;
         }
 
-        matches_list(torrent.category.as_deref(), &self.filters.include_categories)
-            || torrent
-                .tags
-                .iter()
-                .any(|tag| matches_list(Some(tag.as_str()), &self.filters.include_tags))
+        matches_list(
+            torrent.category.as_deref(),
+            &self.filters.include_categories,
+        ) || torrent
+            .tags
+            .iter()
+            .any(|tag| matches_list(Some(tag.as_str()), &self.filters.include_tags))
     }
 
     fn parse_torrent_peers(&self, body: &str) -> Result<QbTorrentPeersResponse> {
@@ -283,12 +293,21 @@ impl QbittorrentClient {
             left.observation_id
                 .peer_ip
                 .cmp(&right.observation_id.peer_ip)
-                .then(left.observation_id.peer_port.cmp(&right.observation_id.peer_port))
+                .then(
+                    left.observation_id
+                        .peer_port
+                        .cmp(&right.observation_id.peer_port),
+                )
         });
         Ok(normalized)
     }
 
-    fn normalize_peer(&self, torrent_hash: &str, peer_key: &str, peer: QbPeer) -> Result<TorrentPeer> {
+    fn normalize_peer(
+        &self,
+        torrent_hash: &str,
+        peer_key: &str,
+        peer: QbPeer,
+    ) -> Result<TorrentPeer> {
         let ip = peer
             .ip
             .parse::<IpAddr>()
@@ -429,7 +448,7 @@ fn parse_peer_key(key: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use std::{
-        env, io,
+        io,
         net::{IpAddr, Ipv4Addr},
     };
 
@@ -548,7 +567,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            filtered.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            filtered
+                .into_iter()
+                .map(|torrent| torrent.hash)
+                .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -563,7 +585,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            filtered.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            filtered
+                .into_iter()
+                .map(|torrent| torrent.hash)
+                .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -745,9 +770,9 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("peer key `10.0.0.10:51413` does not match body endpoint `10.0.0.11:51413`"),
+            error.to_string().contains(
+                "peer key `10.0.0.10:51413` does not match body endpoint `10.0.0.11:51413`"
+            ),
             "{error:#}"
         );
     }
@@ -818,6 +843,7 @@ mod tests {
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
             },
+            "secret".to_string(),
             filters,
             3,
             std::time::Duration::from_secs(10),
@@ -849,13 +875,10 @@ mod tests {
             response: "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nSet-Cookie: SID=abc; Path=/; HttpOnly\r\n\r\nOk.",
         }])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_test_client(&base_url);
         client.authenticate().await.unwrap();
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -882,8 +905,6 @@ mod tests {
             },
         ])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_test_client(&base_url);
         let version = client
@@ -892,7 +913,6 @@ mod tests {
             .unwrap();
         assert_eq!(version, "5.0.4");
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -919,8 +939,6 @@ mod tests {
             },
         ])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_scoped_test_client(
             &base_url,
@@ -936,11 +954,13 @@ mod tests {
         let torrents = client.list_in_scope_torrents().await.unwrap();
 
         assert_eq!(
-            torrents.into_iter().map(|torrent| torrent.hash).collect::<Vec<_>>(),
+            torrents
+                .into_iter()
+                .map(|torrent| torrent.hash)
+                .collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -967,8 +987,6 @@ mod tests {
             },
         ])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_test_client(&base_url);
         let peers = client.list_torrent_peers("abc123").await.unwrap();
@@ -991,13 +1009,9 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            peers[0].client_name.as_deref(),
-            Some("qBittorrent/5.0.0")
-        );
+        assert_eq!(peers[0].client_name.as_deref(), Some("qBittorrent/5.0.0"));
         assert_eq!(peers[1].client_name, None);
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -1030,8 +1044,6 @@ mod tests {
             },
         ])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_test_client(&base_url);
         let ban = active_ban("10.0.0.10", 51413, "torrent:abc123");
@@ -1057,7 +1069,6 @@ mod tests {
             }
         );
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -1084,8 +1095,6 @@ mod tests {
             },
         ])
         .await;
-        let previous = env::var_os("QBITTORRENT_PASSWORD");
-        unsafe { env::set_var("QBITTORRENT_PASSWORD", "secret") };
 
         let client = network_test_client(&base_url);
         let result = client
@@ -1107,7 +1116,6 @@ mod tests {
             }
         );
 
-        restore_env("QBITTORRENT_PASSWORD", previous);
         server.await.unwrap();
     }
 
@@ -1194,6 +1202,7 @@ mod tests {
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
             },
+            "secret".to_string(),
             filters,
             3,
             std::time::Duration::from_secs(10),
@@ -1211,14 +1220,6 @@ mod tests {
             created_at: std::time::UNIX_EPOCH,
             expires_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600),
             reconciled_at: None,
-        }
-    }
-
-    fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
-        if let Some(value) = previous {
-            unsafe { env::set_var(key, value) };
-        } else {
-            unsafe { env::remove_var(key) };
         }
     }
 }
