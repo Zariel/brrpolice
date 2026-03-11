@@ -1,0 +1,12 @@
+target
+.git
+.github
+.beads
+.dolt
+.doltcfg
+.cargo-home
+docs
+AGENTS.md
+config.yaml
+*.sqlite
+*.sqlite-*

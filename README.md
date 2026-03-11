@@ -23,6 +23,25 @@ Build an optimized binary with:
 cargo build --release
 ```
 
+## Docker image
+
+Build the image locally:
+
+```bash
+docker build -t brrpolice:local .
+```
+
+Run it with a mounted database path:
+
+```bash
+docker run --rm -p 9090:9090 \
+  -e QBITTORRENT_PASSWORD='your-password' \
+  -v "$(pwd)/.data:/data" \
+  brrpolice:local
+```
+
+The image is multi-stage and runs on `distroless` as a non-root user.
+
 ## Configuration
 
 Configuration resolution order is:
@@ -142,6 +161,18 @@ CARGO_HOME=.cargo-home cargo test
 ```
 
 The tests are hermetic and should not depend on ambient qBittorrent credentials or mutate the process environment.
+
+## GitHub Actions
+
+Workflows under `.github/workflows` provide:
+
+- `ci.yml`: runs `cargo test` and `cargo clippy` on pushes and pull requests.
+- `docker-publish.yml`: builds and publishes to GHCR on branch and `v*` tag pushes.
+
+Published image naming:
+
+- branch push: `ghcr.io/<owner>/brrpolice:<branch>`
+- tag push: `ghcr.io/<owner>/brrpolice:<tag>` (for example `v1.0.0`)
 
 ## HTTP endpoints
 
