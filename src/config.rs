@@ -35,11 +35,14 @@ impl AppConfig {
         let file = path
             .or_else(|| env::var_os("BRRPOLICE_CONFIG").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("config.toml"));
-        Self::load_from_path(&file)
+        Self::load_from_path_with_env(&file, &read_env_var)
     }
 
-    fn load_from_path(path: &Path) -> Result<Self> {
-        Self::from_builder(
+    fn load_from_path_with_env<F>(path: &Path, read_env: &F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::from_builder_with_env(
             Config::builder()
                 .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
                 .set_default("qbittorrent.username", "admin")?
@@ -67,13 +70,20 @@ impl AppConfig {
                 .add_source(
                     File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(false),
                 ),
+            read_env,
         )
     }
 
-    fn from_builder(builder: config::ConfigBuilder<config::builder::DefaultState>) -> Result<Self> {
+    fn from_builder_with_env<F>(
+        builder: config::ConfigBuilder<config::builder::DefaultState>,
+        read_env: &F,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let raw = builder.build()?;
         let mut parsed = raw.try_deserialize::<AppConfig>()?;
-        parsed.apply_env_overrides()?;
+        parsed.apply_env_overrides(read_env)?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -92,103 +102,140 @@ impl AppConfig {
         Ok(())
     }
 
-    fn apply_env_overrides(&mut self) -> Result<()> {
+    fn apply_env_overrides<F>(&mut self, read_env: &F) -> Result<()>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         apply_string_override(
             "BRRPOLICE_QBITTORRENT__BASE_URL",
             &mut self.qbittorrent.base_url,
+            read_env,
         );
         apply_string_override(
             "BRRPOLICE_QBITTORRENT__USERNAME",
             &mut self.qbittorrent.username,
+            read_env,
         );
         apply_string_override(
             "BRRPOLICE_QBITTORRENT__PASSWORD_ENV",
             &mut self.qbittorrent.password_env,
+            read_env,
         );
         apply_duration_override(
             "BRRPOLICE_QBITTORRENT__POLL_INTERVAL",
             &mut self.qbittorrent.poll_interval,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT",
             &mut self.qbittorrent.request_timeout,
+            read_env,
         )?;
 
         apply_u64_override(
             "BRRPOLICE_POLICY__SLOW_RATE_BPS",
             &mut self.policy.slow_rate_bps,
+            read_env,
         )?;
         apply_f64_override(
             "BRRPOLICE_POLICY__MIN_PROGRESS_DELTA",
             &mut self.policy.min_progress_delta,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD",
             &mut self.policy.new_peer_grace_period,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION",
             &mut self.policy.min_observation_duration,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_POLICY__BAD_FOR_DURATION",
             &mut self.policy.bad_for_duration,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_POLICY__DECAY_WINDOW",
             &mut self.policy.decay_window,
+            read_env,
         )?;
         apply_f64_override(
             "BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE",
             &mut self.policy.ignore_peer_progress_at_or_above,
+            read_env,
         )?;
         apply_u32_override(
             "BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS",
             &mut self.policy.min_total_seeders,
+            read_env,
         )?;
         apply_duration_override(
             "BRRPOLICE_POLICY__REBAN_COOLDOWN",
             &mut self.policy.reban_cooldown,
+            read_env,
         )?;
         apply_duration_list_override(
             "BRRPOLICE_POLICY__BAN_LADDER__DURATIONS",
             &mut self.policy.ban_ladder.durations,
+            read_env,
         )?;
 
         apply_list_override(
             "BRRPOLICE_FILTERS__INCLUDE_CATEGORIES",
             &mut self.filters.include_categories,
+            read_env,
         );
         apply_list_override(
             "BRRPOLICE_FILTERS__EXCLUDE_CATEGORIES",
             &mut self.filters.exclude_categories,
+            read_env,
         );
         apply_list_override(
             "BRRPOLICE_FILTERS__INCLUDE_TAGS",
             &mut self.filters.include_tags,
+            read_env,
         );
         apply_list_override(
             "BRRPOLICE_FILTERS__EXCLUDE_TAGS",
             &mut self.filters.exclude_tags,
+            read_env,
         );
         apply_list_override(
             "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
             &mut self.filters.allowlist_peer_ips,
+            read_env,
         );
         apply_list_override(
             "BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS",
             &mut self.filters.allowlist_peer_cidrs,
+            read_env,
         );
 
-        apply_path_override("BRRPOLICE_DATABASE__PATH", &mut self.database.path);
+        apply_path_override(
+            "BRRPOLICE_DATABASE__PATH",
+            &mut self.database.path,
+            read_env,
+        );
         apply_duration_override(
             "BRRPOLICE_DATABASE__BUSY_TIMEOUT",
             &mut self.database.busy_timeout,
+            read_env,
         )?;
 
-        apply_string_override("BRRPOLICE_HTTP__BIND", &mut self.http.bind);
-        apply_string_override("BRRPOLICE_LOGGING__LEVEL", &mut self.logging.level);
-        apply_string_override("BRRPOLICE_LOGGING__FORMAT", &mut self.logging.format);
+        apply_string_override("BRRPOLICE_HTTP__BIND", &mut self.http.bind, read_env);
+        apply_string_override(
+            "BRRPOLICE_LOGGING__LEVEL",
+            &mut self.logging.level,
+            read_env,
+        );
+        apply_string_override(
+            "BRRPOLICE_LOGGING__FORMAT",
+            &mut self.logging.format,
+            read_env,
+        );
 
         Ok(())
     }
@@ -440,20 +487,29 @@ fn require_positive_duration(duration: Duration, field_name: &str) -> Result<()>
     Ok(())
 }
 
-fn apply_string_override(key: &str, target: &mut String) {
-    if let Some(value) = read_env_var(key) {
+fn apply_string_override<F>(key: &str, target: &mut String, read_env: &F)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = value;
     }
 }
 
-fn apply_path_override(key: &str, target: &mut PathBuf) {
-    if let Some(value) = read_env_var(key) {
+fn apply_path_override<F>(key: &str, target: &mut PathBuf, read_env: &F)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = PathBuf::from(value);
     }
 }
 
-fn apply_duration_override(key: &str, target: &mut Duration) -> Result<()> {
-    if let Some(value) = read_env_var(key) {
+fn apply_duration_override<F>(key: &str, target: &mut Duration, read_env: &F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = parse_duration(&value)
             .with_context(|| format!("invalid duration in environment variable `{key}`"))?;
     }
@@ -461,8 +517,15 @@ fn apply_duration_override(key: &str, target: &mut Duration) -> Result<()> {
     Ok(())
 }
 
-fn apply_duration_list_override(key: &str, target: &mut Vec<Duration>) -> Result<()> {
-    if let Some(value) = read_env_var(key) {
+fn apply_duration_list_override<F>(
+    key: &str,
+    target: &mut Vec<Duration>,
+    read_env: &F,
+) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = split_env_list(&value)
             .into_iter()
             .map(|item| {
@@ -475,8 +538,11 @@ fn apply_duration_list_override(key: &str, target: &mut Vec<Duration>) -> Result
     Ok(())
 }
 
-fn apply_u64_override(key: &str, target: &mut u64) -> Result<()> {
-    if let Some(value) = read_env_var(key) {
+fn apply_u64_override<F>(key: &str, target: &mut u64, read_env: &F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = value
             .parse()
             .with_context(|| format!("invalid u64 in environment variable `{key}`"))?;
@@ -485,8 +551,11 @@ fn apply_u64_override(key: &str, target: &mut u64) -> Result<()> {
     Ok(())
 }
 
-fn apply_u32_override(key: &str, target: &mut u32) -> Result<()> {
-    if let Some(value) = read_env_var(key) {
+fn apply_u32_override<F>(key: &str, target: &mut u32, read_env: &F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = value
             .parse()
             .with_context(|| format!("invalid u32 in environment variable `{key}`"))?;
@@ -495,8 +564,11 @@ fn apply_u32_override(key: &str, target: &mut u32) -> Result<()> {
     Ok(())
 }
 
-fn apply_f64_override(key: &str, target: &mut f64) -> Result<()> {
-    if let Some(value) = read_env_var(key) {
+fn apply_f64_override<F>(key: &str, target: &mut f64, read_env: &F) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = value
             .parse()
             .with_context(|| format!("invalid f64 in environment variable `{key}`"))?;
@@ -505,8 +577,11 @@ fn apply_f64_override(key: &str, target: &mut f64) -> Result<()> {
     Ok(())
 }
 
-fn apply_list_override(key: &str, target: &mut Vec<String>) {
-    if let Some(value) = read_env_var(key) {
+fn apply_list_override<F>(key: &str, target: &mut Vec<String>, read_env: &F)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = read_env(key) {
         *target = split_env_list(&value);
     }
 }
@@ -566,27 +641,17 @@ fn validate_logging_format(format: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::Path,
-        sync::{Mutex, OnceLock},
-        time::Duration,
-    };
+    use std::{collections::HashMap, fs, path::Path, time::Duration};
 
     use super::AppConfig;
     use tempfile::tempdir;
 
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
     #[test]
     fn loads_defaults_when_no_file_exists() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = temp_dir.path().join("missing.toml");
 
-        let config = AppConfig::load(Some(config_path)).unwrap();
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
         assert_eq!(config.policy.slow_rate_bps, 262_144);
@@ -603,9 +668,6 @@ mod tests {
 
     #[test]
     fn loads_values_from_toml_file() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
             temp_dir.path(),
@@ -648,7 +710,7 @@ format = "plain"
 "#,
         );
 
-        let config = AppConfig::load(Some(config_path)).unwrap();
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
         assert_eq!(config.qbittorrent.username, "alice");
         assert_eq!(config.policy.slow_rate_bps, 1024);
@@ -659,9 +721,6 @@ format = "plain"
 
     #[test]
     fn environment_overrides_toml_values() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
             temp_dir.path(),
@@ -679,16 +738,24 @@ allowlist_peer_ips = ["127.0.0.1"]
 "#,
         );
 
-        unsafe {
-            std::env::set_var("BRRPOLICE_QBITTORRENT__USERNAME", "from-env");
-            std::env::set_var("BRRPOLICE_POLICY__SLOW_RATE_BPS", "4096");
-            std::env::set_var(
-                "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
-                "192.168.1.10,192.168.1.11",
-            );
-        }
-
-        let config = AppConfig::load(Some(config_path)).unwrap();
+        let config = load_test_config(
+            &config_path,
+            HashMap::from([
+                (
+                    "BRRPOLICE_QBITTORRENT__USERNAME".to_string(),
+                    "from-env".to_string(),
+                ),
+                (
+                    "BRRPOLICE_POLICY__SLOW_RATE_BPS".to_string(),
+                    "4096".to_string(),
+                ),
+                (
+                    "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS".to_string(),
+                    "192.168.1.10,192.168.1.11".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
 
         assert_eq!(config.qbittorrent.username, "from-env");
         assert_eq!(config.policy.slow_rate_bps, 4096);
@@ -700,9 +767,6 @@ allowlist_peer_ips = ["127.0.0.1"]
 
     #[test]
     fn rejects_invalid_cidr() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
             temp_dir.path(),
@@ -712,15 +776,12 @@ allowlist_peer_cidrs = ["10.0.0.0/99"]
 "#,
         );
 
-        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("invalid allowlisted peer CIDR"));
     }
 
     #[test]
     fn rejects_invalid_qbittorrent_threshold_combinations() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
             temp_dir.path(),
@@ -731,15 +792,12 @@ request_timeout = "10s"
 "#,
         );
 
-        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("request_timeout"));
     }
 
     #[test]
     fn rejects_unsupported_logging_format() {
-        let _guard = env_lock();
-        clear_test_env();
-
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
             temp_dir.path(),
@@ -749,7 +807,7 @@ format = "yaml"
 "#,
         );
 
-        let error = AppConfig::load(Some(config_path)).unwrap_err();
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("unsupported logging format"));
     }
 
@@ -759,25 +817,10 @@ format = "yaml"
         path
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn clear_test_env() {
-        const KEYS: &[&str] = &[
-            "BRRPOLICE_CONFIG",
-            "BRRPOLICE_QBITTORRENT__USERNAME",
-            "BRRPOLICE_POLICY__SLOW_RATE_BPS",
-            "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS",
-        ];
-
-        for key in KEYS {
-            unsafe {
-                std::env::remove_var(key);
-            }
-        }
+    fn load_test_config(
+        path: &Path,
+        overrides: HashMap<String, String>,
+    ) -> anyhow::Result<AppConfig> {
+        AppConfig::load_from_path_with_env(path, &|key| overrides.get(key).cloned())
     }
 }
