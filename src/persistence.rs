@@ -104,12 +104,12 @@ pub struct Persistence {
 
 impl Persistence {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        if config.path != Path::new(":memory:") {
-            if let Some(parent) = config.path.parent() {
-                tokio::fs::create_dir_all(parent).await.with_context(|| {
-                    format!("failed to create database directory `{}`", parent.display())
-                })?;
-            }
+        if config.path != Path::new(":memory:")
+            && let Some(parent) = config.path.parent()
+        {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("failed to create database directory `{}`", parent.display())
+            })?;
         }
 
         let connect_options = if config.path == Path::new(":memory:") {
@@ -226,6 +226,7 @@ impl Persistence {
             .is_ok()
     }
 
+    #[cfg(test)]
     pub async fn load_peer_sessions(&self) -> Result<Vec<PeerSessionState>> {
         let rows = sqlx::query(
             r#"
@@ -433,6 +434,7 @@ impl Persistence {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn delete_peer_session(&self, observation_id: &PeerObservationId) -> Result<bool> {
         let result =
             sqlx::query("DELETE FROM peer_sessions WHERE torrent_hash = ? AND peer_key = ?")
@@ -444,6 +446,7 @@ impl Persistence {
         Ok(result.rows_affected() > 0)
     }
 
+    #[cfg(test)]
     pub async fn get_service_meta(&self) -> Result<Option<ServiceMetaRecord>> {
         let row = sqlx::query(
             r#"
@@ -490,6 +493,7 @@ impl Persistence {
         })
     }
 
+    #[cfg(test)]
     pub async fn upsert_active_ban(&self, ban: &ActiveBanRecord) -> Result<()> {
         sqlx::query(
             r#"
@@ -599,6 +603,7 @@ impl Persistence {
         Ok(result.rows_affected() > 0)
     }
 
+    #[cfg(test)]
     pub async fn delete_active_ban(
         &self,
         peer_ip: IpAddr,
@@ -812,6 +817,7 @@ impl Persistence {
         })
     }
 
+    #[cfg(test)]
     pub async fn insert_peer_offence(&self, offence: &PeerOffenceRecord) -> Result<i64> {
         let result = sqlx::query(
             r#"
@@ -966,6 +972,7 @@ impl Persistence {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn load_pending_ban_intents(&self) -> Result<Vec<PendingBanIntentRecord>> {
         let rows = sqlx::query(
             r#"
@@ -1141,14 +1148,14 @@ async fn upsert_service_meta(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Re
         .await?
         .map(|row| row.get::<i64, _>("schema_version"));
 
-    if let Some(version) = existing_version {
-        if version > CURRENT_SCHEMA_VERSION {
-            bail!(
-                "service_meta schema version {} is newer than supported version {}",
-                version,
-                CURRENT_SCHEMA_VERSION
-            );
-        }
+    if let Some(version) = existing_version
+        && version > CURRENT_SCHEMA_VERSION
+    {
+        bail!(
+            "service_meta schema version {} is newer than supported version {}",
+            version,
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     sqlx::query(

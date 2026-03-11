@@ -408,7 +408,7 @@ mod tests {
     };
 
     use crate::{
-        config::{FiltersConfig, PolicyConfig},
+        config::{BanLadderConfig, FiltersConfig, PolicyConfig},
         types::{
             BanDisposition, ExemptionReason, OffenceHistory, PeerContext, PeerSessionState,
             PeerSnapshot, TorrentScope,
@@ -433,8 +433,10 @@ mod tests {
 
     #[test]
     fn classifies_allowlisted_peer_exemption() {
-        let mut filters = FiltersConfig::default();
-        filters.allowlist_peer_ips = vec!["10.0.0.10".to_string()];
+        let filters = FiltersConfig {
+            allowlist_peer_ips: vec!["10.0.0.10".to_string()],
+            ..FiltersConfig::default()
+        };
         let engine = PolicyEngine::new(PolicyConfig::default(), &filters);
 
         assert_eq!(
@@ -503,13 +505,15 @@ mod tests {
 
     #[test]
     fn accumulates_bad_time_until_peer_is_bannable() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(300);
-        config.bad_for_duration = Duration::from_secs(180);
-        config.decay_window = Duration::from_secs(600);
-        config.slow_rate_bps = 1_000;
-        config.min_progress_delta = 0.01;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(300),
+            bad_for_duration: Duration::from_secs(180),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let initial = seeded_peer(0, 0.10, 500);
@@ -535,11 +539,13 @@ mod tests {
 
     #[test]
     fn decays_bad_time_when_peer_improves() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.bad_for_duration = Duration::from_secs(300);
-        config.decay_window = Duration::from_secs(600);
-        config.min_progress_delta = 0.01;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            bad_for_duration: Duration::from_secs(300),
+            decay_window: Duration::from_secs(600),
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let mut session = PeerSessionState {
@@ -572,10 +578,12 @@ mod tests {
 
     #[test]
     fn carries_over_state_across_reconnect_on_new_port() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.bad_for_duration = Duration::from_secs(300);
-        config.decay_window = Duration::from_secs(600);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            bad_for_duration: Duration::from_secs(300),
+            decay_window: Duration::from_secs(600),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let mut peer = seeded_peer(120, 0.10, 500);
@@ -610,8 +618,10 @@ mod tests {
 
     #[test]
     fn does_not_mark_exempt_samples_as_bad() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(300);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(300),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let initial = test_peer();
         let session = engine.begin_session(&initial, None);
@@ -627,13 +637,15 @@ mod tests {
 
     #[test]
     fn supports_first_evaluation_without_seeded_session() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
-        config.decay_window = Duration::from_secs(600);
-        config.min_progress_delta = 0.01;
-        config.slow_rate_bps = 1_000;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            decay_window: Duration::from_secs(600),
+            min_progress_delta: 0.01,
+            slow_rate_bps: 1_000,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
@@ -649,10 +661,12 @@ mod tests {
 
     #[test]
     fn returns_not_bannable_until_thresholds_are_met() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(600);
-        config.bad_for_duration = Duration::from_secs(300);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(600),
+            bad_for_duration: Duration::from_secs(300),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
 
@@ -669,11 +683,13 @@ mod tests {
 
     #[test]
     fn returns_reban_cooldown_when_previous_ban_expired_recently() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
-        config.reban_cooldown = Duration::from_secs(300);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            reban_cooldown: Duration::from_secs(300),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -695,10 +711,12 @@ mod tests {
 
     #[test]
     fn selects_ban_ladder_ttl_from_prior_offence_count() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -724,11 +742,15 @@ mod tests {
 
     #[test]
     fn selects_first_ban_ladder_rung_for_first_offence() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
-        config.ban_ladder.durations = vec![Duration::from_secs(300), Duration::from_secs(600)];
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            ban_ladder: BanLadderConfig {
+                durations: vec![Duration::from_secs(300), Duration::from_secs(600)],
+            },
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -744,11 +766,15 @@ mod tests {
 
     #[test]
     fn caps_ban_ladder_at_last_rung_for_high_offence_counts() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
-        config.ban_ladder.durations = vec![Duration::from_secs(300), Duration::from_secs(600)];
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            ban_ladder: BanLadderConfig {
+                durations: vec![Duration::from_secs(300), Duration::from_secs(600)],
+            },
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -771,8 +797,10 @@ mod tests {
 
     #[test]
     fn returns_exemption_before_ban_decision() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(300);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(300),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = test_peer();
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -785,10 +813,12 @@ mod tests {
 
     #[test]
     fn suppresses_duplicate_ban_decisions_for_same_bannable_episode() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -809,12 +839,14 @@ mod tests {
 
     #[test]
     fn allows_new_ban_after_peer_leaves_bannable_state() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(60);
-        config.bad_for_duration = Duration::from_secs(30);
-        config.decay_window = Duration::from_secs(60);
-        config.reban_cooldown = Duration::from_secs(30);
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(30),
+            decay_window: Duration::from_secs(60),
+            reban_cooldown: Duration::from_secs(30),
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
         let evaluation = engine.evaluate_peer(&peer, None);
@@ -845,13 +877,15 @@ mod tests {
 
     #[test]
     fn simulation_slow_non_progressing_peer_escalates_to_ban() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(180);
-        config.bad_for_duration = Duration::from_secs(120);
-        config.decay_window = Duration::from_secs(600);
-        config.slow_rate_bps = 1_000;
-        config.min_progress_delta = 0.01;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(180),
+            bad_for_duration: Duration::from_secs(120),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let mut session = None;
@@ -868,13 +902,15 @@ mod tests {
 
     #[test]
     fn simulation_reconnect_churn_preserves_progress_toward_ban() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(180);
-        config.bad_for_duration = Duration::from_secs(120);
-        config.decay_window = Duration::from_secs(600);
-        config.slow_rate_bps = 1_000;
-        config.min_progress_delta = 0.01;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(180),
+            bad_for_duration: Duration::from_secs(120),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let first = seeded_peer(120, 0.10, 500);
@@ -901,13 +937,15 @@ mod tests {
 
     #[test]
     fn simulation_healthy_recovery_clears_bannable_state() {
-        let mut config = PolicyConfig::default();
-        config.new_peer_grace_period = Duration::from_secs(1);
-        config.min_observation_duration = Duration::from_secs(180);
-        config.bad_for_duration = Duration::from_secs(120);
-        config.decay_window = Duration::from_secs(600);
-        config.slow_rate_bps = 1_000;
-        config.min_progress_delta = 0.01;
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(180),
+            bad_for_duration: Duration::from_secs(120),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.01,
+            ..PolicyConfig::default()
+        };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
         let peer = seeded_peer(240, 0.1015, 500);
@@ -952,9 +990,10 @@ mod tests {
             (
                 "allowlisted",
                 {
-                    let mut filters = FiltersConfig::default();
-                    filters.allowlist_peer_ips = vec!["10.0.0.10".to_string()];
-                    filters
+                    FiltersConfig {
+                        allowlist_peer_ips: vec!["10.0.0.10".to_string()],
+                        ..FiltersConfig::default()
+                    }
                 },
                 seeded_peer(360, 0.10, 500),
                 ExemptionReason::AllowlistedPeer,

@@ -19,7 +19,9 @@ use crate::{
 };
 
 const AUTH_LOGIN_PATH: &str = "api/v2/auth/login";
+#[cfg(test)]
 const APP_VERSION_PATH: &str = "api/v2/app/version";
+#[cfg(test)]
 const WEBAPI_VERSION_PATH: &str = "api/v2/app/webapiVersion";
 const APP_PREFERENCES_PATH: &str = "api/v2/app/preferences";
 const APP_SET_PREFERENCES_PATH: &str = "api/v2/app/setPreferences";
@@ -405,13 +407,13 @@ impl QbittorrentClient {
             .ip
             .parse::<IpAddr>()
             .with_context(|| format!("invalid peer ip `{}`", peer.ip))?;
-        if let Some(address) = parse_peer_key(peer_key) {
-            if address.ip() != ip || address.port() != peer.port {
-                bail!(
-                    "peer key `{peer_key}` does not match body endpoint `{ip}:{}`",
-                    peer.port
-                );
-            }
+        if let Some(address) = parse_peer_key(peer_key)
+            && (address.ip() != ip || address.port() != peer.port)
+        {
+            bail!(
+                "peer key `{peer_key}` does not match body endpoint `{ip}:{}`",
+                peer.port
+            );
         }
         let client_name = empty_string_to_none(peer.client.trim().to_string());
         let peer = PeerSnapshot {
