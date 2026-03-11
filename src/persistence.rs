@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use humantime::{format_rfc3339_seconds, parse_rfc3339_weak};
 use sqlx::{
-    Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqliteJournalMode,
+    Executor, Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqliteJournalMode,
     sqlite::SqlitePoolOptions,
 };
 use tracing::info;
@@ -228,33 +228,7 @@ impl Persistence {
 
     #[cfg(test)]
     pub async fn load_peer_sessions(&self) -> Result<Vec<PeerSessionState>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_key,
-                peer_ip,
-                peer_port,
-                first_seen_at,
-                last_seen_at,
-                baseline_progress,
-                latest_progress,
-                rolling_avg_up_rate_bps,
-                observed_seconds,
-                bad_seconds,
-                sample_count,
-                last_torrent_seeder_count,
-                last_exemption_reason,
-                bannable_since,
-                last_ban_decision_at
-            FROM peer_sessions
-            ORDER BY torrent_hash, peer_key
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(decode_peer_session).collect()
+        load_peer_sessions_exec(&self.pool).await
     }
 
     pub async fn count_peer_sessions(&self) -> Result<usize> {
@@ -288,35 +262,7 @@ impl Persistence {
         &self,
         observation_id: &PeerObservationId,
     ) -> Result<Option<PeerSessionState>> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_key,
-                peer_ip,
-                peer_port,
-                first_seen_at,
-                last_seen_at,
-                baseline_progress,
-                latest_progress,
-                rolling_avg_up_rate_bps,
-                observed_seconds,
-                bad_seconds,
-                sample_count,
-                last_torrent_seeder_count,
-                last_exemption_reason,
-                bannable_since,
-                last_ban_decision_at
-            FROM peer_sessions
-            WHERE torrent_hash = ? AND peer_key = ?
-            "#,
-        )
-        .bind(&observation_id.torrent_hash)
-        .bind(peer_key(observation_id.peer_ip, observation_id.peer_port))
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(decode_peer_session).transpose()
+        get_peer_session_exec(&self.pool, observation_id).await
     }
 
     pub async fn get_latest_peer_session_for_torrent_ip(
@@ -362,76 +308,7 @@ impl Persistence {
         session: &PeerSessionState,
         policy_version: &str,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO peer_sessions (
-                torrent_hash,
-                peer_key,
-                peer_ip,
-                peer_port,
-                client_name,
-                first_seen_at,
-                last_seen_at,
-                baseline_progress,
-                latest_progress,
-                rolling_avg_up_rate_bps,
-                observed_seconds,
-                bad_seconds,
-                sample_count,
-                last_torrent_seeder_count,
-                last_exemption_reason,
-                policy_version,
-                bannable_since,
-                last_ban_decision_at
-            )
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(torrent_hash, peer_key) DO UPDATE SET
-                peer_ip = excluded.peer_ip,
-                peer_port = excluded.peer_port,
-                first_seen_at = excluded.first_seen_at,
-                last_seen_at = excluded.last_seen_at,
-                baseline_progress = excluded.baseline_progress,
-                latest_progress = excluded.latest_progress,
-                rolling_avg_up_rate_bps = excluded.rolling_avg_up_rate_bps,
-                observed_seconds = excluded.observed_seconds,
-                bad_seconds = excluded.bad_seconds,
-                sample_count = excluded.sample_count,
-                last_torrent_seeder_count = excluded.last_torrent_seeder_count,
-                last_exemption_reason = excluded.last_exemption_reason,
-                policy_version = excluded.policy_version,
-                bannable_since = excluded.bannable_since,
-                last_ban_decision_at = excluded.last_ban_decision_at
-            "#,
-        )
-        .bind(&session.observation_id.torrent_hash)
-        .bind(peer_key(
-            session.observation_id.peer_ip,
-            session.observation_id.peer_port,
-        ))
-        .bind(session.observation_id.peer_ip.to_string())
-        .bind(i64::from(session.observation_id.peer_port))
-        .bind(format_system_time(session.first_seen_at))
-        .bind(format_system_time(session.last_seen_at))
-        .bind(session.baseline_progress)
-        .bind(session.latest_progress)
-        .bind(i64::try_from(session.rolling_avg_up_rate_bps)?)
-        .bind(i64::try_from(session.observed_duration.as_secs())?)
-        .bind(i64::try_from(session.bad_duration.as_secs())?)
-        .bind(i64::from(session.sample_count))
-        .bind(i64::from(session.last_torrent_seeder_count))
-        .bind(
-            session
-                .last_exemption_reason
-                .as_ref()
-                .map(encode_exemption_reason),
-        )
-        .bind(policy_version)
-        .bind(session.bannable_since.map(format_system_time))
-        .bind(session.last_ban_decision_at.map(format_system_time))
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        upsert_peer_session_exec(&self.pool, session, policy_version).await
     }
 
     #[cfg(test)]
@@ -448,17 +325,7 @@ impl Persistence {
 
     #[cfg(test)]
     pub async fn get_service_meta(&self) -> Result<Option<ServiceMetaRecord>> {
-        let row = sqlx::query(
-            r#"
-            SELECT schema_version, service_version, config_hash, updated_at
-            FROM service_meta
-            WHERE id = 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(decode_service_meta).transpose()
+        load_service_meta_exec(&self.pool).await
     }
 
     pub async fn update_service_meta(
@@ -495,61 +362,11 @@ impl Persistence {
 
     #[cfg(test)]
     pub async fn upsert_active_ban(&self, ban: &ActiveBanRecord) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO active_bans (
-                peer_ip,
-                peer_port,
-                scope,
-                offence_number,
-                reason,
-                created_at,
-                expires_at,
-                reconciled_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(peer_ip, peer_port, scope) DO UPDATE SET
-                offence_number = excluded.offence_number,
-                reason = excluded.reason,
-                created_at = excluded.created_at,
-                expires_at = excluded.expires_at,
-                reconciled_at = excluded.reconciled_at
-            "#,
-        )
-        .bind(ban.peer_ip.to_string())
-        .bind(i64::from(ban.peer_port))
-        .bind(&ban.scope)
-        .bind(i64::from(ban.offence_number))
-        .bind(&ban.reason)
-        .bind(format_system_time(ban.created_at))
-        .bind(format_system_time(ban.expires_at))
-        .bind(ban.reconciled_at.map(format_system_time))
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        upsert_active_ban_exec(&self.pool, ban).await
     }
 
     pub async fn load_active_bans(&self) -> Result<Vec<ActiveBanRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                peer_ip,
-                peer_port,
-                scope,
-                offence_number,
-                reason,
-                created_at,
-                expires_at,
-                reconciled_at
-            FROM active_bans
-            ORDER BY expires_at, peer_ip, peer_port, scope
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(decode_active_ban).collect()
+        load_active_bans_exec(&self.pool).await
     }
 
     pub async fn list_expired_active_bans(
@@ -629,53 +446,21 @@ impl Persistence {
         enforced_at: SystemTime,
     ) -> Result<EnforcementWriteResult> {
         let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_key,
-                peer_ip,
-                peer_port,
-                first_seen_at,
-                last_seen_at,
-                baseline_progress,
-                latest_progress,
-                rolling_avg_up_rate_bps,
-                observed_seconds,
-                bad_seconds,
-                sample_count,
-                last_torrent_seeder_count,
-                last_exemption_reason,
-                policy_version,
-                bannable_since,
-                last_ban_decision_at
-            FROM peer_sessions
-            WHERE torrent_hash = ? AND peer_key = ?
-            "#,
-        )
-        .bind(&evaluation.session.observation_id.torrent_hash)
-        .bind(peer_key(
-            evaluation.session.observation_id.peer_ip,
-            evaluation.session.observation_id.peer_port,
-        ))
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(row) = existing {
-            let session = decode_peer_session(row)?;
-            if session.last_ban_decision_at.is_some() {
-                tx.commit().await?;
-                return Ok(EnforcementWriteResult {
-                    duplicate_suppressed: true,
-                    offence_id: None,
-                    active_ban: None,
-                });
-            }
+        if let Some(session) =
+            get_peer_session_exec(&mut *tx, &evaluation.session.observation_id).await?
+            && session.last_ban_decision_at.is_some()
+        {
+            tx.commit().await?;
+            return Ok(EnforcementWriteResult {
+                duplicate_suppressed: true,
+                offence_id: None,
+                active_ban: None,
+            });
         }
 
         let mut updated_session = evaluation.session.clone();
         updated_session.last_ban_decision_at = Some(enforced_at);
-        upsert_peer_session_tx(&mut tx, &updated_session, "policy-v1").await?;
+        upsert_peer_session_exec(&mut *tx, &updated_session, "policy-v1").await?;
 
         let offence = PeerOffenceRecord {
             id: None,
@@ -692,7 +477,7 @@ impl Persistence {
             ban_expires_at: enforced_at + decision.ttl,
             ban_revoked_at: None,
         };
-        let offence_id = insert_peer_offence_tx(&mut tx, &offence).await?;
+        let offence_id = insert_peer_offence_exec(&mut *tx, &offence).await?;
 
         let active_ban = ActiveBanRecord {
             peer_ip: decision.peer_ip,
@@ -704,7 +489,7 @@ impl Persistence {
             expires_at: enforced_at + decision.ttl,
             reconciled_at: None,
         };
-        upsert_active_ban_tx(&mut tx, &active_ban).await?;
+        upsert_active_ban_exec(&mut *tx, &active_ban).await?;
 
         tx.commit().await?;
 
@@ -717,95 +502,12 @@ impl Persistence {
 
     pub async fn load_recovery_snapshot(&self) -> Result<RecoverySnapshot> {
         let mut tx = self.pool.begin().await?;
-        let service_meta = sqlx::query(
-            r#"
-            SELECT
-                schema_version,
-                service_version,
-                config_hash,
-                updated_at
-            FROM service_meta
-            LIMIT 1
-            "#,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map(decode_service_meta)??;
-
-        let peer_sessions = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_key,
-                peer_ip,
-                peer_port,
-                first_seen_at,
-                last_seen_at,
-                baseline_progress,
-                latest_progress,
-                rolling_avg_up_rate_bps,
-                observed_seconds,
-                bad_seconds,
-                sample_count,
-                last_torrent_seeder_count,
-                last_exemption_reason,
-                policy_version,
-                bannable_since,
-                last_ban_decision_at
-            FROM peer_sessions
-            ORDER BY torrent_hash, peer_key
-            "#,
-        )
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(decode_peer_session)
-        .collect::<Result<Vec<_>>>()?;
-
-        let active_bans = sqlx::query(
-            r#"
-            SELECT
-                peer_ip,
-                peer_port,
-                scope,
-                offence_number,
-                reason,
-                created_at,
-                expires_at,
-                reconciled_at
-            FROM active_bans
-            ORDER BY expires_at, peer_ip, peer_port, scope
-            "#,
-        )
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(decode_active_ban)
-        .collect::<Result<Vec<_>>>()?;
-
-        let pending_ban_intents = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_ip,
-                peer_port,
-                offence_number,
-                reason_code,
-                observed_at,
-                ban_expires_at,
-                bad_seconds,
-                progress_delta,
-                avg_up_rate_bps,
-                last_error
-            FROM pending_ban_intents
-            ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
-            "#,
-        )
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(decode_pending_ban_intent)
-        .collect::<Result<Vec<_>>>()?;
+        let service_meta = load_service_meta_exec(&mut *tx)
+            .await?
+            .context("service_meta row missing after migrations")?;
+        let peer_sessions = load_peer_sessions_exec(&mut *tx).await?;
+        let active_bans = load_active_bans_exec(&mut *tx).await?;
+        let pending_ban_intents = load_pending_ban_intents_exec(&mut *tx).await?;
 
         tx.commit().await?;
 
@@ -819,41 +521,7 @@ impl Persistence {
 
     #[cfg(test)]
     pub async fn insert_peer_offence(&self, offence: &PeerOffenceRecord) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
-            INSERT INTO peer_offences (
-                torrent_hash,
-                peer_ip,
-                peer_port,
-                offence_number,
-                reason_code,
-                observed_seconds,
-                bad_seconds,
-                progress_delta,
-                avg_up_rate_bps,
-                banned_at,
-                ban_expires_at,
-                ban_revoked_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&offence.torrent_hash)
-        .bind(offence.peer_ip.to_string())
-        .bind(i64::from(offence.peer_port))
-        .bind(i64::from(offence.offence_number))
-        .bind(&offence.reason_code)
-        .bind(i64::try_from(offence.observed_duration.as_secs())?)
-        .bind(i64::try_from(offence.bad_duration.as_secs())?)
-        .bind(f64::from(offence.progress_delta_per_mille) / 1000.0)
-        .bind(i64::try_from(offence.avg_up_rate_bps)?)
-        .bind(format_system_time(offence.banned_at))
-        .bind(format_system_time(offence.ban_expires_at))
-        .bind(offence.ban_revoked_at.map(format_system_time))
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.last_insert_rowid())
+        insert_peer_offence_exec(&self.pool, offence).await
     }
 
     pub async fn load_peer_offences_by_ip(
@@ -974,28 +642,7 @@ impl Persistence {
 
     #[cfg(test)]
     pub async fn load_pending_ban_intents(&self) -> Result<Vec<PendingBanIntentRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                torrent_hash,
-                peer_ip,
-                peer_port,
-                offence_number,
-                reason_code,
-                observed_at,
-                ban_expires_at,
-                bad_seconds,
-                progress_delta,
-                avg_up_rate_bps,
-                last_error
-            FROM pending_ban_intents
-            ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(decode_pending_ban_intent).collect()
+        load_pending_ban_intents_exec(&self.pool).await
     }
 
     pub async fn delete_pending_ban_intent(
@@ -1281,11 +928,102 @@ fn decode_service_meta(row: sqlx::sqlite::SqliteRow) -> Result<ServiceMetaRecord
     })
 }
 
-async fn upsert_peer_session_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+async fn load_service_meta_exec<'e, E>(executor: E) -> Result<Option<ServiceMetaRecord>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(
+        r#"
+        SELECT schema_version, service_version, config_hash, updated_at
+        FROM service_meta
+        WHERE id = 1
+        "#,
+    )
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(decode_service_meta).transpose()
+}
+
+async fn get_peer_session_exec<'e, E>(
+    executor: E,
+    observation_id: &PeerObservationId,
+) -> Result<Option<PeerSessionState>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(
+        r#"
+        SELECT
+            torrent_hash,
+            peer_key,
+            peer_ip,
+            peer_port,
+            first_seen_at,
+            last_seen_at,
+            baseline_progress,
+            latest_progress,
+            rolling_avg_up_rate_bps,
+            observed_seconds,
+            bad_seconds,
+            sample_count,
+            last_torrent_seeder_count,
+            last_exemption_reason,
+            bannable_since,
+            last_ban_decision_at
+        FROM peer_sessions
+        WHERE torrent_hash = ? AND peer_key = ?
+        "#,
+    )
+    .bind(&observation_id.torrent_hash)
+    .bind(peer_key(observation_id.peer_ip, observation_id.peer_port))
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(decode_peer_session).transpose()
+}
+
+async fn load_peer_sessions_exec<'e, E>(executor: E) -> Result<Vec<PeerSessionState>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            torrent_hash,
+            peer_key,
+            peer_ip,
+            peer_port,
+            first_seen_at,
+            last_seen_at,
+            baseline_progress,
+            latest_progress,
+            rolling_avg_up_rate_bps,
+            observed_seconds,
+            bad_seconds,
+            sample_count,
+            last_torrent_seeder_count,
+            last_exemption_reason,
+            bannable_since,
+            last_ban_decision_at
+        FROM peer_sessions
+        ORDER BY torrent_hash, peer_key
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter().map(decode_peer_session).collect()
+}
+
+async fn upsert_peer_session_exec<'e, E>(
+    executor: E,
     session: &PeerSessionState,
     policy_version: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO peer_sessions (
@@ -1307,7 +1045,8 @@ async fn upsert_peer_session_tx(
             policy_version,
             bannable_since,
             last_ban_decision_at
-        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(torrent_hash, peer_key) DO UPDATE SET
             peer_ip = excluded.peer_ip,
             peer_port = excluded.peer_port,
@@ -1360,16 +1099,41 @@ async fn upsert_peer_session_tx(
     .bind(policy_version)
     .bind(session.bannable_since.map(format_system_time))
     .bind(session.last_ban_decision_at.map(format_system_time))
-    .execute(&mut **tx)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
-async fn upsert_active_ban_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ban: &ActiveBanRecord,
-) -> Result<()> {
+async fn load_active_bans_exec<'e, E>(executor: E) -> Result<Vec<ActiveBanRecord>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            peer_ip,
+            peer_port,
+            scope,
+            offence_number,
+            reason,
+            created_at,
+            expires_at,
+            reconciled_at
+        FROM active_bans
+        ORDER BY expires_at, peer_ip, peer_port, scope
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter().map(decode_active_ban).collect()
+}
+
+async fn upsert_active_ban_exec<'e, E>(executor: E, ban: &ActiveBanRecord) -> Result<()>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO active_bans (
@@ -1398,16 +1162,44 @@ async fn upsert_active_ban_tx(
     .bind(format_system_time(ban.created_at))
     .bind(format_system_time(ban.expires_at))
     .bind(ban.reconciled_at.map(format_system_time))
-    .execute(&mut **tx)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
-async fn insert_peer_offence_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    offence: &PeerOffenceRecord,
-) -> Result<i64> {
+async fn load_pending_ban_intents_exec<'e, E>(executor: E) -> Result<Vec<PendingBanIntentRecord>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            torrent_hash,
+            peer_ip,
+            peer_port,
+            offence_number,
+            reason_code,
+            observed_at,
+            ban_expires_at,
+            bad_seconds,
+            progress_delta,
+            avg_up_rate_bps,
+            last_error
+        FROM pending_ban_intents
+        ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter().map(decode_pending_ban_intent).collect()
+}
+
+async fn insert_peer_offence_exec<'e, E>(executor: E, offence: &PeerOffenceRecord) -> Result<i64>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
     let result = sqlx::query(
         r#"
         INSERT INTO peer_offences (
@@ -1447,7 +1239,7 @@ async fn insert_peer_offence_tx(
     .bind(format_system_time(offence.banned_at))
     .bind(format_system_time(offence.ban_expires_at))
     .bind(offence.ban_revoked_at.map(format_system_time))
-    .execute(&mut **tx)
+    .execute(executor)
     .await?;
 
     Ok(result.last_insert_rowid())
