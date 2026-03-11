@@ -843,6 +843,134 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn simulation_slow_non_progressing_peer_escalates_to_ban() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(180);
+        config.bad_for_duration = Duration::from_secs(120);
+        config.decay_window = Duration::from_secs(600);
+        config.slow_rate_bps = 1_000;
+        config.min_progress_delta = 0.01;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let mut session = None;
+        let mut final_disposition = None;
+        for (observed_secs, progress) in [(60, 0.10), (120, 0.1005), (180, 0.1010), (240, 0.1015)] {
+            let peer = seeded_peer(observed_secs, progress, 500);
+            let evaluation = engine.evaluate_peer(&peer, session.as_ref());
+            final_disposition = Some(engine.decide_ban(&peer, &evaluation, &empty_history()));
+            session = Some(evaluation.session);
+        }
+
+        assert!(matches!(final_disposition, Some(BanDisposition::Ban(_))));
+    }
+
+    #[test]
+    fn simulation_reconnect_churn_preserves_progress_toward_ban() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(180);
+        config.bad_for_duration = Duration::from_secs(120);
+        config.decay_window = Duration::from_secs(600);
+        config.slow_rate_bps = 1_000;
+        config.min_progress_delta = 0.01;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let first = seeded_peer(120, 0.10, 500);
+        let first_eval = engine.evaluate_peer(&first, None);
+        assert!(matches!(
+            engine.decide_ban(&first, &first_eval, &empty_history()),
+            BanDisposition::NotBannableYet { .. }
+        ));
+
+        let mut reconnected = seeded_peer(240, 0.1005, 500);
+        reconnected.peer.port = 51414;
+        let second_eval = engine.evaluate_peer(&reconnected, Some(&first_eval.session));
+
+        assert_eq!(second_eval.session.observation_id.peer_port, 51414);
+        assert_eq!(
+            second_eval.session.first_seen_at,
+            first_eval.session.first_seen_at
+        );
+        assert!(matches!(
+            engine.decide_ban(&reconnected, &second_eval, &empty_history()),
+            BanDisposition::Ban(_)
+        ));
+    }
+
+    #[test]
+    fn simulation_healthy_recovery_clears_bannable_state() {
+        let mut config = PolicyConfig::default();
+        config.new_peer_grace_period = Duration::from_secs(1);
+        config.min_observation_duration = Duration::from_secs(180);
+        config.bad_for_duration = Duration::from_secs(120);
+        config.decay_window = Duration::from_secs(600);
+        config.slow_rate_bps = 1_000;
+        config.min_progress_delta = 0.01;
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let peer = seeded_peer(240, 0.1015, 500);
+        let initial = engine.evaluate_peer(&peer, None);
+        let banned_session = engine.record_ban_decision(&initial.session, peer.observed_at);
+
+        let recovered_peer = seeded_peer(1140, 0.20, 5_000);
+        let recovered = engine.evaluate_peer(&recovered_peer, Some(&banned_session));
+
+        assert!(!recovered.is_bad_sample);
+        assert!(!recovered.is_bannable);
+        assert!(recovered.session.bad_duration < banned_session.bad_duration);
+        assert_eq!(recovered.session.bannable_since, None);
+        assert_eq!(recovered.session.last_ban_decision_at, None);
+    }
+
+    #[test]
+    fn simulation_exemption_matrix_returns_expected_dispositions() {
+        let cases = vec![
+            (
+                "near_complete",
+                FiltersConfig::default(),
+                seeded_peer(360, 0.99, 500),
+                ExemptionReason::NearComplete {
+                    progress: 0.99,
+                    threshold: 0.95,
+                },
+            ),
+            (
+                "low_seeders",
+                FiltersConfig::default(),
+                {
+                    let mut peer = seeded_peer(360, 0.10, 500);
+                    peer.torrent.total_seeders = 1;
+                    peer
+                },
+                ExemptionReason::InsufficientSeeders {
+                    total_seeders: 1,
+                    required_seeders: 3,
+                },
+            ),
+            (
+                "allowlisted",
+                {
+                    let mut filters = FiltersConfig::default();
+                    filters.allowlist_peer_ips = vec!["10.0.0.10".to_string()];
+                    filters
+                },
+                seeded_peer(360, 0.10, 500),
+                ExemptionReason::AllowlistedPeer,
+            ),
+        ];
+
+        for (name, filters, peer, expected) in cases {
+            let engine = PolicyEngine::new(PolicyConfig::default(), &filters);
+            let evaluation = engine.evaluate_peer(&peer, None);
+            match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+                BanDisposition::Exempt(reason) => assert_eq!(reason, expected, "{name}"),
+                other => panic!("expected exemption for {name}, got {other:?}"),
+            }
+        }
+    }
+
     fn test_peer() -> PeerContext {
         seeded_peer(120, 0.25, 1024)
     }
