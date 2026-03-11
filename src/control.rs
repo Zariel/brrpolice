@@ -12,7 +12,10 @@ use crate::{
     policy::PolicyEngine,
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
-    types::{BanDisposition, PeerContext, TorrentScope},
+    types::{
+        BanDecision, BanDisposition, OffenceIdentity, PeerContext, PeerEvaluation,
+        PeerObservationId, PeerSessionState, TorrentScope,
+    },
 };
 
 pub struct ControlLoop {
@@ -34,6 +37,8 @@ pub struct PollCycleResult {
 
 const MAX_CYCLE_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const MAX_PENDING_REPLAY_RETRIES: usize = 3;
+const PENDING_REPLAY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
 impl ControlLoop {
     pub fn new(
@@ -59,7 +64,7 @@ impl ControlLoop {
     pub async fn recover_startup_state(&self) -> Result<RecoverySnapshot> {
         let snapshot = self.persistence.load_recovery_snapshot().await?;
         let now = std::time::SystemTime::now();
-        let active_bans = snapshot
+        let mut active_bans = snapshot
             .active_bans
             .iter()
             .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > now)
@@ -82,6 +87,9 @@ impl ControlLoop {
             .await?;
         self.mark_expired_bans_reconciled(&expired_bans, now)
             .await?;
+        let (replayed_pending_count, dropped_stale_pending_count, failed_pending_count) = self
+            .replay_pending_ban_intents(&snapshot.pending_ban_intents, &mut active_bans, now)
+            .await?;
         self.refresh_gauges().await?;
         self.service_state.mark_recovery_complete();
         info!(
@@ -89,6 +97,10 @@ impl ControlLoop {
             active_ban_count = snapshot.active_bans.len(),
             enforced_banned_ip_count = sync_result.banned_ips.len(),
             expired_ban_count = expired_bans.len(),
+            pending_ban_intent_count = snapshot.pending_ban_intents.len(),
+            replayed_pending_ban_count = replayed_pending_count,
+            dropped_stale_pending_ban_count = dropped_stale_pending_count,
+            failed_pending_ban_replay_count = failed_pending_count,
             "startup recovery completed"
         );
         Ok(snapshot)
@@ -447,6 +459,216 @@ impl ControlLoop {
         Ok(expired_bans.len())
     }
 
+    async fn replay_pending_ban_intents(
+        &self,
+        pending_ban_intents: &[PendingBanIntentRecord],
+        active_bans: &mut Vec<ActiveBanRecord>,
+        recovered_at: std::time::SystemTime,
+    ) -> Result<(usize, usize, usize)> {
+        let mut replayed = 0;
+        let mut stale_dropped = 0;
+        let mut failed = 0;
+
+        for intent in pending_ban_intents {
+            if intent.ban_expires_at <= recovered_at {
+                self.persistence
+                    .delete_pending_ban_intent(
+                        &intent.torrent_hash,
+                        intent.peer_ip,
+                        intent.peer_port,
+                        intent.offence_number,
+                    )
+                    .await?;
+                stale_dropped += 1;
+                info!(
+                    torrent_hash = %intent.torrent_hash,
+                    peer_ip = %intent.peer_ip,
+                    peer_port = intent.peer_port,
+                    offence_number = intent.offence_number,
+                    ban_expires_at = ?intent.ban_expires_at,
+                    "dropped stale pending ban intent during startup recovery"
+                );
+                continue;
+            }
+
+            let mut attempt = 0;
+            loop {
+                match self
+                    .replay_pending_ban_intent(intent, active_bans, recovered_at)
+                    .await
+                {
+                    Ok(()) => {
+                        replayed += 1;
+                        break;
+                    }
+                    Err(error) if attempt + 1 < MAX_PENDING_REPLAY_RETRIES => {
+                        let delay = PENDING_REPLAY_BACKOFF_BASE * (1_u32 << attempt);
+                        warn!(
+                            torrent_hash = %intent.torrent_hash,
+                            peer_ip = %intent.peer_ip,
+                            peer_port = intent.peer_port,
+                            offence_number = intent.offence_number,
+                            retry_attempt = attempt + 1,
+                            max_retries = MAX_PENDING_REPLAY_RETRIES,
+                            backoff_ms = delay.as_millis(),
+                            error = ?error,
+                            "pending ban replay failed; retrying"
+                        );
+                        time::sleep(delay).await;
+                        attempt += 1;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        warn!(
+                            torrent_hash = %intent.torrent_hash,
+                            peer_ip = %intent.peer_ip,
+                            peer_port = intent.peer_port,
+                            offence_number = intent.offence_number,
+                            retries = MAX_PENDING_REPLAY_RETRIES,
+                            error = ?error,
+                            "pending ban replay exhausted retries; intent retained"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok((replayed, stale_dropped, failed))
+    }
+
+    async fn replay_pending_ban_intent(
+        &self,
+        intent: &PendingBanIntentRecord,
+        active_bans: &mut Vec<ActiveBanRecord>,
+        recovered_at: std::time::SystemTime,
+    ) -> Result<()> {
+        let ttl = intent
+            .ban_expires_at
+            .duration_since(recovered_at)
+            .unwrap_or_default();
+        if ttl.is_zero() {
+            self.persistence
+                .delete_pending_ban_intent(
+                    &intent.torrent_hash,
+                    intent.peer_ip,
+                    intent.peer_port,
+                    intent.offence_number,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let active_ban = ActiveBanRecord {
+            peer_ip: intent.peer_ip,
+            peer_port: intent.peer_port,
+            scope: format!("torrent:{}", intent.torrent_hash),
+            offence_number: intent.offence_number,
+            reason: intent.reason_code.clone(),
+            created_at: recovered_at,
+            expires_at: intent.ban_expires_at,
+            reconciled_at: None,
+        };
+
+        if let Err(error) = self
+            .qbittorrent
+            .apply_peer_ban(&active_ban, active_bans)
+            .await
+        {
+            self.persistence
+                .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                    last_error: error.to_string(),
+                    ..intent.clone()
+                })
+                .await?;
+            self.metrics.record_ban_failure();
+            return Err(error);
+        }
+
+        let observation_id = PeerObservationId {
+            torrent_hash: intent.torrent_hash.clone(),
+            peer_ip: intent.peer_ip,
+            peer_port: intent.peer_port,
+        };
+        let existing_session = self.persistence.get_peer_session(&observation_id).await?;
+        let session = existing_session.unwrap_or(PeerSessionState {
+            observation_id,
+            offence_identity: OffenceIdentity {
+                peer_ip: intent.peer_ip,
+            },
+            first_seen_at: intent.observed_at,
+            last_seen_at: intent.observed_at,
+            baseline_progress: 0.0,
+            latest_progress: f64::from(intent.progress_delta_per_mille) / 1000.0,
+            rolling_avg_up_rate_bps: intent.avg_up_rate_bps,
+            observed_duration: intent.bad_duration,
+            bad_duration: intent.bad_duration,
+            sample_count: 1,
+            last_torrent_seeder_count: 0,
+            last_exemption_reason: None,
+            bannable_since: Some(intent.observed_at),
+            last_ban_decision_at: None,
+        });
+        let progress_delta = f64::from(intent.progress_delta_per_mille) / 1000.0;
+        let evaluation = PeerEvaluation {
+            session,
+            progress_delta,
+            sample_duration: intent.bad_duration,
+            sample_up_rate_bps: intent.avg_up_rate_bps,
+            is_bad_sample: true,
+            is_bannable: true,
+        };
+        let decision = BanDecision {
+            peer_ip: intent.peer_ip,
+            peer_port: intent.peer_port,
+            offence_number: intent.offence_number,
+            ttl,
+            reason: intent.reason_code.clone(),
+        };
+
+        let stored = match self
+            .persistence
+            .record_ban_enforcement(&evaluation, &decision, recovered_at)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.persistence
+                    .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                        last_error: error.to_string(),
+                        ..intent.clone()
+                    })
+                    .await?;
+                self.metrics.record_ban_failure();
+                return Err(error);
+            }
+        };
+        self.persistence
+            .delete_pending_ban_intent(
+                &intent.torrent_hash,
+                intent.peer_ip,
+                intent.peer_port,
+                intent.offence_number,
+            )
+            .await?;
+        if let Some(active_ban) = stored.active_ban {
+            active_bans.push(active_ban);
+        }
+        if !stored.duplicate_suppressed {
+            self.metrics.record_ban_applied(intent.bad_duration);
+        }
+
+        info!(
+            torrent_hash = %intent.torrent_hash,
+            peer_ip = %intent.peer_ip,
+            peer_port = intent.peer_port,
+            offence_number = intent.offence_number,
+            ban_expires_at = ?intent.ban_expires_at,
+            "replayed pending ban intent during startup recovery"
+        );
+        Ok(())
+    }
+
     async fn refresh_gauges(&self) -> Result<()> {
         self.metrics
             .set_active_tracked_peers(self.persistence.count_peer_sessions().await?);
@@ -552,7 +774,7 @@ mod tests {
             PolicyConfig, QbittorrentConfig,
         },
         metrics::AppMetrics,
-        persistence::{ActiveBanRecord, Persistence},
+        persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence},
         policy::PolicyEngine,
         runtime::ServiceState,
         types::{OffenceIdentity, PeerObservationId, PeerSessionState},
@@ -741,6 +963,277 @@ mod tests {
         assert_eq!(offences.len(), 1);
         assert_eq!(offences[0].id, Some(offence_id));
         assert!(offences[0].ban_revoked_at.is_some());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_replays_pending_ban_intent_and_clears_it() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let now = std::time::SystemTime::now();
+        let intent = pending_ban_intent(
+            "abc123",
+            "10.0.0.10",
+            51413,
+            1,
+            now - Duration::from_secs(30),
+            now + Duration::from_secs(3600),
+            "failed to apply qbittorrent peer ban",
+        );
+        persistence
+            .upsert_pending_ban_intent(&intent)
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json="],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json=", "10.0.0.10"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+        assert!(
+            persistence
+                .load_pending_ban_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(persistence.load_active_bans().await.unwrap().len(), 1);
+        assert_eq!(
+            persistence
+                .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_drops_stale_pending_ban_intents() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let now = std::time::SystemTime::now();
+        persistence
+            .upsert_pending_ban_intent(&pending_ban_intent(
+                "abc123",
+                "10.0.0.10",
+                51413,
+                1,
+                now - Duration::from_secs(600),
+                now - Duration::from_secs(300),
+                "expired while down",
+            ))
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json="],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+        assert!(
+            persistence
+                .load_pending_ban_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retries_pending_ban_replay_and_retains_on_failure() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let now = std::time::SystemTime::now();
+        persistence
+            .upsert_pending_ban_intent(&pending_ban_intent(
+                "abc123",
+                "10.0.0.10",
+                51413,
+                1,
+                now - Duration::from_secs(60),
+                now + Duration::from_secs(600),
+                "initial failure",
+            ))
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json="],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+        let pending = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0]
+                .last_error
+                .contains("failed to apply qbittorrent peer ban")
+        );
 
         server.await.unwrap();
     }
@@ -1247,6 +1740,30 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    fn pending_ban_intent(
+        torrent_hash: &str,
+        peer_ip: &str,
+        peer_port: u16,
+        offence_number: u32,
+        observed_at: std::time::SystemTime,
+        ban_expires_at: std::time::SystemTime,
+        last_error: &str,
+    ) -> PendingBanIntentRecord {
+        PendingBanIntentRecord {
+            torrent_hash: torrent_hash.to_string(),
+            peer_ip: peer_ip.parse().unwrap(),
+            peer_port,
+            offence_number,
+            reason_code: "slow peer".to_string(),
+            observed_at,
+            ban_expires_at,
+            bad_duration: Duration::from_secs(120),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 128,
+            last_error: last_error.to_string(),
+        }
     }
 
     #[derive(Clone)]

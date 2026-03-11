@@ -92,6 +92,7 @@ pub struct RecoverySnapshot {
     pub service_meta: ServiceMetaRecord,
     pub peer_sessions: Vec<PeerSessionState>,
     pub active_bans: Vec<ActiveBanRecord>,
+    pub pending_ban_intents: Vec<PendingBanIntentRecord>,
 }
 
 #[derive(Clone)]
@@ -777,12 +778,37 @@ impl Persistence {
         .map(decode_active_ban)
         .collect::<Result<Vec<_>>>()?;
 
+        let pending_ban_intents = sqlx::query(
+            r#"
+            SELECT
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_at,
+                ban_expires_at,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                last_error
+            FROM pending_ban_intents
+            ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(decode_pending_ban_intent)
+        .collect::<Result<Vec<_>>>()?;
+
         tx.commit().await?;
 
         Ok(RecoverySnapshot {
             service_meta,
             peer_sessions,
             active_bans,
+            pending_ban_intents,
         })
     }
 
@@ -1897,6 +1923,7 @@ mod tests {
                 service_meta: persistence.get_service_meta().await.unwrap().unwrap(),
                 peer_sessions: vec![session],
                 active_bans: vec![ban],
+                pending_ban_intents: vec![],
             }
         );
     }
@@ -1928,6 +1955,7 @@ mod tests {
         assert_eq!(snapshot.service_meta.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(snapshot.peer_sessions.len(), 1);
         assert_eq!(snapshot.active_bans, vec![active_ban]);
+        assert!(snapshot.pending_ban_intents.is_empty());
         assert_eq!(
             reopened
                 .load_peer_offences_by_ip(decision.peer_ip)
