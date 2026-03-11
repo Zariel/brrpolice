@@ -94,7 +94,7 @@ qBittorrent auth rule:
 | `qbittorrent.base_url` | `BRRPOLICE_QBITTORRENT__BASE_URL` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. |
 | `qbittorrent.username` | `BRRPOLICE_QBITTORRENT__USERNAME` | `""` | Enables authenticated API mode when set together with `password_env`. |
 | `qbittorrent.password_env` | `BRRPOLICE_QBITTORRENT__PASSWORD_ENV` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
-| `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `30s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
+| `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `15s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
 | `qbittorrent.request_timeout` | `BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT` | `10s` | Timeout per qBittorrent API request. Must be `<= poll_interval`. |
 
 ### Policy Settings
@@ -102,7 +102,7 @@ qBittorrent auth rule:
 | Setting | Env Var | Default | Impact |
 |---|---|---|---|
 | `policy.slow_rate_bps` | `BRRPOLICE_POLICY__SLOW_RATE_BPS` | `65536` | Upload-rate threshold (bytes/sec). Peers below this may be treated as slow. |
-| `policy.min_progress_delta` | `BRRPOLICE_POLICY__MIN_PROGRESS_DELTA` | `0.0025` | Minimum progress increase per sample to be considered progressing. |
+| `policy.min_progress_delta` | `BRRPOLICE_POLICY__MIN_PROGRESS_DELTA` | `0.005` | Minimum total completion progress required across the `bad_for_duration` window, expressed as a fraction in `[0.0, 1.0]` (`0.005` = `0.5%`). The requirement ramps linearly until the full window is observed. |
 | `policy.new_peer_grace_period` | `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD` | `60s` | New peers are exempt during this initial age window. |
 | `policy.min_observation_duration` | `BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked duration before a peer can become bannable. |
 | `policy.bad_for_duration` | `BRRPOLICE_POLICY__BAD_FOR_DURATION` | `15m` | Required accumulated "bad" time before ban eligibility. |

@@ -49,10 +49,10 @@ impl AppConfig {
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
             .set_default("qbittorrent.username", "")?
             .set_default("qbittorrent.password_env", "")?
-            .set_default("qbittorrent.poll_interval", "30s")?
+            .set_default("qbittorrent.poll_interval", "15s")?
             .set_default("qbittorrent.request_timeout", "10s")?
             .set_default("policy.slow_rate_bps", 65_536_u64)?
-            .set_default("policy.min_progress_delta", 0.0025_f64)?
+            .set_default("policy.min_progress_delta", 0.005_f64)?
             .set_default("policy.new_peer_grace_period", "60s")?
             .set_default("policy.min_observation_duration", "5m")?
             .set_default("policy.bad_for_duration", "15m")?
@@ -205,10 +205,10 @@ impl AppConfig {
             bail!("policy.ignore_peer_progress_at_or_above must be between 0.0 and 1.0");
         }
         if self.policy.min_progress_delta < 0.0 {
-            bail!("policy.min_progress_delta must not be negative");
+            bail!("policy.min_progress_delta must be >= 0.0 (fraction; 0.005 = 0.5%)");
         }
         if self.policy.min_progress_delta > 1.0 {
-            bail!("policy.min_progress_delta must not exceed 1.0");
+            bail!("policy.min_progress_delta must be <= 1.0 (fraction; 0.005 = 0.5%)");
         }
         if self.policy.ban_ladder.durations.is_empty() {
             bail!("policy.ban_ladder.durations must not be empty");
@@ -267,7 +267,7 @@ impl Default for QbittorrentConfig {
             base_url: "http://qbittorrent:8080".to_string(),
             username: String::new(),
             password_env: String::new(),
-            poll_interval: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(15),
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -297,7 +297,7 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             slow_rate_bps: 65_536,
-            min_progress_delta: 0.0025,
+            min_progress_delta: 0.005,
             new_peer_grace_period: Duration::from_secs(60),
             min_observation_duration: Duration::from_secs(300),
             bad_for_duration: Duration::from_secs(900),
@@ -507,8 +507,10 @@ mod tests {
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
+        assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(15));
         assert_eq!(config.logging.level, "warn");
         assert_eq!(config.policy.slow_rate_bps, 65_536);
+        assert_eq!(config.policy.min_progress_delta, 0.005);
         assert_eq!(
             config.policy.new_peer_grace_period,
             Duration::from_secs(60)

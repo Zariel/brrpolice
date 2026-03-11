@@ -175,17 +175,19 @@ impl PolicyEngine {
                 .observed_at
                 .duration_since(peer.first_seen_at)
                 .unwrap_or_default();
-            let progress_delta = 0.0;
+            let observed_duration = session.observed_duration;
+            let progress_delta = (peer.peer.progress - session.baseline_progress).max(0.0);
+            let required_progress_delta = self.required_progress_delta(observed_duration);
             let exemption = session.last_exemption_reason.clone();
             let is_bad_sample = exemption.is_none()
                 && peer.peer.up_rate_bps < self.config.slow_rate_bps
-                && progress_delta < self.config.min_progress_delta;
+                && progress_delta < required_progress_delta;
             if is_bad_sample {
                 session.bad_duration = sample_duration;
             }
 
             let is_bannable = exemption.is_none()
-                && session.observed_duration >= self.config.min_observation_duration
+                && observed_duration >= self.config.min_observation_duration
                 && session.bad_duration >= self.config.bad_for_duration;
             if is_bannable {
                 session.bannable_since = Some(peer.observed_at);
@@ -209,12 +211,18 @@ impl PolicyEngine {
             .observed_at
             .duration_since(previous.last_seen_at)
             .unwrap_or_default();
-        let progress_delta = (peer.peer.progress - previous.latest_progress).max(0.0);
+        let observed_duration = previous.observed_duration + sample_duration;
+        let baseline_progress = self.advance_progress_baseline(
+            previous.baseline_progress,
+            previous.latest_progress,
+            sample_duration,
+        );
+        let progress_delta = (peer.peer.progress - baseline_progress).max(0.0);
+        let required_progress_delta = self.required_progress_delta(observed_duration);
         let exemption = self.classify_exemption(peer);
         let is_bad_sample = exemption.is_none()
             && peer.peer.up_rate_bps < self.config.slow_rate_bps
-            && progress_delta < self.config.min_progress_delta;
-        let observed_duration = previous.observed_duration + sample_duration;
+            && progress_delta < required_progress_delta;
         let mut bad_duration = self.decay_bad_duration(previous.bad_duration, sample_duration);
         if is_bad_sample {
             bad_duration += sample_duration;
@@ -239,7 +247,7 @@ impl PolicyEngine {
             offence_identity: self.offence_identity(peer),
             first_seen_at: previous.first_seen_at,
             last_seen_at: peer.observed_at,
-            baseline_progress: previous.baseline_progress,
+            baseline_progress,
             latest_progress: peer.peer.progress,
             rolling_avg_up_rate_bps: self.weighted_rate(
                 previous.rolling_avg_up_rate_bps,
@@ -365,6 +373,41 @@ impl PolicyEngine {
             self.config.bad_for_duration.as_secs_f64() / self.config.decay_window.as_secs_f64();
         let decay = elapsed.mul_f64(decay_ratio);
         bad_duration.saturating_sub(decay)
+    }
+
+    fn required_progress_delta(&self, observed_duration: Duration) -> f64 {
+        if observed_duration.is_zero() || self.config.min_progress_delta <= 0.0 {
+            return 0.0;
+        }
+
+        let bad_for_secs = self.config.bad_for_duration.as_secs_f64();
+        if bad_for_secs <= 0.0 {
+            return self.config.min_progress_delta;
+        }
+
+        let observed_secs = observed_duration.as_secs_f64();
+        let ramp = (observed_secs / bad_for_secs).clamp(0.0, 1.0);
+        self.config.min_progress_delta * ramp
+    }
+
+    fn advance_progress_baseline(
+        &self,
+        baseline_progress: f64,
+        latest_progress: f64,
+        elapsed: Duration,
+    ) -> f64 {
+        if elapsed.is_zero() || latest_progress <= baseline_progress {
+            return baseline_progress.min(latest_progress);
+        }
+
+        let bad_for_secs = self.config.bad_for_duration.as_secs_f64();
+        if bad_for_secs <= 0.0 {
+            return latest_progress;
+        }
+
+        let elapsed_secs = elapsed.as_secs_f64();
+        let shift = (elapsed_secs / bad_for_secs).clamp(0.0, 1.0);
+        (baseline_progress + ((latest_progress - baseline_progress) * shift)).clamp(0.0, 1.0)
     }
 
     fn weighted_rate(
@@ -666,6 +709,30 @@ mod tests {
         assert_eq!(evaluation.session.bad_duration, Duration::from_secs(60));
         assert!(evaluation.is_bad_sample);
         assert!(evaluation.is_bannable);
+    }
+
+    #[test]
+    fn evaluates_progress_against_ban_window_not_single_sample_only() {
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(60),
+            bad_for_duration: Duration::from_secs(120),
+            decay_window: Duration::from_secs(600),
+            slow_rate_bps: 1_000,
+            min_progress_delta: 0.02,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let initial = seeded_peer(60, 0.10, 500);
+        let first = engine.evaluate_peer(&seeded_peer(120, 0.111, 500), Some(&engine.begin_session(&initial, None)));
+        assert!(!first.is_bad_sample);
+
+        let second = engine.evaluate_peer(&seeded_peer(180, 0.127, 500), Some(&first.session));
+        assert!(
+            !second.is_bad_sample,
+            "window progress should be sufficient even with small latest sample delta"
+        );
     }
 
     #[test]
