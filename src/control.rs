@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::AppConfig,
     metrics::AppMetrics,
-    persistence::{ActiveBanRecord, Persistence, RecoverySnapshot},
+    persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
     policy::PolicyEngine,
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
@@ -203,38 +203,55 @@ impl ControlLoop {
                             })
                             .cloned()
                             .collect::<Vec<_>>();
-                        self.qbittorrent
-                            .apply_peer_ban(
-                                &ActiveBanRecord {
+                        let active_ban = ActiveBanRecord {
+                            peer_ip: decision.peer_ip,
+                            peer_port: decision.peer_port,
+                            scope: format!("torrent:{}", torrent.hash),
+                            offence_number: decision.offence_number,
+                            reason: decision.reason.clone(),
+                            created_at: observed_at,
+                            expires_at: observed_at + decision.ttl,
+                            reconciled_at: None,
+                        };
+                        if let Err(error) = self
+                            .qbittorrent
+                            .apply_peer_ban(&active_ban, &active_before)
+                            .await
+                        {
+                            self.metrics.record_ban_failure();
+                            error!(
+                                torrent_hash = %torrent.hash,
+                                peer_ip = %decision.peer_ip,
+                                peer_port = decision.peer_port,
+                                offence_number = decision.offence_number,
+                                observed_at = ?observed_at,
+                                bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                progress_delta = evaluation.progress_delta,
+                                average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                                selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                                reason_code = %decision.reason,
+                                error = ?error,
+                                "peer ban application failed"
+                            );
+                            self.persistence
+                                .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                                    torrent_hash: torrent.hash.clone(),
                                     peer_ip: decision.peer_ip,
                                     peer_port: decision.peer_port,
-                                    scope: format!("torrent:{}", torrent.hash),
                                     offence_number: decision.offence_number,
-                                    reason: decision.reason.clone(),
-                                    created_at: observed_at,
-                                    expires_at: observed_at + decision.ttl,
-                                    reconciled_at: None,
-                                },
-                                &active_before,
-                            )
-                            .await
-                            .inspect_err(|error| {
-                                self.metrics.record_ban_failure();
-                                error!(
-                                    torrent_hash = %torrent.hash,
-                                    peer_ip = %decision.peer_ip,
-                                    peer_port = decision.peer_port,
-                                    offence_number = decision.offence_number,
-                                    observed_at = ?observed_at,
-                                    bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                                    progress_delta = evaluation.progress_delta,
-                                    average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                                    selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                    reason_code = %decision.reason,
-                                    error = ?error,
-                                    "peer ban application failed"
-                                );
-                            })?;
+                                    reason_code: decision.reason.clone(),
+                                    observed_at,
+                                    ban_expires_at: observed_at + decision.ttl,
+                                    bad_duration: evaluation.session.bad_duration,
+                                    progress_delta_per_mille: progress_delta_per_mille(
+                                        evaluation.progress_delta,
+                                    ),
+                                    avg_up_rate_bps: evaluation.session.rolling_avg_up_rate_bps,
+                                    last_error: error.to_string(),
+                                })
+                                .await?;
+                            return Err(error);
+                        }
                         let stored = self
                             .persistence
                             .record_ban_enforcement(&evaluation, &decision, observed_at)
@@ -256,6 +273,14 @@ impl ControlLoop {
                                     "peer ban persistence failed"
                                 );
                             })?;
+                        self.persistence
+                            .delete_pending_ban_intent(
+                                &torrent.hash,
+                                decision.peer_ip,
+                                decision.peer_port,
+                                decision.offence_number,
+                            )
+                            .await?;
                         if let Some(active_ban) = stored.active_ban {
                             active_bans.push(active_ban);
                         }
@@ -450,6 +475,10 @@ impl ControlLoop {
 
         Ok(())
     }
+}
+
+fn progress_delta_per_mille(progress_delta: f64) -> u32 {
+    (progress_delta.max(0.0) * 1000.0).round() as u32
 }
 
 fn has_active_ban(
@@ -971,6 +1000,138 @@ mod tests {
             }
         );
         assert!(state.is_ready());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_cycle_persists_pending_ban_intent_when_qb_ban_fails() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        persistence
+            .upsert_peer_session(
+                &PeerSessionState {
+                    observation_id: PeerObservationId {
+                        torrent_hash: "abc123".to_string(),
+                        peer_ip: "10.0.0.10".parse().unwrap(),
+                        peer_port: 51413,
+                    },
+                    offence_identity: OffenceIdentity {
+                        peer_ip: "10.0.0.10".parse().unwrap(),
+                    },
+                    first_seen_at: std::time::UNIX_EPOCH,
+                    last_seen_at: std::time::UNIX_EPOCH + Duration::from_secs(60),
+                    baseline_progress: 0.10,
+                    latest_progress: 0.10,
+                    rolling_avg_up_rate_bps: 512,
+                    observed_duration: Duration::from_secs(120),
+                    bad_duration: Duration::from_secs(120),
+                    sample_count: 2,
+                    last_torrent_seeder_count: 5,
+                    last_exemption_reason: None,
+                    bannable_since: Some(std::time::UNIX_EPOCH + Duration::from_secs(30)),
+                    last_ban_decision_at: None,
+                },
+                "policy-v1",
+            )
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=seeding",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51413\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51413,\"progress\":0.1005,\"dl_speed\":1024,\"up_speed\":128}},\"peers_removed\":[]}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51413"],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+
+        let mut config = test_config(&base_url);
+        config.policy = PolicyConfig {
+            slow_rate_bps: 1024,
+            min_progress_delta: 0.01,
+            new_peer_grace_period: Duration::from_secs(1),
+            min_observation_duration: Duration::from_secs(1),
+            bad_for_duration: Duration::from_secs(1),
+            decay_window: Duration::from_secs(3600),
+            ignore_peer_progress_at_or_above: 0.95,
+            min_total_seeders: 1,
+            reban_cooldown: Duration::from_secs(1),
+            ban_ladder: BanLadderConfig {
+                durations: vec![Duration::from_secs(3600)],
+            },
+        };
+        let config = Arc::new(config);
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                config.qbittorrent.request_timeout,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        let error = control.run_poll_cycle().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to apply qbittorrent peer ban")
+        );
+        let pending = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].torrent_hash, "abc123");
+        assert_eq!(
+            pending[0].peer_ip,
+            "10.0.0.10".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(pending[0].peer_port, 51413);
+        assert_eq!(pending[0].offence_number, 1);
+        assert!(
+            pending[0]
+                .last_error
+                .contains("failed to apply qbittorrent peer ban")
+        );
+        assert!(persistence.load_active_bans().await.unwrap().is_empty());
+        assert!(
+            persistence
+                .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         server.await.unwrap();
     }

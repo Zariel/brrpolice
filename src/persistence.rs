@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 
@@ -63,6 +63,21 @@ pub struct PeerOffenceRecord {
     pub banned_at: SystemTime,
     pub ban_expires_at: SystemTime,
     pub ban_revoked_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBanIntentRecord {
+    pub torrent_hash: String,
+    pub peer_ip: IpAddr,
+    pub peer_port: u16,
+    pub offence_number: u32,
+    pub reason_code: String,
+    pub observed_at: SystemTime,
+    pub ban_expires_at: SystemTime,
+    pub bad_duration: Duration,
+    pub progress_delta_per_mille: u32,
+    pub avg_up_rate_bps: u64,
+    pub last_error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +185,18 @@ impl Persistence {
                 r#"
                 INSERT INTO schema_migrations (version, description)
                 VALUES (2, 'persist bannable timestamps for peer sessions')
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if max_version < 3 {
+            apply_migration_3(&mut tx).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO schema_migrations (version, description)
+                VALUES (3, 'persist pending ban intents after enforcement failures')
                 "#,
             )
             .execute(&mut *tx)
@@ -830,6 +857,98 @@ impl Persistence {
 
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn upsert_pending_ban_intent(&self, record: &PendingBanIntentRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_ban_intents (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_at,
+                ban_expires_at,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(torrent_hash, peer_ip, peer_port, offence_number) DO UPDATE SET
+                reason_code = excluded.reason_code,
+                observed_at = excluded.observed_at,
+                ban_expires_at = excluded.ban_expires_at,
+                bad_seconds = excluded.bad_seconds,
+                progress_delta = excluded.progress_delta,
+                avg_up_rate_bps = excluded.avg_up_rate_bps,
+                last_error = excluded.last_error
+            "#,
+        )
+        .bind(&record.torrent_hash)
+        .bind(record.peer_ip.to_string())
+        .bind(i64::from(record.peer_port))
+        .bind(i64::from(record.offence_number))
+        .bind(&record.reason_code)
+        .bind(format_system_time(record.observed_at))
+        .bind(format_system_time(record.ban_expires_at))
+        .bind(i64::try_from(record.bad_duration.as_secs())?)
+        .bind(f64::from(record.progress_delta_per_mille) / 1000.0)
+        .bind(i64::try_from(record.avg_up_rate_bps)?)
+        .bind(&record.last_error)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn load_pending_ban_intents(&self) -> Result<Vec<PendingBanIntentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_at,
+                ban_expires_at,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                last_error
+            FROM pending_ban_intents
+            ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(decode_pending_ban_intent).collect()
+    }
+
+    pub async fn delete_pending_ban_intent(
+        &self,
+        torrent_hash: &str,
+        peer_ip: IpAddr,
+        peer_port: u16,
+        offence_number: u32,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM pending_ban_intents
+            WHERE torrent_hash = ? AND peer_ip = ? AND peer_port = ? AND offence_number = ?
+            "#,
+        )
+        .bind(torrent_hash)
+        .bind(peer_ip.to_string())
+        .bind(i64::from(peer_port))
+        .bind(i64::from(offence_number))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 async fn apply_migration_1(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -923,6 +1042,31 @@ async fn apply_migration_2(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Resu
     sqlx::query("ALTER TABLE peer_sessions ADD COLUMN last_ban_decision_at TEXT")
         .execute(&mut **tx)
         .await?;
+
+    Ok(())
+}
+
+async fn apply_migration_3(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS pending_ban_intents (
+            torrent_hash TEXT NOT NULL,
+            peer_ip TEXT NOT NULL,
+            peer_port INTEGER NOT NULL,
+            offence_number INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            ban_expires_at TEXT NOT NULL,
+            bad_seconds INTEGER NOT NULL,
+            progress_delta REAL NOT NULL,
+            avg_up_rate_bps INTEGER NOT NULL,
+            last_error TEXT NOT NULL,
+            PRIMARY KEY (torrent_hash, peer_ip, peer_port, offence_number)
+        )
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
 }
@@ -1287,6 +1431,22 @@ fn decode_peer_offence(row: sqlx::sqlite::SqliteRow) -> Result<PeerOffenceRecord
     })
 }
 
+fn decode_pending_ban_intent(row: sqlx::sqlite::SqliteRow) -> Result<PendingBanIntentRecord> {
+    Ok(PendingBanIntentRecord {
+        torrent_hash: row.get("torrent_hash"),
+        peer_ip: row.get::<String, _>("peer_ip").parse()?,
+        peer_port: u16::try_from(row.get::<i64, _>("peer_port"))?,
+        offence_number: u32::try_from(row.get::<i64, _>("offence_number"))?,
+        reason_code: row.get("reason_code"),
+        observed_at: parse_system_time(&row.get::<String, _>("observed_at"))?,
+        ban_expires_at: parse_system_time(&row.get::<String, _>("ban_expires_at"))?,
+        bad_duration: Duration::from_secs(u64::try_from(row.get::<i64, _>("bad_seconds"))?),
+        progress_delta_per_mille: ((row.get::<f64, _>("progress_delta") * 1000.0).round()) as u32,
+        avg_up_rate_bps: u64::try_from(row.get::<i64, _>("avg_up_rate_bps"))?,
+        last_error: row.get("last_error"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1299,7 +1459,7 @@ mod tests {
 
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
-        PeerOffenceRecord, Persistence, RecoverySnapshot,
+        PeerOffenceRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot,
     };
     use crate::{
         config::DatabaseConfig,
@@ -1322,6 +1482,7 @@ mod tests {
             "peer_sessions",
             "peer_offences",
             "active_bans",
+            "pending_ban_intents",
             "service_meta",
         ] {
             let exists = sqlx::query_scalar::<_, i64>(
@@ -1497,6 +1658,51 @@ mod tests {
         assert_eq!(
             offences[1].ban_revoked_at,
             Some(UNIX_EPOCH + Duration::from_secs(5400))
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_ban_intents_round_trip_and_delete() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let record = PendingBanIntentRecord {
+            torrent_hash: "abc123".to_string(),
+            peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_port: 51413,
+            offence_number: 2,
+            reason_code: "slow peer".to_string(),
+            observed_at: UNIX_EPOCH + Duration::from_secs(900),
+            ban_expires_at: UNIX_EPOCH + Duration::from_secs(4_500),
+            bad_duration: Duration::from_secs(1_200),
+            progress_delta_per_mille: 1,
+            avg_up_rate_bps: 128,
+            last_error: "qbittorrent request failed".to_string(),
+        };
+
+        persistence
+            .upsert_pending_ban_intent(&record)
+            .await
+            .unwrap();
+        let loaded = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(loaded, vec![record.clone()]);
+
+        assert!(
+            persistence
+                .delete_pending_ban_intent(
+                    &record.torrent_hash,
+                    record.peer_ip,
+                    record.peer_port,
+                    record.offence_number,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            persistence
+                .load_pending_ban_intents()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1746,8 +1952,15 @@ mod tests {
         .fetch_one(&persistence.pool)
         .await
         .unwrap();
+        let pending_ban_intents_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_ban_intents'",
+        )
+        .fetch_one(&persistence.pool)
+        .await
+        .unwrap();
         assert_eq!(bannable_since_exists, 1);
         assert_eq!(last_ban_decision_exists, 1);
+        assert_eq!(pending_ban_intents_exists, 1);
     }
 
     #[tokio::test]
