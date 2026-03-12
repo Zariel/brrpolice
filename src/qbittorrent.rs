@@ -56,13 +56,12 @@ impl QbittorrentClient {
         password: impl Into<SecretString>,
         filters: FiltersConfig,
         min_total_seeders: u32,
-        timeout: Duration,
         metrics: Arc<AppMetrics>,
     ) -> Result<Self> {
         let base_url = normalized_base_url(&config.base_url)?;
         let client = Client::builder()
             .cookie_store(true)
-            .timeout(timeout)
+            .timeout(config.request_timeout)
             .pool_idle_timeout(config.pool_idle_timeout)
             .build()?;
 
@@ -1233,7 +1232,6 @@ mod tests {
             "secret".to_string(),
             filters,
             3,
-            std::time::Duration::from_secs(10),
             Arc::new(AppMetrics::new()),
         )
         .unwrap()
@@ -1805,7 +1803,6 @@ mod tests {
             String::new(),
             FiltersConfig::default(),
             3,
-            std::time::Duration::from_secs(5),
             Arc::new(AppMetrics::new()),
         )
         .unwrap()
@@ -1825,7 +1822,6 @@ mod tests {
             "secret".to_string(),
             filters,
             3,
-            std::time::Duration::from_secs(10),
             Arc::new(AppMetrics::new()),
         )
         .unwrap()

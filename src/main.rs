@@ -2,13 +2,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use brrpolice::{
-    config::AppConfig, control::ControlLoop, http::HttpServer, metrics::AppMetrics,
-    persistence::Persistence, policy::PolicyEngine, qbittorrent::QbittorrentClient,
+    config::{AppConfig, QbittorrentConfig},
+    control::ControlLoop,
+    http::HttpServer,
+    metrics::AppMetrics,
+    persistence::Persistence,
+    policy::PolicyEngine,
+    qbittorrent::QbittorrentClient,
     runtime::ServiceState,
 };
 use secrecy::SecretString;
 use tokio::{signal, sync::watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,6 +27,7 @@ async fn main() -> Result<()> {
     config.init_tracing()?;
 
     info!(resolved_config = %config.fingerprint(), "resolved configuration loaded");
+    warn_nondefault_resiliency_config(&config);
 
     let persistence = Arc::new(Persistence::connect(&config.database).await?);
     persistence.run_migrations().await?;
@@ -52,7 +58,6 @@ async fn main() -> Result<()> {
         qb_password,
         config.filters.clone(),
         config.policy.min_total_seeders,
-        config.qbittorrent.request_timeout,
         metrics.clone(),
     )?);
 
@@ -88,6 +93,34 @@ async fn main() -> Result<()> {
         shutdown_signal(),
     )
     .await
+}
+
+fn warn_nondefault_resiliency_config(config: &AppConfig) {
+    let defaults = QbittorrentConfig::default();
+    if config.qbittorrent.transient_retries != defaults.transient_retries {
+        warn!(
+            configured = config.qbittorrent.transient_retries,
+            default = defaults.transient_retries,
+            setting = "qbittorrent.transient_retries",
+            "resiliency setting differs from default"
+        );
+    }
+    if config.qbittorrent.pool_idle_timeout != defaults.pool_idle_timeout {
+        warn!(
+            configured_seconds = config.qbittorrent.pool_idle_timeout.as_secs(),
+            default_seconds = defaults.pool_idle_timeout.as_secs(),
+            setting = "qbittorrent.pool_idle_timeout",
+            "resiliency setting differs from default"
+        );
+    }
+    if config.qbittorrent.poll_interval != defaults.poll_interval {
+        warn!(
+            configured_seconds = config.qbittorrent.poll_interval.as_secs(),
+            default_seconds = defaults.poll_interval.as_secs(),
+            setting = "qbittorrent.poll_interval",
+            "resiliency setting differs from default"
+        );
+    }
 }
 
 async fn shutdown_signal() {

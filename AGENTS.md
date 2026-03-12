@@ -148,3 +148,7 @@ the whole workspace. Commit messages should include a title and the body
 should describe the change so that a reviewer can get an understanding. The
 title should be all lower case and no longer than 50 characters, the body must
 use prose, avoid lists and overly explainging things, be concise.
+
+### Release tags
+When creating a tag, include a very brief changelog in the tag annotation using
+one concise line per notable change item.

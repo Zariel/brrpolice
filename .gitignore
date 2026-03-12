@@ -12,3 +12,4 @@ target/
 
 # Local evaluation logs
 prodlogs.json
+samples/logs/

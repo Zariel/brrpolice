@@ -945,7 +945,6 @@ mod tests {
                 SecretString::from(String::new()),
                 FiltersConfig::default(),
                 0,
-                Duration::from_secs(1),
                 Arc::new(AppMetrics::new()),
             )
             .unwrap(),
