@@ -730,7 +730,7 @@ impl ControlLoop {
                 warn!(
                     expired_ban_count = expired_bans.len(),
                     remaining_active_ban_count = remaining_active_bans.len(),
-                    reconciled_at = ?reconciled_at,
+                    reconciled_at = %format_timestamp(reconciled_at),
                     error = ?error,
                     "expired ban reconciliation failed"
                 );
@@ -771,7 +771,7 @@ impl ControlLoop {
                     peer_ip = %intent.peer_ip,
                     peer_port = intent.peer_port,
                     offence_number = intent.offence_number,
-                    ban_expires_at = ?intent.ban_expires_at,
+                    ban_expires_at = %format_timestamp(intent.ban_expires_at),
                     "dropped stale pending ban intent during startup recovery"
                 );
                 continue;
@@ -967,7 +967,7 @@ impl ControlLoop {
             peer_ip = %intent.peer_ip,
             peer_port = intent.peer_port,
             offence_number = intent.offence_number,
-            ban_expires_at = ?intent.ban_expires_at,
+            ban_expires_at = %format_timestamp(intent.ban_expires_at),
             "replayed pending ban intent during startup recovery"
         );
         Ok(())
@@ -998,9 +998,9 @@ impl ControlLoop {
                 peer_ip = %ban.peer_ip,
                 peer_port = ban.peer_port,
                 offence_number = ban.offence_number,
-                created_at = ?ban.created_at,
-                expires_at = ?ban.expires_at,
-                reconciled_at = ?reconciled_at,
+                created_at = %format_timestamp(ban.created_at),
+                expires_at = %format_timestamp(ban.expires_at),
+                reconciled_at = %format_timestamp(reconciled_at),
                 reason_code = %ban.reason,
                 "peer ban expired"
             );
@@ -1047,6 +1047,10 @@ fn startup_retry_backoff(attempt: u32) -> Duration {
         attempt.min(6),
         STARTUP_RETRY_BACKOFF_MAX,
     )
+}
+
+fn format_timestamp(value: std::time::SystemTime) -> String {
+    humantime::format_rfc3339_millis(value).to_string()
 }
 
 async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
