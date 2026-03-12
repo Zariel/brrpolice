@@ -87,6 +87,10 @@ struct LogFields {
     progress_delta: f64,
     average_upload_rate_bps: u64,
     observed_duration_seconds: Option<u64>,
+    bad_time_seconds: Option<u64>,
+    ban_score: Option<f64>,
+    ban_score_above_threshold_seconds: Option<u64>,
+    sample_score_risk: Option<f64>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -248,8 +252,9 @@ fn process_fields(
             hash: fields.torrent_hash.clone(),
             name: fields
                 .torrent_name
+                .clone()
                 .unwrap_or_else(|| fields.torrent_hash.clone()),
-            tracker: fields.torrent_tracker,
+            tracker: fields.torrent_tracker.clone(),
             category: None,
             tags: Vec::new(),
             total_seeders: config.policy.min_total_seeders.max(1),
@@ -266,7 +271,9 @@ fn process_fields(
         has_active_ban,
     };
 
-    let evaluation = policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
+    let mut evaluation =
+        policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
+    hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
     let history = state
         .offences
         .get(&OffenceKey::from_offence_identity(
@@ -382,6 +389,12 @@ fn extract_log_fields(
     let observed_duration_seconds = fields
         .get("observed_duration_seconds")
         .and_then(Value::as_u64);
+    let bad_time_seconds = fields.get("bad_time_seconds").and_then(Value::as_u64);
+    let ban_score = fields.get("ban_score").and_then(Value::as_f64);
+    let ban_score_above_threshold_seconds = fields
+        .get("ban_score_above_threshold_seconds")
+        .and_then(Value::as_u64);
+    let sample_score_risk = fields.get("sample_score_risk").and_then(Value::as_f64);
 
     Some(LogFields {
         message,
@@ -394,7 +407,41 @@ fn extract_log_fields(
         progress_delta,
         average_upload_rate_bps,
         observed_duration_seconds,
+        bad_time_seconds,
+        ban_score,
+        ban_score_above_threshold_seconds,
+        sample_score_risk,
     })
+}
+
+fn hydrate_evaluation_from_log_fields(
+    evaluation: &mut brrpolice::types::PeerEvaluation,
+    fields: &LogFields,
+    config: &SimulatorConfig,
+) {
+    evaluation.progress_delta = fields.progress_delta;
+    evaluation.session.rolling_avg_up_rate_bps = fields.average_upload_rate_bps;
+    if let Some(seconds) = fields.observed_duration_seconds {
+        evaluation.session.observed_duration = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = fields.bad_time_seconds {
+        evaluation.session.bad_duration = Duration::from_secs(seconds);
+    }
+    if let Some(score) = fields.ban_score {
+        evaluation.session.ban_score = score;
+    }
+    if let Some(seconds) = fields.ban_score_above_threshold_seconds {
+        evaluation.session.ban_score_above_threshold_duration = Duration::from_secs(seconds);
+    }
+    if let Some(risk) = fields.sample_score_risk {
+        evaluation.sample_score_risk = risk;
+    }
+
+    let exemption_free = evaluation.session.last_exemption_reason.is_none();
+    evaluation.is_bannable = exemption_free
+        && evaluation.session.observed_duration >= config.policy.score.min_observation_duration
+        && evaluation.session.ban_score_above_threshold_duration
+            >= config.policy.score.sustain_duration;
 }
 
 fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayState) {
