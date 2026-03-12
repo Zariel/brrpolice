@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use brrpolice::{
@@ -17,13 +17,21 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Some(arg) = std::env::args().nth(1) {
-        anyhow::bail!(
-            "unexpected argument `{arg}`; run score simulation via `cargo run -p score-simulator -- ...`"
-        );
+    let cli = parse_cli_args()?;
+    if let Some(host) = cli.http_host {
+        // Safe because this happens before any threads are spawned.
+        unsafe {
+            std::env::set_var("BRRPOLICE_HTTP__HOST", host);
+        }
+    }
+    if let Some(port) = cli.http_port {
+        // Safe because this happens before any threads are spawned.
+        unsafe {
+            std::env::set_var("BRRPOLICE_HTTP__PORT", port.to_string());
+        }
     }
 
-    let config = Arc::new(AppConfig::load(None)?);
+    let config = Arc::new(AppConfig::load(cli.config)?);
     config.init_tracing()?;
 
     info!(resolved_config = %config.fingerprint(), "resolved configuration loaded");
@@ -121,6 +129,69 @@ fn warn_nondefault_resiliency_config(config: &AppConfig) {
             "resiliency setting differs from default"
         );
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CliArgs {
+    config: Option<PathBuf>,
+    http_host: Option<String>,
+    http_port: Option<u16>,
+}
+
+fn parse_cli_args() -> Result<CliArgs> {
+    parse_cli_args_from(std::env::args().skip(1))
+}
+
+fn parse_cli_args_from<I>(args: I) -> Result<CliArgs>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut parsed = CliArgs::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--config" => {
+                let Some(value) = iter.next() else {
+                    anyhow::bail!("missing value for --config");
+                };
+                parsed.config = Some(PathBuf::from(value));
+            }
+            "--http-host" => {
+                let Some(value) = iter.next() else {
+                    anyhow::bail!("missing value for --http-host");
+                };
+                parsed.http_host = Some(value);
+            }
+            "--http-port" => {
+                let Some(value) = iter.next() else {
+                    anyhow::bail!("missing value for --http-port");
+                };
+                parsed.http_port = Some(value.parse().context("invalid --http-port value")?);
+            }
+            other => {
+                anyhow::bail!(
+                    "unexpected argument `{other}`; use --config, --http-host, --http-port, or run score simulation via `cargo run -p score-simulator -- ...`"
+                );
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn print_usage() {
+    println!(concat!(
+        "brrpolice usage:\n",
+        "  brrpolice [--config <path>] [--http-host <host>] [--http-port <port>]\n",
+        "\n",
+        "examples:\n",
+        "  brrpolice --config /etc/brrpolice/config.toml\n",
+        "  brrpolice --http-host 0.0.0.0 --http-port 9090\n",
+        "  cargo run -p score-simulator -- --help\n",
+    ));
 }
 
 async fn shutdown_signal() {
@@ -224,6 +295,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::run_until_shutdown;
+    use crate::{CliArgs, parse_cli_args_from};
     use brrpolice::runtime::ServiceState;
 
     #[tokio::test]
@@ -251,5 +323,33 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(sibling_finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn parses_cli_config_and_http_overrides() {
+        let parsed = parse_cli_args_from([
+            "--config".to_string(),
+            "/tmp/config.toml".to_string(),
+            "--http-host".to_string(),
+            "127.0.0.1".to_string(),
+            "--http-port".to_string(),
+            "10090".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            CliArgs {
+                config: Some("/tmp/config.toml".into()),
+                http_host: Some("127.0.0.1".to_string()),
+                http_port: Some(10090),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_cli_flags() {
+        let error = parse_cli_args_from(["--wat".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("unexpected argument"));
     }
 }

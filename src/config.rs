@@ -91,7 +91,8 @@ impl AppConfig {
             .set_default("retention.max_rows_per_run", 5_000_u32)?
             .set_default("retention.vacuum.mode", "incremental")?
             .set_default("retention.vacuum.incremental_pages", 200_u32)?
-            .set_default("http.bind", "0.0.0.0:9090")?
+            .set_default("http.host", "0.0.0.0")?
+            .set_default("http.port", 9090_u16)?
             .set_default("logging.level", "warn")?
             .set_default("logging.format", "json")?
             .add_source(
@@ -172,7 +173,8 @@ impl AppConfig {
                 "retention.max_rows_per_run={}\n",
                 "retention.vacuum.mode={}\n",
                 "retention.vacuum.incremental_pages={}\n",
-                "http.bind={}\n",
+                "http.host={}\n",
+                "http.port={}\n",
                 "logging.level={}\n",
                 "logging.format={}\n"
             ),
@@ -228,7 +230,8 @@ impl AppConfig {
             self.retention.max_rows_per_run,
             self.retention.vacuum.mode.as_str(),
             self.retention.vacuum.incremental_pages,
-            self.http.bind,
+            self.http.host,
+            self.http.port,
             self.logging.level,
             self.logging.format,
         )
@@ -372,8 +375,9 @@ impl AppConfig {
                 "retention.vacuum.incremental_pages can only be set when retention.vacuum.mode is `incremental`"
             );
         }
-        if self.http.bind.parse::<SocketAddr>().is_err() {
-            bail!("http.bind must be a valid socket address");
+        self.http.bind_addr()?;
+        if self.http.port == 0 {
+            bail!("http.port must be between 1 and 65535");
         }
         require_positive_duration(self.database.busy_timeout, "database.busy_timeout")?;
         validate_ip_allowlists(&self.filters)?;
@@ -626,22 +630,24 @@ impl VacuumMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpConfig {
-    pub bind: String,
+    pub host: String,
+    pub port: u16,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:9090".to_string(),
+            host: "0.0.0.0".to_string(),
+            port: 9090,
         }
     }
 }
 
 impl HttpConfig {
     pub fn bind_addr(&self) -> Result<SocketAddr> {
-        self.bind
+        format!("{}:{}", self.host, self.port)
             .parse::<SocketAddr>()
-            .context("failed to parse http.bind")
+            .context("failed to parse http.host/http.port")
     }
 }
 
@@ -822,7 +828,8 @@ mod tests {
 
         let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
-        assert_eq!(config.http.bind, "0.0.0.0:9090");
+        assert_eq!(config.http.host, "0.0.0.0");
+        assert_eq!(config.http.port, 9090);
     }
 
     #[test]
@@ -879,7 +886,8 @@ mode = "off"
 incremental_pages = 200
 
 [http]
-bind = "127.0.0.1:9191"
+host = "127.0.0.1"
+port = 9292
 
 [logging]
 level = "debug"
@@ -901,7 +909,12 @@ format = "plain"
         assert_eq!(config.retention.max_rows_per_run, 4_000);
         assert_eq!(config.retention.vacuum.mode.as_str(), "off");
         assert_eq!(config.filters.allowlist_peer_cidrs, vec!["10.0.0.0/24"]);
-        assert_eq!(config.http.bind, "127.0.0.1:9191");
+        assert_eq!(config.http.host, "127.0.0.1");
+        assert_eq!(config.http.port, 9292);
+        assert_eq!(
+            config.http.bind_addr().unwrap().to_string(),
+            "127.0.0.1:9292"
+        );
         assert_eq!(config.logging.format, "plain");
         assert!(config.policy.score.churn.enabled);
         assert_eq!(
@@ -963,6 +976,8 @@ allowlist_peer_ips = ["127.0.0.1"]
                     "BRRPOLICE_RETENTION__VACUUM__MODE".to_string(),
                     "off".to_string(),
                 ),
+                ("BRRPOLICE_HTTP__PORT".to_string(), "10090".to_string()),
+                ("BRRPOLICE_HTTP__HOST".to_string(), "127.0.0.1".to_string()),
                 (
                     "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS".to_string(),
                     "192.168.1.10,192.168.1.11".to_string(),
@@ -978,6 +993,12 @@ allowlist_peer_ips = ["127.0.0.1"]
         assert_eq!(config.policy.score.target_rate_bps, 4096);
         assert_eq!(config.retention.max_rows_per_run, 12_000);
         assert_eq!(config.retention.vacuum.mode.as_str(), "off");
+        assert_eq!(config.http.host, "127.0.0.1");
+        assert_eq!(config.http.port, 10090);
+        assert_eq!(
+            config.http.bind_addr().unwrap().to_string(),
+            "127.0.0.1:10090"
+        );
         assert_eq!(
             config.filters.allowlist_peer_ips,
             vec!["192.168.1.10", "192.168.1.11"]

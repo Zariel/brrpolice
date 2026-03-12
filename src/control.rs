@@ -2395,7 +2395,8 @@ mod tests {
             },
             retention: RetentionConfig::default(),
             http: HttpConfig {
-                bind: "127.0.0.1:0".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 0,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

@@ -73,6 +73,12 @@ Use a non-default config path:
 BRRPOLICE_CONFIG=/path/to/config.toml cargo run
 ```
 
+Or with CLI flags:
+
+```bash
+cargo run -- --config /path/to/config.toml --http-host 0.0.0.0 --http-port 9090
+```
+
 ## Configuration
 
 Configuration load order:
@@ -159,7 +165,8 @@ qBittorrent auth rule:
 |---|---|---|---|
 | `database.path` | `BRRPOLICE_DATABASE__PATH` | `/data/brrpolice.sqlite` | SQLite database location for sessions, bans, and offence history. |
 | `database.busy_timeout` | `BRRPOLICE_DATABASE__BUSY_TIMEOUT` | `5s` | SQLite busy timeout for lock contention. |
-| `http.bind` | `BRRPOLICE_HTTP__BIND` | `0.0.0.0:9090` | HTTP bind address for `/healthz`, `/readyz`, and `/metrics`. |
+| `http.host` | `BRRPOLICE_HTTP__HOST` | `0.0.0.0` | HTTP bind host for `/healthz`, `/readyz`, and `/metrics`. |
+| `http.port` | `BRRPOLICE_HTTP__PORT` | `9090` | HTTP bind port for `/healthz`, `/readyz`, and `/metrics`. |
 | `logging.level` | `BRRPOLICE_LOGGING__LEVEL` | `warn` | Log level filter (for example `trace`, `debug`, `info`, `warn`, `error`). At `info`, peer policy decisions are emitted; at `warn`, non-fatal errors and peer bans are emitted. |
 | `logging.format` | `BRRPOLICE_LOGGING__FORMAT` | `json` | Output format: `json`, `plain`, or `text`. |
 
@@ -176,7 +183,8 @@ BRRPOLICE_QBITTORRENT__BASE_URL=http://qbittorrent.svc:8080
 BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS=5
 BRRPOLICE_POLICY__BAN_LADDER__DURATIONS=1h,12h,48h
 BRRPOLICE_FILTERS__EXCLUDE_TAGS=private,restricted
-BRRPOLICE_HTTP__BIND=0.0.0.0:9090
+BRRPOLICE_HTTP__HOST=0.0.0.0
+BRRPOLICE_HTTP__PORT=9090
 ```
 
 For list values, use comma-separated entries.
