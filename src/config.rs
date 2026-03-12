@@ -51,6 +51,7 @@ impl AppConfig {
             .set_default("qbittorrent.password_env", "")?
             .set_default("qbittorrent.poll_interval", "10s")?
             .set_default("qbittorrent.request_timeout", "10s")?
+            .set_default("qbittorrent.transient_retries", 10_u32)?
             .set_default("policy.new_peer_grace_period", "60s")?
             .set_default("policy.decay_window", "60m")?
             .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
@@ -118,6 +119,7 @@ impl AppConfig {
                 "qb.password_env={}\n",
                 "qb.poll_interval={}\n",
                 "qb.request_timeout={}\n",
+                "qb.transient_retries={}\n",
                 "policy.new_peer_grace_period={}\n",
                 "policy.decay_window={}\n",
                 "policy.ignore_peer_progress_at_or_above={:.6}\n",
@@ -157,6 +159,7 @@ impl AppConfig {
             self.qbittorrent.password_env,
             self.qbittorrent.poll_interval.as_secs(),
             self.qbittorrent.request_timeout.as_secs(),
+            self.qbittorrent.transient_retries,
             self.policy.new_peer_grace_period.as_secs(),
             self.policy.decay_window.as_secs(),
             self.policy.ignore_peer_progress_at_or_above,
@@ -229,6 +232,9 @@ impl AppConfig {
             self.qbittorrent.request_timeout,
             "qbittorrent.request_timeout",
         )?;
+        if self.qbittorrent.transient_retries == 0 {
+            bail!("qbittorrent.transient_retries must be at least 1");
+        }
         if self.qbittorrent.request_timeout > self.qbittorrent.poll_interval {
             bail!(
                 "qbittorrent.request_timeout must be less than or equal to qbittorrent.poll_interval"
@@ -326,6 +332,7 @@ pub struct QbittorrentConfig {
     pub poll_interval: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
     pub request_timeout: Duration,
+    pub transient_retries: u32,
 }
 
 impl Default for QbittorrentConfig {
@@ -336,6 +343,7 @@ impl Default for QbittorrentConfig {
             password_env: String::new(),
             poll_interval: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
+            transient_retries: 10,
         }
     }
 }
@@ -628,6 +636,7 @@ mod tests {
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
         assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(10));
+        assert_eq!(config.qbittorrent.transient_retries, 10);
         assert_eq!(config.logging.level, "warn");
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
         assert!(config.policy.score.churn.enabled);
@@ -671,6 +680,7 @@ username = "alice"
 password_env = "QB_PASSWORD"
 poll_interval = "45s"
 request_timeout = "5s"
+transient_retries = 7
 
 [policy]
 new_peer_grace_period = "10m"
@@ -709,6 +719,7 @@ format = "plain"
         let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
         assert_eq!(config.qbittorrent.username, "alice");
+        assert_eq!(config.qbittorrent.transient_retries, 7);
         assert_eq!(
             config.policy.new_peer_grace_period,
             Duration::from_secs(600)
@@ -757,6 +768,10 @@ allowlist_peer_ips = ["127.0.0.1"]
                     "QB_PASSWORD".to_string(),
                 ),
                 (
+                    "BRRPOLICE_QBITTORRENT__TRANSIENT_RETRIES".to_string(),
+                    "12".to_string(),
+                ),
+                (
                     "BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS".to_string(),
                     "4096".to_string(),
                 ),
@@ -770,6 +785,7 @@ allowlist_peer_ips = ["127.0.0.1"]
 
         assert_eq!(config.qbittorrent.username, "from-env");
         assert_eq!(config.qbittorrent.password_env, "QB_PASSWORD");
+        assert_eq!(config.qbittorrent.transient_retries, 12);
         assert_eq!(config.policy.score.target_rate_bps, 4096);
         assert_eq!(
             config.filters.allowlist_peer_ips,
@@ -806,6 +822,21 @@ request_timeout = "10s"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("request_timeout"));
+    }
+
+    #[test]
+    fn rejects_zero_qbittorrent_transient_retries() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+transient_retries = 0
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("transient_retries"));
     }
 
     #[test]

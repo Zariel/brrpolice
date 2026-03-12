@@ -97,6 +97,7 @@ qBittorrent auth rule:
 | `qbittorrent.password_env` | `BRRPOLICE_QBITTORRENT__PASSWORD_ENV` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
 | `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `10s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
 | `qbittorrent.request_timeout` | `BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT` | `10s` | Timeout per qBittorrent API request. Must be `<= poll_interval`. |
+| `qbittorrent.transient_retries` | `BRRPOLICE_QBITTORRENT__TRANSIENT_RETRIES` | `10` | Retries for transient qBittorrent request failures (connection resets, timeouts, and retryable HTTP status). |
 
 ### Policy Settings
 

@@ -2244,6 +2244,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: Duration::from_secs(15),
                 request_timeout: Duration::from_secs(10),
+                transient_retries: 10,
             },
             policy: PolicyConfig {
                 new_peer_grace_period: Duration::from_secs(300),

@@ -31,7 +31,6 @@ const TORRENTS_INFO_PATH: &str = "api/v2/torrents/info";
 const SYNC_TORRENT_PEERS_PATH: &str = "api/v2/sync/torrentPeers";
 const TRANSFER_BAN_PEERS_PATH: &str = "api/v2/transfer/banPeers";
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
-const MAX_TRANSIENT_RETRIES: usize = 3;
 const REQUEST_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
 const REQUEST_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
@@ -234,7 +233,8 @@ impl QbittorrentClient {
     where
         F: Fn() -> RequestBuilder,
     {
-        for attempt in 0..MAX_TRANSIENT_RETRIES {
+        let max_retries = self.config.transient_retries as usize;
+        for attempt in 0..max_retries {
             let started = std::time::Instant::now();
             let result = build().send().await;
             self.metrics.record_qbittorrent_request(started.elapsed());
@@ -247,7 +247,7 @@ impl QbittorrentClient {
                     }
 
                     self.metrics.record_qbittorrent_api_error();
-                    if attempt + 1 < MAX_TRANSIENT_RETRIES && is_retryable_status(status) {
+                    if attempt + 1 < max_retries && is_retryable_status(status) {
                         let delay = jittered_exponential_backoff(
                             REQUEST_RETRY_BACKOFF_BASE,
                             attempt as u32,
@@ -256,7 +256,7 @@ impl QbittorrentClient {
                         warn!(
                             status = %status,
                             retry_attempt = attempt + 1,
-                            max_retries = MAX_TRANSIENT_RETRIES,
+                            max_retries = max_retries,
                             backoff_ms = delay.as_millis(),
                             "qbittorrent request returned transient status; retrying"
                         );
@@ -268,7 +268,7 @@ impl QbittorrentClient {
                 }
                 Err(error) => {
                     self.metrics.record_qbittorrent_api_error();
-                    if attempt + 1 < MAX_TRANSIENT_RETRIES && is_transient_transport_error(&error) {
+                    if attempt + 1 < max_retries && is_transient_transport_error(&error) {
                         let delay = jittered_exponential_backoff(
                             REQUEST_RETRY_BACKOFF_BASE,
                             attempt as u32,
@@ -276,7 +276,7 @@ impl QbittorrentClient {
                         );
                         warn!(
                             retry_attempt = attempt + 1,
-                            max_retries = MAX_TRANSIENT_RETRIES,
+                            max_retries = max_retries,
                             backoff_ms = delay.as_millis(),
                             error = ?error,
                             "qbittorrent request transport error; retrying"
@@ -1226,6 +1226,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
+                transient_retries: 10,
             },
             "secret".to_string(),
             filters,
@@ -1796,6 +1797,7 @@ mod tests {
                 password_env: String::new(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(5),
+                transient_retries: 10,
             },
             String::new(),
             FiltersConfig::default(),
@@ -1814,6 +1816,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
+                transient_retries: 10,
             },
             "secret".to_string(),
             filters,
