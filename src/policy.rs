@@ -736,14 +736,18 @@ mod tests {
         let mut session = engine.begin_session(&initial, None);
         let mut final_eval = None;
         for observed_secs in [120, 180, 240, 300, 360] {
-            let evaluation = engine.evaluate_peer(&seeded_peer(observed_secs, 0.10, 500), Some(&session));
+            let evaluation =
+                engine.evaluate_peer(&seeded_peer(observed_secs, 0.10, 500), Some(&session));
             assert!(evaluation.is_bad_sample);
             session = evaluation.session.clone();
             final_eval = Some(evaluation);
         }
 
         let evaluation = final_eval.expect("expected final evaluation");
-        assert_eq!(evaluation.session.observed_duration, Duration::from_secs(300));
+        assert_eq!(
+            evaluation.session.observed_duration,
+            Duration::from_secs(300)
+        );
         assert_eq!(evaluation.session.bad_duration, Duration::from_secs(300));
         assert!(evaluation.is_bannable);
     }
