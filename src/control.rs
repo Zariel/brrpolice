@@ -444,6 +444,10 @@ impl ControlLoop {
                         bad_duration,
                         required_bad_duration,
                     } => {
+                        let score_threshold_met =
+                            evaluation.session.ban_score >= self.config.policy.score.ban_threshold;
+                        let unmet_observation_guardrail = observed_duration < required_observation;
+                        let unmet_sustain_guardrail = bad_duration < required_bad_duration;
                         self.metrics.record_policy_not_bannable_decision();
                         info_peer_decision!(
                             "peer not bannable yet decision",
@@ -456,6 +460,10 @@ impl ControlLoop {
                             required_observation_seconds = required_observation.as_secs(),
                             observed_bad_duration_seconds = bad_duration.as_secs(),
                             required_bad_duration_seconds = required_bad_duration.as_secs(),
+                            score_threshold = self.config.policy.score.ban_threshold,
+                            score_threshold_met = score_threshold_met,
+                            unmet_observation_guardrail = unmet_observation_guardrail,
+                            unmet_sustain_guardrail = unmet_sustain_guardrail,
                             latest_peer_progress = peer.peer.progress
                         );
                         self.persistence

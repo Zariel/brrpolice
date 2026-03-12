@@ -117,7 +117,7 @@ qBittorrent auth rule:
 | `policy.score.clear_threshold` | `BRRPOLICE_POLICY__SCORE__CLEAR_THRESHOLD` | `0.8` | Score threshold that resets accumulated above-threshold time. |
 | `policy.score.sustain_duration` | `BRRPOLICE_POLICY__SCORE__SUSTAIN_DURATION` | `240s` | Time score must stay at or above `ban_threshold` before a ban is allowed. |
 | `policy.score.decay_per_second` | `BRRPOLICE_POLICY__SCORE__DECAY_PER_SECOND` | `0.02` | Passive score decay rate per second between observations. |
-| `policy.score.min_observation_duration` | `BRRPOLICE_POLICY__SCORE__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked peer age before score-based bans can trigger. |
+| `policy.score.min_observation_duration` | `BRRPOLICE_POLICY__SCORE__MIN_OBSERVATION_DURATION` | `2m` | Minimum tracked peer age before score-based bans can trigger. |
 | `policy.score.max_score` | `BRRPOLICE_POLICY__SCORE__MAX_SCORE` | `5.0` | Upper clamp for per-peer score state. |
 | `policy.score.churn.enabled` | `BRRPOLICE_POLICY__SCORE__CHURN__ENABLED` | `true` | Enables reconnect churn as an additive score signal for repeatedly reconnecting low-rate, low-progress peers. |
 | `policy.score.churn.reconnect_window` | `BRRPOLICE_POLICY__SCORE__CHURN__RECONNECT_WINDOW` | `30m` | Time window used to count reconnects for churn scoring. |

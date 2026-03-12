@@ -66,7 +66,7 @@ impl AppConfig {
             .set_default("policy.score.clear_threshold", 0.8_f64)?
             .set_default("policy.score.sustain_duration", "240s")?
             .set_default("policy.score.decay_per_second", 0.02_f64)?
-            .set_default("policy.score.min_observation_duration", "5m")?
+            .set_default("policy.score.min_observation_duration", "2m")?
             .set_default("policy.score.max_score", 5.0_f64)?
             .set_default("policy.score.churn.enabled", true)?
             .set_default("policy.score.churn.reconnect_window", "30m")?
@@ -409,7 +409,7 @@ impl Default for ScorePolicyConfig {
             clear_threshold: 0.8,
             sustain_duration: Duration::from_secs(240),
             decay_per_second: 0.02,
-            min_observation_duration: Duration::from_secs(300),
+            min_observation_duration: Duration::from_secs(120),
             max_score: 5.0,
             churn: ChurnPolicyConfig::default(),
         }
