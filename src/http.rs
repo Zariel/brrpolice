@@ -245,14 +245,17 @@ async fn admin_state(State(state): State<HttpState>) -> impl IntoResponse {
         }
     };
     let active_bans = managed_active_bans(&all_bans, now);
-    let pending_ban_intent_count = match state.persistence.load_pending_ban_intents().await {
-        Ok(intents) => intents.len(),
+    let pending_ban_intent_count = match state.persistence.count_pending_ban_intents().await {
+        Ok(count) => count,
         Err(error) => {
-            error!(?error, "failed to load pending ban intents for admin state");
+            error!(
+                ?error,
+                "failed to count pending ban intents for admin state"
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "failed to load pending ban intents"
+                    "error": "failed to count pending ban intents"
                 })),
             )
                 .into_response();

@@ -200,6 +200,13 @@ impl Persistence {
         Ok(count as usize)
     }
 
+    pub async fn count_pending_ban_intents(&self) -> Result<usize> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_ban_intents")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as usize)
+    }
+
     pub async fn sqlite_size_bytes(&self) -> Result<Option<u64>> {
         let Some(path) = &self.database_path else {
             return Ok(None);
