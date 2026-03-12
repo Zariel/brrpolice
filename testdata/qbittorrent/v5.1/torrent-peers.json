@@ -1,0 +1,46 @@
+{
+  "rid": 23,
+  "full_update": true,
+  "show_flags": true,
+  "peers": {
+    "10.0.0.10:51413": {
+      "client": "qBittorrent/5.1.0",
+      "peer_id_client": "qBittorrent",
+      "connection": "uTP",
+      "country": "United Kingdom",
+      "country_code": "gb",
+      "dl_speed": 32768,
+      "files": "0 (100%)",
+      "flags": "D",
+      "flags_desc": "remote interested",
+      "host_name": "example.test",
+      "ip": "10.0.0.10",
+      "port": 51413,
+      "progress": 0.42,
+      "relevance": 0.91,
+      "downloaded": 1048576,
+      "uploaded": 524288,
+      "up_speed": 65536
+    },
+    "[2001:db8::5]:51413": {
+      "client": "qBittorrent/5.1.0",
+      "peer_id_client": "qBittorrent",
+      "connection": "TCP",
+      "country": "Germany",
+      "country_code": "de",
+      "dl_speed": 8192,
+      "files": "1 (5%)",
+      "flags": "d",
+      "flags_desc": "remote choking",
+      "host_name": "ipv6.example.test",
+      "ip": "2001:db8::5",
+      "port": 51413,
+      "progress": 0.05,
+      "relevance": 0.25,
+      "downloaded": 65536,
+      "uploaded": 32768,
+      "up_speed": 2048
+    }
+  },
+  "peers_removed": []
+}

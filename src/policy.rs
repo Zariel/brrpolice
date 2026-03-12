@@ -713,6 +713,8 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use proptest::prelude::*;
+
     use crate::{
         config::{
             BanLadderConfig, ChurnPolicyConfig, FiltersConfig, PolicyConfig, ScorePolicyConfig,
@@ -724,6 +726,74 @@ mod tests {
     };
 
     use super::PolicyEngine;
+
+    proptest! {
+        #[test]
+        fn normalized_rate_risk_is_bounded_and_monotonic(
+            target in 1_u64..1_000_000_u64,
+            slower in 0_u64..1_000_000_u64,
+            faster in 0_u64..1_000_000_u64,
+        ) {
+            let slow = slower.min(faster);
+            let fast = slower.max(faster);
+            let slow_risk = super::normalized_rate_risk(slow, target);
+            let fast_risk = super::normalized_rate_risk(fast, target);
+
+            prop_assert!((0.0..=1.0).contains(&slow_risk));
+            prop_assert!((0.0..=1.0).contains(&fast_risk));
+            prop_assert!(slow_risk >= fast_risk);
+        }
+
+        #[test]
+        fn normalized_progress_risk_is_bounded_and_monotonic(
+            required in 0.000_1_f64..0.25_f64,
+            lower_progress in 0.0_f64..0.25_f64,
+            higher_progress in 0.0_f64..0.25_f64,
+        ) {
+            let low = lower_progress.min(higher_progress);
+            let high = lower_progress.max(higher_progress);
+            let low_risk = super::normalized_progress_risk(low, required);
+            let high_risk = super::normalized_progress_risk(high, required);
+
+            prop_assert!((0.0..=1.0).contains(&low_risk));
+            prop_assert!((0.0..=1.0).contains(&high_risk));
+            prop_assert!(low_risk >= high_risk);
+        }
+
+        #[test]
+        fn score_state_stays_within_bounds_under_random_observations(
+            steps in prop::collection::vec((1_u64..60_u64, 0_u64..200_000_u64, 0.0_f64..0.03_f64), 1..64),
+        ) {
+            let config = PolicyConfig {
+                new_peer_grace_period: Duration::from_secs(1),
+                decay_window: Duration::from_secs(3600),
+                score: ScorePolicyConfig {
+                    min_observation_duration: Duration::from_secs(1),
+                    sustain_duration: Duration::from_secs(1),
+                    ..ScorePolicyConfig::default()
+                },
+                ..PolicyConfig::default()
+            };
+            let engine = PolicyEngine::new(config.clone(), &FiltersConfig::default());
+
+            let mut elapsed = 120_u64;
+            let mut progress = 0.10_f64;
+            let mut session = None;
+
+            for (sample_secs, up_rate_bps, progress_delta) in steps {
+                elapsed += sample_secs;
+                progress = (progress + progress_delta).min(0.90);
+                let peer = seeded_peer(elapsed, progress, up_rate_bps);
+                let evaluation = engine.evaluate_peer(&peer, session.as_ref());
+
+                prop_assert!((0.0..=config.score.max_score).contains(&evaluation.session.ban_score));
+                prop_assert!(evaluation.session.ban_score_above_threshold_duration <= evaluation.session.observed_duration);
+                prop_assert!(evaluation.session.bad_duration <= evaluation.session.observed_duration);
+
+                session = Some(evaluation.session);
+            }
+        }
+    }
 
     #[test]
     fn uses_torrent_ip_port_for_observation_identity_and_torrent_ip_for_offence_identity() {

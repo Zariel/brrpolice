@@ -221,7 +221,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use tokio::{sync::watch, time::Duration};
+    use tokio::sync::watch;
 
     use crate::run_until_shutdown;
     use brrpolice::runtime::ServiceState;
@@ -235,7 +235,6 @@ mod tests {
         let control_handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             let _ = shutdown_rx.changed().await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
             sibling_flag.store(true, Ordering::Relaxed);
             Ok::<(), anyhow::Error>(())
         });

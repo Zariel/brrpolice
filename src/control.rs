@@ -1148,13 +1148,13 @@ mod tests {
         path::PathBuf,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use tokio::{
-        sync::watch,
+        sync::{Notify, watch},
         time::{self, timeout},
     };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::any};
@@ -1649,7 +1649,7 @@ mod tests {
         persistence.run_migrations().await.unwrap();
         let metrics = Arc::new(AppMetrics::new());
 
-        let (base_url, server) = spawn_server(vec![
+        let (base_url, server, observed_count, observed_notify) = spawn_server_with_progress(vec![
             ExpectedRequest {
                 method: "POST",
                 path: "/api/v2/auth/login",
@@ -1717,13 +1717,19 @@ mod tests {
                 if state.is_ready() {
                     break;
                 }
-                time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
         .expect("service should become ready after startup retry succeeds");
 
-        time::sleep(Duration::from_millis(100)).await;
+        wait_for_observed_requests(
+            observed_count.as_ref(),
+            observed_notify.as_ref(),
+            5,
+            Duration::from_secs(3),
+        )
+        .await;
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
         server.await.unwrap();
@@ -2094,13 +2100,14 @@ mod tests {
         persistence.run_migrations().await.unwrap();
         let metrics = Arc::new(AppMetrics::new());
 
-        let (base_url, server) = spawn_server(vec![ExpectedRequest {
-            method: "GET",
-            path: "/api/v2/torrents/info?filter=active",
-            must_contain: vec![],
-            response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
-        }])
-        .await;
+        let (base_url, server, observed_count, observed_notify) =
+            spawn_server_with_progress(vec![ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=active",
+                must_contain: vec![],
+                response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
+            }])
+            .await;
 
         let state = Arc::new(ServiceState::new());
         state.mark_database_ready();
@@ -2131,7 +2138,13 @@ mod tests {
         );
 
         let task = tokio::spawn(async move { control.run_poll_cycle_with_retry().await.unwrap() });
-        time::sleep(Duration::from_millis(10)).await;
+        wait_for_observed_requests(
+            observed_count.as_ref(),
+            observed_notify.as_ref(),
+            1,
+            Duration::from_secs(2),
+        )
+        .await;
         shutdown_tx.send(true).unwrap();
 
         let result = timeout(Duration::from_millis(250), task)
@@ -2374,6 +2387,8 @@ mod tests {
 
     struct SequenceResponder {
         expected_requests: Arc<Mutex<VecDeque<ExpectedRequest>>>,
+        observed_count: Arc<AtomicUsize>,
+        observed_notify: Arc<Notify>,
     }
 
     impl Respond for SequenceResponder {
@@ -2404,6 +2419,8 @@ mod tests {
                     "request missing `{needle}`: {rendered}"
                 );
             }
+            self.observed_count.fetch_add(1, Ordering::Relaxed);
+            self.observed_notify.notify_waiters();
 
             response_template(expected.response)
         }
@@ -2412,32 +2429,70 @@ mod tests {
     async fn spawn_server(
         expected_requests: Vec<ExpectedRequest>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        let (base_url, handle, _, _) = spawn_server_with_progress(expected_requests).await;
+        (base_url, handle)
+    }
+
+    async fn spawn_server_with_progress(
+        expected_requests: Vec<ExpectedRequest>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Arc<Notify>,
+    ) {
         let server = MockServer::start().await;
         let expected_requests = Arc::new(Mutex::new(VecDeque::from(expected_requests)));
+        let observed_count = Arc::new(AtomicUsize::new(0));
+        let observed_notify = Arc::new(Notify::new());
         Mock::given(any())
             .respond_with(SequenceResponder {
                 expected_requests: expected_requests.clone(),
+                observed_count: observed_count.clone(),
+                observed_notify: observed_notify.clone(),
             })
             .mount(&server)
             .await;
         let base_url = format!("{}/", server.uri());
+        let notify_for_handle = observed_notify.clone();
         let handle = tokio::spawn(async move {
-            let mut remaining = expected_requests.lock().unwrap().len();
-            for _ in 0..500 {
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(5);
+            loop {
+                let remaining = expected_requests.lock().unwrap().len();
                 if remaining == 0 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                remaining = expected_requests.lock().unwrap().len();
+                assert!(
+                    start.elapsed() < timeout,
+                    "{remaining} expected request(s) were not observed"
+                );
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(50), notify_for_handle.notified())
+                        .await;
             }
-            assert_eq!(
-                remaining, 0,
-                "{remaining} expected request(s) were not observed"
-            );
             drop(server);
         });
 
-        (base_url, handle)
+        (base_url, handle, observed_count, observed_notify)
+    }
+
+    async fn wait_for_observed_requests(
+        observed_count: &AtomicUsize,
+        observed_notify: &Notify,
+        expected: usize,
+        timeout_duration: Duration,
+    ) {
+        timeout(timeout_duration, async {
+            loop {
+                if observed_count.load(Ordering::Relaxed) >= expected {
+                    break;
+                }
+                observed_notify.notified().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for expected requests");
     }
 
     fn request_path_and_query(request: &Request) -> String {

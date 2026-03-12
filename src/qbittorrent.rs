@@ -869,6 +869,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_torrent_list_fixture_qb_5_1_x() {
+        let client = test_client();
+        let torrents = client
+            .parse_torrents(include_str!(
+                "../testdata/qbittorrent/v5.1/torrents-info-active.json"
+            ))
+            .unwrap();
+
+        assert_eq!(torrents.len(), 2);
+        assert_eq!(torrents[0].hash, "abc123");
+        assert_eq!(torrents[0].num_complete, 21);
+        assert_eq!(torrents[0].amount_left, 0);
+        assert_eq!(torrents[1].hash, "def456");
+        assert_eq!(torrents[1].amount_left, 4096);
+    }
+
+    #[test]
     fn filters_only_completed_torrents_before_scope_rules() {
         let client = test_client();
         let completed = client.filter_completed_torrents(vec![
@@ -1016,6 +1033,21 @@ mod tests {
                 peers_removed: Some(vec![]),
             }
         );
+    }
+
+    #[test]
+    fn parses_torrent_peers_fixture_qb_5_1_x() {
+        let client = test_client();
+        let peers = client
+            .parse_torrent_peers(include_str!(
+                "../testdata/qbittorrent/v5.1/torrent-peers.json"
+            ))
+            .unwrap();
+
+        assert_eq!(peers.rid, 23);
+        assert_eq!(peers.peers.len(), 2);
+        assert_eq!(peers.peers["10.0.0.10:51413"].up_speed, 65536);
+        assert_eq!(peers.peers["[2001:db8::5]:51413"].ip, "2001:db8::5");
     }
 
     #[test]

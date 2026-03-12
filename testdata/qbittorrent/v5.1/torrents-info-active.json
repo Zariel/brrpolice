@@ -1,0 +1,20 @@
+[
+  {
+    "hash": "abc123",
+    "name": "Example.Active.Torrent",
+    "tracker": "https://tracker.example/announce",
+    "category": "tv",
+    "tags": "seed,public",
+    "num_complete": 21,
+    "amount_left": 0
+  },
+  {
+    "hash": "def456",
+    "name": "Example.Incomplete.Torrent",
+    "tracker": "",
+    "category": "",
+    "tags": "",
+    "num_complete": 3,
+    "amount_left": 4096
+  }
+]
