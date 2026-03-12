@@ -13,3 +13,16 @@ target/
 # Local evaluation logs
 prodlogs.json
 samples/logs/
+
+# Local workspace artifacts
+.beads/
+.cache/
+brrpolice.sqlite
+brrpolice.sqlite-shm
+brrpolice.sqlite-wal
+config.toml
+config.yaml
+docs/adr-0001-score-based-banning.md
+docs/adr-0002-db-pruning.md
+docs/spec.md
+scripts/
