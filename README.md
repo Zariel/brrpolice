@@ -71,6 +71,21 @@ Use a non-default config path:
 BRRPOLICE_CONFIG=/path/to/config.toml cargo run
 ```
 
+## Score Simulator
+
+Use the built-in simulator to replay exported decision logs and test alternative score thresholds offline:
+
+```bash
+cargo run -- simulate-score \
+  --input /Users/chrisbannister/Downloads/vmui_logs_export.jsonl \
+  --target-rate-bps 65536 \
+  --required-progress-delta 0.005 \
+  --ban-threshold 0.8 \
+  --sustain-seconds 60
+```
+
+Use `cargo run -- simulate-score --help` to view all knobs, including weights, decay, and optional peer-IP filtering.
+
 ## Configuration
 
 Configuration load order:

@@ -6,6 +6,7 @@ mod persistence;
 mod policy;
 mod qbittorrent;
 mod runtime;
+mod simulator;
 mod types;
 
 use std::sync::Arc;
@@ -23,6 +24,14 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut cli_args = std::env::args();
+    let _binary = cli_args.next();
+    if let Some(command) = cli_args.next()
+        && command == "simulate-score"
+    {
+        return simulator::run(cli_args.collect());
+    }
+
     let config = Arc::new(AppConfig::load(None)?);
     config.init_tracing()?;
 
