@@ -51,16 +51,11 @@ impl AppConfig {
             .set_default("qbittorrent.password_env", "")?
             .set_default("qbittorrent.poll_interval", "15s")?
             .set_default("qbittorrent.request_timeout", "10s")?
-            .set_default("policy.slow_rate_bps", 65_536_u64)?
-            .set_default("policy.min_progress_delta", 0.005_f64)?
             .set_default("policy.new_peer_grace_period", "60s")?
-            .set_default("policy.min_observation_duration", "5m")?
-            .set_default("policy.bad_for_duration", "15m")?
             .set_default("policy.decay_window", "60m")?
             .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
             .set_default("policy.min_total_seeders", 3_u32)?
             .set_default("policy.reban_cooldown", "30m")?
-            .set_default("policy.ban_decision_mode", "duration")?
             .set_default("policy.score.target_rate_bps", 65_536_u64)?
             .set_default("policy.score.required_progress_delta", 0.02_f64)?
             .set_default("policy.score.weight_rate", 0.35_f64)?
@@ -118,16 +113,11 @@ impl AppConfig {
                 "qb.password_env={}\n",
                 "qb.poll_interval={}\n",
                 "qb.request_timeout={}\n",
-                "policy.slow_rate_bps={}\n",
-                "policy.min_progress_delta={:.6}\n",
                 "policy.new_peer_grace_period={}\n",
-                "policy.min_observation_duration={}\n",
-                "policy.bad_for_duration={}\n",
                 "policy.decay_window={}\n",
                 "policy.ignore_peer_progress_at_or_above={:.6}\n",
                 "policy.min_total_seeders={}\n",
                 "policy.reban_cooldown={}\n",
-                "policy.ban_decision_mode={}\n",
                 "policy.score.target_rate_bps={}\n",
                 "policy.score.required_progress_delta={:.6}\n",
                 "policy.score.weight_rate={:.6}\n",
@@ -157,16 +147,11 @@ impl AppConfig {
             self.qbittorrent.password_env,
             self.qbittorrent.poll_interval.as_secs(),
             self.qbittorrent.request_timeout.as_secs(),
-            self.policy.slow_rate_bps,
-            self.policy.min_progress_delta,
             self.policy.new_peer_grace_period.as_secs(),
-            self.policy.min_observation_duration.as_secs(),
-            self.policy.bad_for_duration.as_secs(),
             self.policy.decay_window.as_secs(),
             self.policy.ignore_peer_progress_at_or_above,
             self.policy.min_total_seeders,
             self.policy.reban_cooldown.as_secs(),
-            self.policy.ban_decision_mode,
             self.policy.score.target_rate_bps,
             self.policy.score.required_progress_delta,
             self.policy.score.weight_rate,
@@ -234,20 +219,8 @@ impl AppConfig {
                 "qbittorrent.request_timeout must be less than or equal to qbittorrent.poll_interval"
             );
         }
-        if self.policy.slow_rate_bps == 0 {
-            bail!("policy.slow_rate_bps must be positive");
-        }
-        if !matches!(self.policy.ban_decision_mode.as_str(), "duration" | "score") {
-            bail!("policy.ban_decision_mode must be either `duration` or `score`");
-        }
         if !(0.0..=1.0).contains(&self.policy.ignore_peer_progress_at_or_above) {
             bail!("policy.ignore_peer_progress_at_or_above must be between 0.0 and 1.0");
-        }
-        if self.policy.min_progress_delta < 0.0 {
-            bail!("policy.min_progress_delta must be >= 0.0 (fraction; 0.005 = 0.5%)");
-        }
-        if self.policy.min_progress_delta > 1.0 {
-            bail!("policy.min_progress_delta must be <= 1.0 (fraction; 0.005 = 0.5%)");
         }
         if self.policy.ban_ladder.durations.is_empty() {
             bail!("policy.ban_ladder.durations must not be empty");
@@ -257,23 +230,15 @@ impl AppConfig {
             "policy.new_peer_grace_period",
         )?;
         require_positive_duration(
-            self.policy.min_observation_duration,
-            "policy.min_observation_duration",
-        )?;
-        require_positive_duration(
             self.policy.score.min_observation_duration,
             "policy.score.min_observation_duration",
         )?;
-        require_positive_duration(self.policy.bad_for_duration, "policy.bad_for_duration")?;
         require_positive_duration(self.policy.decay_window, "policy.decay_window")?;
         require_positive_duration(self.policy.reban_cooldown, "policy.reban_cooldown")?;
         require_positive_duration(
             self.policy.score.sustain_duration,
             "policy.score.sustain_duration",
         )?;
-        if self.policy.bad_for_duration > self.policy.decay_window {
-            bail!("policy.bad_for_duration must be less than or equal to policy.decay_window");
-        }
         if self.policy.score.target_rate_bps == 0 {
             bail!("policy.score.target_rate_bps must be positive");
         }
@@ -349,21 +314,14 @@ impl Default for QbittorrentConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyConfig {
-    pub slow_rate_bps: u64,
-    pub min_progress_delta: f64,
     #[serde(deserialize_with = "deserialize_duration")]
     pub new_peer_grace_period: Duration,
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub min_observation_duration: Duration,
-    #[serde(deserialize_with = "deserialize_duration")]
-    pub bad_for_duration: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
     pub decay_window: Duration,
     pub ignore_peer_progress_at_or_above: f64,
     pub min_total_seeders: u32,
     #[serde(deserialize_with = "deserialize_duration")]
     pub reban_cooldown: Duration,
-    pub ban_decision_mode: String,
     #[serde(default)]
     pub score: ScorePolicyConfig,
     #[serde(default)]
@@ -373,16 +331,11 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            slow_rate_bps: 65_536,
-            min_progress_delta: 0.005,
             new_peer_grace_period: Duration::from_secs(60),
-            min_observation_duration: Duration::from_secs(300),
-            bad_for_duration: Duration::from_secs(900),
             decay_window: Duration::from_secs(3_600),
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 3,
             reban_cooldown: Duration::from_secs(1_800),
-            ban_decision_mode: "duration".to_string(),
             score: ScorePolicyConfig::default(),
             ban_ladder: BanLadderConfig::default(),
         }
@@ -623,13 +576,7 @@ mod tests {
         assert_eq!(config.qbittorrent.password_env, "");
         assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(15));
         assert_eq!(config.logging.level, "warn");
-        assert_eq!(config.policy.slow_rate_bps, 65_536);
-        assert_eq!(config.policy.min_progress_delta, 0.005);
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
-        assert_eq!(
-            config.policy.min_observation_duration,
-            Duration::from_secs(300)
-        );
         assert_eq!(
             config.policy.ban_ladder.durations,
             vec![
@@ -665,11 +612,7 @@ poll_interval = "45s"
 request_timeout = "5s"
 
 [policy]
-slow_rate_bps = 1024
-min_progress_delta = 0.01
 new_peer_grace_period = "10m"
-min_observation_duration = "25m"
-bad_for_duration = "20m"
 decay_window = "90m"
 ignore_peer_progress_at_or_above = 0.9
 min_total_seeders = 5
@@ -698,7 +641,10 @@ format = "plain"
         let config = load_test_config(&config_path, HashMap::new()).unwrap();
 
         assert_eq!(config.qbittorrent.username, "alice");
-        assert_eq!(config.policy.slow_rate_bps, 1024);
+        assert_eq!(
+            config.policy.new_peer_grace_period,
+            Duration::from_secs(600)
+        );
         assert_eq!(config.filters.allowlist_peer_cidrs, vec!["10.0.0.0/24"]);
         assert_eq!(config.http.bind, "127.0.0.1:9191");
         assert_eq!(config.logging.format, "plain");
@@ -716,7 +662,7 @@ poll_interval = "45s"
 request_timeout = "10s"
 
 [policy]
-slow_rate_bps = 2048
+min_total_seeders = 2
 
 [filters]
 allowlist_peer_ips = ["127.0.0.1"]
@@ -735,7 +681,7 @@ allowlist_peer_ips = ["127.0.0.1"]
                     "QB_PASSWORD".to_string(),
                 ),
                 (
-                    "BRRPOLICE_POLICY__SLOW_RATE_BPS".to_string(),
+                    "BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS".to_string(),
                     "4096".to_string(),
                 ),
                 (
@@ -748,7 +694,7 @@ allowlist_peer_ips = ["127.0.0.1"]
 
         assert_eq!(config.qbittorrent.username, "from-env");
         assert_eq!(config.qbittorrent.password_env, "QB_PASSWORD");
-        assert_eq!(config.policy.slow_rate_bps, 4096);
+        assert_eq!(config.policy.score.target_rate_bps, 4096);
         assert_eq!(
             config.filters.allowlist_peer_ips,
             vec!["192.168.1.10", "192.168.1.11"]

@@ -101,16 +101,11 @@ qBittorrent auth rule:
 
 | Setting | Env Var | Default | Impact |
 |---|---|---|---|
-| `policy.slow_rate_bps` | `BRRPOLICE_POLICY__SLOW_RATE_BPS` | `65536` | Upload-rate threshold (bytes/sec). Peers below this may be treated as slow. |
-| `policy.min_progress_delta` | `BRRPOLICE_POLICY__MIN_PROGRESS_DELTA` | `0.005` | Minimum total completion progress required across the `bad_for_duration` window, expressed as a fraction in `[0.0, 1.0]` (`0.005` = `0.5%`). The requirement ramps linearly until the full window is observed. |
 | `policy.new_peer_grace_period` | `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD` | `60s` | New peers are exempt during this initial age window. |
-| `policy.min_observation_duration` | `BRRPOLICE_POLICY__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked duration before a peer can become bannable. |
-| `policy.bad_for_duration` | `BRRPOLICE_POLICY__BAD_FOR_DURATION` | `15m` | Required accumulated "bad" time before ban eligibility. |
 | `policy.decay_window` | `BRRPOLICE_POLICY__DECAY_WINDOW` | `60m` | Window used to decay bad history and carry over peer state between sightings. |
 | `policy.ignore_peer_progress_at_or_above` | `BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE` | `0.95` | Exempts peers at or above this completion ratio. |
 | `policy.min_total_seeders` | `BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS` | `3` | Skips torrents below this seeder count. |
 | `policy.reban_cooldown` | `BRRPOLICE_POLICY__REBAN_COOLDOWN` | `30m` | Cooldown before re-banning a recently handled peer identity. |
-| `policy.ban_decision_mode` | `BRRPOLICE_POLICY__BAN_DECISION_MODE` | `duration` | Ban decision model. `duration` uses accumulated bad-time windows, `score` uses sustained score thresholding. |
 | `policy.score.target_rate_bps` | `BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS` | `65536` | Score model upload target in bytes/sec. Lower observed rates increase score risk. |
 | `policy.score.required_progress_delta` | `BRRPOLICE_POLICY__SCORE__REQUIRED_PROGRESS_DELTA` | `0.02` | Score model progress target as a fraction (`0.02` = `2%`). Lower progress increases score risk. |
 | `policy.score.weight_rate` | `BRRPOLICE_POLICY__SCORE__WEIGHT_RATE` | `0.35` | Weight for upload-rate risk in score calculations. |

@@ -23,7 +23,6 @@ pub struct PolicyEngine {
     allowlisted_cidrs: Vec<IpNet>,
 }
 
-const SLOW_NON_PROGRESSING_REASON_CODE: &str = "slow_non_progressing";
 const SCORE_BASED_REASON_CODE: &str = "score_based";
 
 impl PolicyEngine {
@@ -186,7 +185,7 @@ impl PolicyEngine {
             let required_progress_delta = self.required_progress_delta(observed_duration);
             let exemption = session.last_exemption_reason.clone();
             let is_bad_sample = exemption.is_none()
-                && peer.peer.up_rate_bps < self.config.slow_rate_bps
+                && peer.peer.up_rate_bps < self.config.score.target_rate_bps
                 && progress_delta < required_progress_delta;
             if is_bad_sample {
                 session.bad_duration = sample_duration;
@@ -240,7 +239,7 @@ impl PolicyEngine {
         let required_progress_delta = self.required_progress_delta(observed_duration);
         let exemption = self.classify_exemption(peer);
         let is_bad_sample = exemption.is_none()
-            && peer.peer.up_rate_bps < self.config.slow_rate_bps
+            && peer.peer.up_rate_bps < self.config.score.target_rate_bps
             && progress_delta < required_progress_delta;
         let bad_duration = if is_bad_sample {
             previous.bad_duration + sample_duration
@@ -267,7 +266,6 @@ impl PolicyEngine {
 
         let is_bannable = self.is_bannable_with_metrics(
             observed_duration,
-            bad_duration,
             ban_score_above_threshold_duration,
             exemption.is_none(),
         );
@@ -328,26 +326,11 @@ impl PolicyEngine {
         }
 
         if !evaluation.is_bannable {
-            let (required_observation, required_bad_duration) = if self.is_score_mode() {
-                (
-                    self.config.score.min_observation_duration,
-                    self.config.score.sustain_duration,
-                )
-            } else {
-                (
-                    self.config.min_observation_duration,
-                    self.config.bad_for_duration,
-                )
-            };
             return BanDisposition::NotBannableYet {
                 observed_duration: evaluation.session.observed_duration,
-                required_observation,
-                bad_duration: if self.is_score_mode() {
-                    evaluation.session.ban_score_above_threshold_duration
-                } else {
-                    evaluation.session.bad_duration
-                },
-                required_bad_duration,
+                required_observation: self.config.score.min_observation_duration,
+                bad_duration: evaluation.session.ban_score_above_threshold_duration,
+                required_bad_duration: self.config.score.sustain_duration,
             };
         }
 
@@ -362,34 +345,19 @@ impl PolicyEngine {
         }
 
         let offence_number = history.offence_count + 1;
-        let (reason_code, reason_details) = if self.is_score_mode() {
-            (
-                SCORE_BASED_REASON_CODE.to_string(),
-                format!(
-                    "score peer: score={:.4} sample_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} score_above_seconds={} observed_seconds={}",
-                    evaluation.session.ban_score,
-                    evaluation.sample_score_risk,
-                    evaluation.session.rolling_avg_up_rate_bps,
-                    evaluation.progress_delta,
-                    evaluation
-                        .session
-                        .ban_score_above_threshold_duration
-                        .as_secs(),
-                    evaluation.session.observed_duration.as_secs()
-                ),
-            )
-        } else {
-            (
-                SLOW_NON_PROGRESSING_REASON_CODE.to_string(),
-                format!(
-                    "slow peer: avg_up_rate_bps={} progress_delta={:.4} bad_seconds={} observed_seconds={}",
-                    evaluation.session.rolling_avg_up_rate_bps,
-                    evaluation.progress_delta,
-                    evaluation.session.bad_duration.as_secs(),
-                    evaluation.session.observed_duration.as_secs()
-                ),
-            )
-        };
+        let reason_code = SCORE_BASED_REASON_CODE.to_string();
+        let reason_details = format!(
+            "score peer: score={:.4} sample_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} score_above_seconds={} observed_seconds={}",
+            evaluation.session.ban_score,
+            evaluation.sample_score_risk,
+            evaluation.session.rolling_avg_up_rate_bps,
+            evaluation.progress_delta,
+            evaluation
+                .session
+                .ban_score_above_threshold_duration
+                .as_secs(),
+            evaluation.session.observed_duration.as_secs()
+        );
 
         BanDisposition::Ban(BanDecision {
             peer_ip: peer.peer.ip,
@@ -450,8 +418,8 @@ impl PolicyEngine {
             return bad_duration;
         }
 
-        let decay_ratio =
-            self.config.bad_for_duration.as_secs_f64() / self.config.decay_window.as_secs_f64();
+        let decay_ratio = self.config.score.sustain_duration.as_secs_f64()
+            / self.config.decay_window.as_secs_f64();
         let decay = elapsed.mul_f64(decay_ratio);
         bad_duration.saturating_sub(decay)
     }
@@ -465,18 +433,18 @@ impl PolicyEngine {
     }
 
     fn required_progress_delta(&self, observed_duration: Duration) -> f64 {
-        if observed_duration.is_zero() || self.config.min_progress_delta <= 0.0 {
+        if observed_duration.is_zero() || self.config.score.required_progress_delta <= 0.0 {
             return 0.0;
         }
 
-        let bad_for_secs = self.config.bad_for_duration.as_secs_f64();
-        if bad_for_secs <= 0.0 {
-            return self.config.min_progress_delta;
+        let sustain_secs = self.config.score.sustain_duration.as_secs_f64();
+        if sustain_secs <= 0.0 {
+            return self.config.score.required_progress_delta;
         }
 
         let observed_secs = observed_duration.as_secs_f64();
-        let ramp = (observed_secs / bad_for_secs).clamp(0.0, 1.0);
-        self.config.min_progress_delta * ramp
+        let ramp = (observed_secs / sustain_secs).clamp(0.0, 1.0);
+        self.config.score.required_progress_delta * ramp
     }
 
     fn advance_progress_baseline(
@@ -489,13 +457,13 @@ impl PolicyEngine {
             return baseline_progress.min(latest_progress);
         }
 
-        let bad_for_secs = self.config.bad_for_duration.as_secs_f64();
-        if bad_for_secs <= 0.0 {
+        let sustain_secs = self.config.score.sustain_duration.as_secs_f64();
+        if sustain_secs <= 0.0 {
             return latest_progress;
         }
 
         let elapsed_secs = elapsed.as_secs_f64();
-        let shift = (elapsed_secs / bad_for_secs).clamp(0.0, 1.0);
+        let shift = (elapsed_secs / sustain_secs).clamp(0.0, 1.0);
         (baseline_progress + ((latest_progress - baseline_progress) * shift)).clamp(0.0, 1.0)
     }
 
@@ -520,14 +488,9 @@ impl PolicyEngine {
             .round() as u64
     }
 
-    fn is_score_mode(&self) -> bool {
-        self.config.ban_decision_mode == "score"
-    }
-
     fn is_bannable(&self, session: &PeerSessionState, exemption_free: bool) -> bool {
         self.is_bannable_with_metrics(
             session.observed_duration,
-            session.bad_duration,
             session.ban_score_above_threshold_duration,
             exemption_free,
         )
@@ -536,20 +499,14 @@ impl PolicyEngine {
     fn is_bannable_with_metrics(
         &self,
         observed_duration: Duration,
-        bad_duration: Duration,
         score_above_threshold_duration: Duration,
         exemption_free: bool,
     ) -> bool {
         if !exemption_free {
             return false;
         }
-        if self.is_score_mode() {
-            observed_duration >= self.config.score.min_observation_duration
-                && score_above_threshold_duration >= self.config.score.sustain_duration
-        } else {
-            observed_duration >= self.config.min_observation_duration
-                && bad_duration >= self.config.bad_for_duration
-        }
+        observed_duration >= self.config.score.min_observation_duration
+            && score_above_threshold_duration >= self.config.score.sustain_duration
     }
 
     fn sample_score_risk(&self, up_rate_bps: u64, progress_delta: f64) -> f64 {
@@ -695,15 +652,32 @@ mod tests {
         );
     }
 
+    fn score_policy_for_tests(
+        min_observation_secs: u64,
+        sustain_secs: u64,
+        required_progress_delta: f64,
+    ) -> ScorePolicyConfig {
+        ScorePolicyConfig {
+            target_rate_bps: 1_000,
+            required_progress_delta,
+            weight_rate: 0.7,
+            weight_progress: 0.3,
+            rate_risk_floor: 0.4,
+            ban_threshold: 0.5,
+            clear_threshold: 0.25,
+            sustain_duration: Duration::from_secs(sustain_secs),
+            decay_per_second: 0.0,
+            min_observation_duration: Duration::from_secs(min_observation_secs),
+            max_score: 5.0,
+        }
+    }
+
     #[test]
     fn accumulates_bad_time_until_peer_is_bannable() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(300),
-            bad_for_duration: Duration::from_secs(180),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.01,
+            score: score_policy_for_tests(300, 180, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -733,9 +707,8 @@ mod tests {
     fn decays_bad_time_when_peer_improves() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            bad_for_duration: Duration::from_secs(300),
             decay_window: Duration::from_secs(600),
-            min_progress_delta: 0.01,
+            score: score_policy_for_tests(60, 300, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -774,8 +747,8 @@ mod tests {
     fn carries_over_state_across_reconnect_on_new_port() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            bad_for_duration: Duration::from_secs(300),
             decay_window: Duration::from_secs(600),
+            score: score_policy_for_tests(60, 300, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -835,11 +808,8 @@ mod tests {
     fn supports_first_evaluation_without_seeded_session() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
             decay_window: Duration::from_secs(600),
-            min_progress_delta: 0.01,
-            slow_rate_bps: 1_000,
+            score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -859,11 +829,8 @@ mod tests {
     fn evaluates_progress_against_ban_window_not_single_sample_only() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(120),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.02,
+            score: score_policy_for_tests(60, 120, 0.02),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -886,11 +853,8 @@ mod tests {
     fn continuous_bad_samples_reach_bad_for_duration_without_hidden_decay() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(300),
-            bad_for_duration: Duration::from_secs(300),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.01,
+            score: score_policy_for_tests(300, 300, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -919,8 +883,7 @@ mod tests {
     fn returns_not_bannable_until_thresholds_are_met() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(600),
-            bad_for_duration: Duration::from_secs(300),
+            score: score_policy_for_tests(600, 300, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -941,9 +904,8 @@ mod tests {
     fn returns_reban_cooldown_when_previous_ban_expired_recently() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
             reban_cooldown: Duration::from_secs(300),
+            score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -969,8 +931,7 @@ mod tests {
     fn selects_ban_ladder_ttl_from_prior_offence_count() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
+            score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -990,8 +951,8 @@ mod tests {
                 assert_eq!(decision.ttl, Duration::from_secs(24 * 60 * 60));
                 assert_eq!(decision.peer_ip, peer.peer.ip);
                 assert_eq!(decision.peer_port, peer.peer.port);
-                assert_eq!(decision.reason_code, "slow_non_progressing");
-                assert!(decision.reason_details.contains("slow peer"));
+                assert_eq!(decision.reason_code, "score_based");
+                assert!(decision.reason_details.contains("score peer"));
             }
             other => panic!("expected ban decision, got {other:?}"),
         }
@@ -1001,8 +962,7 @@ mod tests {
     fn selects_first_ban_ladder_rung_for_first_offence() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
+            score: score_policy_for_tests(60, 30, 0.01),
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(300), Duration::from_secs(600)],
             },
@@ -1025,8 +985,7 @@ mod tests {
     fn caps_ban_ladder_at_last_rung_for_high_offence_counts() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
+            score: score_policy_for_tests(60, 30, 0.01),
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(300), Duration::from_secs(600)],
             },
@@ -1072,8 +1031,7 @@ mod tests {
     fn suppresses_duplicate_ban_decisions_for_same_bannable_episode() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
+            score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -1096,12 +1054,13 @@ mod tests {
 
     #[test]
     fn allows_new_ban_after_peer_leaves_bannable_state() {
+        let mut score = score_policy_for_tests(60, 30, 0.01);
+        score.decay_per_second = 0.01;
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(30),
             decay_window: Duration::from_secs(60),
             reban_cooldown: Duration::from_secs(30),
+            score,
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -1136,11 +1095,8 @@ mod tests {
     fn simulation_slow_non_progressing_peer_escalates_to_ban() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(180),
-            bad_for_duration: Duration::from_secs(120),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.01,
+            score: score_policy_for_tests(180, 120, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -1161,11 +1117,8 @@ mod tests {
     fn simulation_reconnect_churn_preserves_progress_toward_ban() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(180),
-            bad_for_duration: Duration::from_secs(120),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.01,
+            score: score_policy_for_tests(180, 120, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -1196,11 +1149,7 @@ mod tests {
     fn simulation_healthy_recovery_clears_bannable_state() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(180),
-            bad_for_duration: Duration::from_secs(120),
             decay_window: Duration::from_secs(600),
-            slow_rate_bps: 1_000,
-            min_progress_delta: 0.01,
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
@@ -1291,10 +1240,7 @@ mod tests {
     #[test]
     fn score_mode_bans_after_sustained_high_score() {
         let config = PolicyConfig {
-            ban_decision_mode: "score".to_string(),
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(600),
-            bad_for_duration: Duration::from_secs(600),
             score: ScorePolicyConfig {
                 target_rate_bps: 1_000,
                 required_progress_delta: 0.01,
@@ -1333,10 +1279,7 @@ mod tests {
     #[test]
     fn score_mode_does_not_ban_when_progress_risk_is_low() {
         let config = PolicyConfig {
-            ban_decision_mode: "score".to_string(),
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(60),
             score: ScorePolicyConfig {
                 target_rate_bps: 1_000,
                 required_progress_delta: 0.005,
@@ -1369,10 +1312,7 @@ mod tests {
     #[test]
     fn score_mode_rate_risk_floor_blocks_full_compensation() {
         let config = PolicyConfig {
-            ban_decision_mode: "score".to_string(),
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(60),
-            bad_for_duration: Duration::from_secs(60),
             score: ScorePolicyConfig {
                 target_rate_bps: 1_000,
                 required_progress_delta: 0.005,

@@ -66,10 +66,7 @@ struct SimulatorConfig {
 
 impl Default for SimulatorConfig {
     fn default() -> Self {
-        let policy = PolicyConfig {
-            ban_decision_mode: "score".to_string(),
-            ..PolicyConfig::default()
-        };
+        let policy = PolicyConfig::default();
         Self {
             inputs: Vec::new(),
             policy,

@@ -277,14 +277,12 @@ impl ControlLoop {
                     .policy
                     .evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
                 self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
-                if self.config.policy.ban_decision_mode == "score" {
-                    self.metrics.record_score_evaluation(
-                        evaluation.session.ban_score,
-                        evaluation.sample_score_risk,
-                        evaluation.session.ban_score_above_threshold_duration,
-                        evaluation.is_bannable,
-                    );
-                }
+                self.metrics.record_score_evaluation(
+                    evaluation.session.ban_score,
+                    evaluation.sample_score_risk,
+                    evaluation.session.ban_score_above_threshold_duration,
+                    evaluation.is_bannable,
+                );
                 let history = self
                     .persistence
                     .load_offence_history(&evaluation.session.offence_identity)
@@ -1710,17 +1708,24 @@ mod tests {
 
         let mut config = test_config(&base_url);
         config.policy = PolicyConfig {
-            slow_rate_bps: 1024,
-            min_progress_delta: 0.01,
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(1),
-            bad_for_duration: Duration::from_secs(1),
             decay_window: Duration::from_secs(3600),
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 1,
             reban_cooldown: Duration::from_secs(1),
-            ban_decision_mode: "duration".to_string(),
-            score: crate::config::ScorePolicyConfig::default(),
+            score: crate::config::ScorePolicyConfig {
+                target_rate_bps: 1_024,
+                required_progress_delta: 0.01,
+                weight_rate: 0.7,
+                weight_progress: 0.3,
+                rate_risk_floor: 0.4,
+                ban_threshold: 0.5,
+                clear_threshold: 0.25,
+                sustain_duration: Duration::from_secs(1),
+                decay_per_second: 0.0,
+                min_observation_duration: Duration::from_secs(1),
+                max_score: 5.0,
+            },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -2092,17 +2097,24 @@ mod tests {
 
         let mut config = test_config(&base_url);
         config.policy = PolicyConfig {
-            slow_rate_bps: 1024,
-            min_progress_delta: 0.01,
             new_peer_grace_period: Duration::from_secs(1),
-            min_observation_duration: Duration::from_secs(1),
-            bad_for_duration: Duration::from_secs(1),
             decay_window: Duration::from_secs(3600),
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 1,
             reban_cooldown: Duration::from_secs(1),
-            ban_decision_mode: "duration".to_string(),
-            score: crate::config::ScorePolicyConfig::default(),
+            score: crate::config::ScorePolicyConfig {
+                target_rate_bps: 1_024,
+                required_progress_delta: 0.01,
+                weight_rate: 0.7,
+                weight_progress: 0.3,
+                rate_risk_floor: 0.4,
+                ban_threshold: 0.5,
+                clear_threshold: 0.25,
+                sustain_duration: Duration::from_secs(1),
+                decay_per_second: 0.0,
+                min_observation_duration: Duration::from_secs(1),
+                max_score: 5.0,
+            },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -2185,16 +2197,11 @@ mod tests {
                 request_timeout: Duration::from_secs(10),
             },
             policy: PolicyConfig {
-                slow_rate_bps: 262_144,
-                min_progress_delta: 0.005,
                 new_peer_grace_period: Duration::from_secs(300),
-                min_observation_duration: Duration::from_secs(1200),
-                bad_for_duration: Duration::from_secs(900),
                 decay_window: Duration::from_secs(3600),
                 ignore_peer_progress_at_or_above: 0.95,
                 min_total_seeders: 3,
                 reban_cooldown: Duration::from_secs(1800),
-                ban_decision_mode: "duration".to_string(),
                 score: crate::config::ScorePolicyConfig::default(),
                 ban_ladder: BanLadderConfig {
                     durations: vec![Duration::from_secs(3600)],
