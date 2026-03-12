@@ -28,6 +28,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Cargo fmt
+        run: cargo fmt --check
+
       - name: Cargo build
         run: cargo build --locked
 

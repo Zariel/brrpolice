@@ -121,9 +121,10 @@ _Add your build and test commands here_
 
 Pre-commit quality gates must run in this exact order and all must pass:
 
-1. `cargo build`
-2. `cargo check`
-3. `cargo test`
+1. `cargo fmt --check`
+2. `cargo build`
+3. `cargo check`
+4. `cargo test`
 
 CI enforces the same cargo gate order.
 
