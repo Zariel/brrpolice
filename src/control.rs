@@ -1498,7 +1498,7 @@ mod tests {
             },
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec!["cookie: SID=abc"],
                 response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
             },
@@ -1591,7 +1591,7 @@ mod tests {
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nForbidden\r\n",
             },
@@ -1603,7 +1603,7 @@ mod tests {
             },
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec!["cookie: SID=abc"],
                 response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
             },
@@ -1729,7 +1729,7 @@ mod tests {
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"bad111\",\"name\":\"Broken\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5},{\"hash\":\"good222\",\"name\":\"Healthy\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
             },
@@ -1810,19 +1810,19 @@ mod tests {
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
             },
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
             },
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]",
             },
@@ -1907,7 +1907,7 @@ mod tests {
 
         let (base_url, server) = spawn_server(vec![ExpectedRequest {
             method: "GET",
-            path: "/api/v2/torrents/info?filter=seeding",
+            path: "/api/v2/torrents/info?filter=active",
             must_contain: vec![],
             response: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nnope\n",
         }])
@@ -1993,7 +1993,7 @@ mod tests {
         let (base_url, server) = spawn_server(vec![
             ExpectedRequest {
                 method: "GET",
-                path: "/api/v2/torrents/info?filter=seeding",
+                path: "/api/v2/torrents/info?filter=active",
                 must_contain: vec![],
                 response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
             },

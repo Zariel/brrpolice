@@ -116,10 +116,11 @@ impl QbittorrentClient {
 
     pub async fn list_in_scope_torrents(&self) -> Result<Vec<TorrentSummary>> {
         let mut url = self.torrent_info_url()?;
-        url.query_pairs_mut().append_pair("filter", "seeding");
+        url.query_pairs_mut().append_pair("filter", "active");
         let body = self.authenticated_get_text(url).await?;
         let torrents = self.parse_torrents(&body)?;
-        Ok(self.filter_in_scope_torrents(torrents))
+        let completed = self.filter_completed_torrents(torrents);
+        Ok(self.filter_in_scope_torrents(completed))
     }
 
     pub async fn list_torrent_peers(&self, torrent_hash: &str) -> Result<Vec<TorrentPeer>> {
@@ -269,11 +270,16 @@ impl QbittorrentClient {
         self.api_url(APP_SET_PREFERENCES_PATH)
     }
 
-    fn parse_torrents(&self, body: &str) -> Result<Vec<TorrentSummary>> {
+    fn parse_torrents(&self, body: &str) -> Result<Vec<QbTorrent>> {
         let torrents: Vec<QbTorrent> =
             serde_json::from_str(body).context("invalid torrent list payload")?;
-        Ok(torrents
+        Ok(torrents)
+    }
+
+    fn filter_completed_torrents(&self, torrents: Vec<QbTorrent>) -> Vec<TorrentSummary> {
+        torrents
             .into_iter()
+            .filter(|torrent| torrent.amount_left == 0)
             .map(|torrent| TorrentSummary {
                 hash: torrent.hash,
                 name: torrent.name,
@@ -282,7 +288,7 @@ impl QbittorrentClient {
                 category: empty_string_to_none(torrent.category),
                 tags: split_tags(&torrent.tags),
             })
-            .collect())
+            .collect()
     }
 
     fn filter_in_scope_torrents(&self, torrents: Vec<TorrentSummary>) -> Vec<TorrentSummary> {
@@ -548,6 +554,8 @@ struct QbTorrent {
     category: String,
     tags: String,
     num_complete: i64,
+    #[serde(default)]
+    amount_left: i64,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -655,7 +663,7 @@ mod tests {
     };
 
     use super::{
-        APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, BanSyncResult, QbPeer,
+        APP_PREFERENCES_PATH, APP_VERSION_PATH, AUTH_LOGIN_PATH, BanSyncResult, QbPeer, QbTorrent,
         QbTorrentPeersResponse, QbittorrentClient, SYNC_TORRENT_PEERS_PATH, TORRENTS_INFO_PATH,
         TRANSFER_BAN_PEERS_PATH, WEBAPI_VERSION_PATH, parse_peer_key,
     };
@@ -744,7 +752,8 @@ mod tests {
                         "tracker":"https://tracker.example/announce",
                         "category":"tv",
                         "tags":"seed,public",
-                        "num_complete":17
+                        "num_complete":17,
+                        "amount_left":0
                     },
                     {
                         "hash":"def456",
@@ -752,7 +761,8 @@ mod tests {
                         "tracker":"",
                         "category":"",
                         "tags":"",
-                        "num_complete":0
+                        "num_complete":0,
+                        "amount_left":1024
                     }
                 ]"#,
             )
@@ -761,19 +771,48 @@ mod tests {
         assert_eq!(torrents.len(), 2);
         assert_eq!(torrents[0].hash, "abc123");
         assert_eq!(torrents[0].name, "Example Torrent");
+        assert_eq!(torrents[0].tracker, "https://tracker.example/announce");
+        assert_eq!(torrents[0].category, "tv");
+        assert_eq!(torrents[0].tags, "seed,public");
+        assert_eq!(torrents[0].num_complete, 17);
+        assert_eq!(torrents[0].amount_left, 0);
+        assert_eq!(torrents[1].tracker, "");
+        assert_eq!(torrents[1].category, "");
+        assert_eq!(torrents[1].tags, "");
+        assert_eq!(torrents[1].amount_left, 1024);
+    }
+
+    #[test]
+    fn filters_only_completed_torrents_before_scope_rules() {
+        let client = test_client();
+        let completed = client.filter_completed_torrents(vec![
+            QbTorrent {
+                hash: "a".to_string(),
+                name: "Complete".to_string(),
+                tracker: "https://tracker.example/announce".to_string(),
+                category: "tv".to_string(),
+                tags: "seed,public".to_string(),
+                num_complete: 7,
+                amount_left: 0,
+            },
+            QbTorrent {
+                hash: "b".to_string(),
+                name: "Incomplete".to_string(),
+                tracker: String::new(),
+                category: "tv".to_string(),
+                tags: "seed".to_string(),
+                num_complete: 9,
+                amount_left: 1,
+            },
+        ]);
+
         assert_eq!(
-            torrents[0].tracker.as_deref(),
-            Some("https://tracker.example/announce")
+            completed
+                .into_iter()
+                .map(|torrent| torrent.hash)
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()]
         );
-        assert_eq!(torrents[0].category.as_deref(), Some("tv"));
-        assert_eq!(
-            torrents[0].tags,
-            vec!["seed".to_string(), "public".to_string()]
-        );
-        assert_eq!(torrents[0].total_seeders, 17);
-        assert_eq!(torrents[1].tracker, None);
-        assert_eq!(torrents[1].category, None);
-        assert!(torrents[1].tags.is_empty());
     }
 
     #[test]
@@ -1230,11 +1269,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_in_scope_torrents_requests_seeding_filter_and_applies_scope_rules() {
+    async fn list_in_scope_torrents_requests_active_filter_and_applies_scope_rules() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "seeding"))
+            .and(query_param("filter", "active"))
             .and(HeaderAbsentMatcher("cookie"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .expect(1)
@@ -1250,12 +1289,12 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "seeding"))
+            .and(query_param("filter", "active"))
             .and(header("cookie", "SID=abc"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/json")
-                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2}]"#),
+                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5,"amount_left":0},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6,"amount_left":0},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6,"amount_left":0},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6,"amount_left":0},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2,"amount_left":0},{"hash":"f","name":"Incomplete active","category":"tv","tags":"keep","num_complete":9,"amount_left":256}]"#),
             )
             .expect(1)
             .mount(&server)
@@ -1490,7 +1529,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "seeding"))
+            .and(query_param("filter", "active"))
             .and(HeaderAbsentMatcher("cookie"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .expect(1)
@@ -1506,12 +1545,12 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "seeding"))
+            .and(query_param("filter", "active"))
             .and(header("cookie", "SID=abc"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/json")
-                    .set_body_string(r#"[{"hash":"abc123","name":"Example","category":"tv","tags":"public","num_complete":5}]"#),
+                    .set_body_string(r#"[{"hash":"abc123","name":"Example","category":"tv","tags":"public","num_complete":5,"amount_left":0}]"#),
             )
             .expect(1)
             .mount(&server)
