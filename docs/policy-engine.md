@@ -91,3 +91,14 @@ The pending intent exists so startup recovery can replay enforcement after parti
 On startup, `brrpolice` loads persisted peer sessions, active bans, and pending intents, then reconciles qBittorrent ban state.
 
 Expired bans are reconciled and marked in storage so local state and qBittorrent remain consistent over time.
+
+## Retention prune scheduling
+
+Retention pruning currently runs inside the control loop. This is intentional because SQLite writes are serialized (`max_connections=1`), so a separate thread/task would not add write concurrency today and would add coordination complexity.
+
+Revisit this and move pruning to a dedicated background task if one or more of these conditions hold in production:
+
+- Prune duration regularly exceeds 25% of `qbittorrent.poll_interval`.
+- Control-loop health/readiness degradation correlates with prune runs.
+- Poll-cycle latency or retry frequency increases due to prune contention.
+- Storage architecture changes to permit meaningful concurrent write throughput.
