@@ -2260,6 +2260,239 @@ mod tests {
         assert_eq!(persistence.count_peer_sessions().await.unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn retention_prune_is_idempotent_after_first_pass() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_000_000);
+
+        let mut stale_session = sample_peer_session();
+        stale_session.observation_id.peer_port = 55555;
+        stale_session.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_session(&stale_session, "policy-v1")
+            .await
+            .unwrap();
+
+        let stale_offence = PeerOffenceRecord {
+            id: None,
+            torrent_hash: "idempotent".to_string(),
+            peer_ip: "10.0.0.81".parse().unwrap(),
+            peer_port: 51413,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(600),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            banned_at: now - Duration::from_secs(120 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(119 * 24 * 3600),
+            ban_revoked_at: Some(now - Duration::from_secs(118 * 24 * 3600)),
+        };
+        persistence
+            .insert_peer_offence(&stale_offence)
+            .await
+            .unwrap();
+
+        let stale_reconciled_ban = ActiveBanRecord {
+            peer_ip: "10.0.0.82".parse().unwrap(),
+            peer_port: 51413,
+            scope: "torrent:idempotent".to_string(),
+            offence_number: 1,
+            reason: "score_based".to_string(),
+            created_at: now - Duration::from_secs(40 * 24 * 3600),
+            expires_at: now - Duration::from_secs(39 * 24 * 3600),
+            reconciled_at: Some(now - Duration::from_secs(35 * 24 * 3600)),
+        };
+        persistence
+            .upsert_active_ban(&stale_reconciled_ban)
+            .await
+            .unwrap();
+
+        let stale_intent = PendingBanIntentRecord {
+            torrent_hash: "idempotent".to_string(),
+            peer_ip: "10.0.0.83".parse().unwrap(),
+            peer_port: 51413,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_at: now - Duration::from_secs(3 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(2 * 24 * 3600),
+            bad_duration: Duration::from_secs(300),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            last_error: "stale".to_string(),
+        };
+        persistence
+            .upsert_pending_ban_intent(&stale_intent)
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        let first = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+        let second = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        assert_eq!(first.peer_sessions_deleted, 1);
+        assert_eq!(first.peer_offences_deleted, 1);
+        assert_eq!(first.active_bans_deleted, 1);
+        assert_eq!(first.pending_ban_intents_deleted, 1);
+        assert_eq!(second, RetentionPruneResult::default());
+    }
+
+    #[tokio::test]
+    async fn retention_prune_keeps_replayable_intents_and_unreconciled_bans() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_000_000);
+
+        let replayable_intent = PendingBanIntentRecord {
+            torrent_hash: "replayable".to_string(),
+            peer_ip: "10.0.0.90".parse().unwrap(),
+            peer_port: 51413,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_at: now - Duration::from_secs(5 * 24 * 3600),
+            ban_expires_at: now + Duration::from_secs(3600),
+            bad_duration: Duration::from_secs(300),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            last_error: "transient".to_string(),
+        };
+        persistence
+            .upsert_pending_ban_intent(&replayable_intent)
+            .await
+            .unwrap();
+
+        let unreconciled_ban = ActiveBanRecord {
+            peer_ip: "10.0.0.91".parse().unwrap(),
+            peer_port: 51413,
+            scope: "torrent:replayable".to_string(),
+            offence_number: 1,
+            reason: "score_based".to_string(),
+            created_at: now - Duration::from_secs(40 * 24 * 3600),
+            expires_at: now - Duration::from_secs(39 * 24 * 3600),
+            reconciled_at: None,
+        };
+        persistence
+            .upsert_active_ban(&unreconciled_ban)
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(60),
+            peer_offence_max_age: Duration::from_secs(60),
+            reconciled_ban_max_age: Duration::from_secs(60),
+            pending_intent_max_age: Duration::from_secs(60),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        let result = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+        assert_eq!(result.active_bans_deleted, 0);
+        assert_eq!(result.pending_ban_intents_deleted, 0);
+        assert_eq!(
+            persistence.load_active_bans().await.unwrap(),
+            vec![unreconciled_ban]
+        );
+        assert_eq!(
+            persistence.load_pending_ban_intents().await.unwrap(),
+            vec![replayable_intent]
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prune_preserves_recent_offences_for_continuity() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_000_000);
+        let peer_ip: IpAddr = "10.0.0.100".parse().unwrap();
+
+        let old_offence = PeerOffenceRecord {
+            id: None,
+            torrent_hash: "continuity".to_string(),
+            peer_ip,
+            peer_port: 10000,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(600),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            banned_at: now - Duration::from_secs(120 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(119 * 24 * 3600),
+            ban_revoked_at: Some(now - Duration::from_secs(118 * 24 * 3600)),
+        };
+        let recent_offence = PeerOffenceRecord {
+            id: None,
+            torrent_hash: "continuity".to_string(),
+            peer_ip,
+            peer_port: 10001,
+            offence_number: 2,
+            reason_code: "score_based".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(600),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            banned_at: now - Duration::from_secs(10 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(9 * 24 * 3600),
+            ban_revoked_at: Some(now - Duration::from_secs(8 * 24 * 3600)),
+        };
+        persistence.insert_peer_offence(&old_offence).await.unwrap();
+        persistence
+            .insert_peer_offence(&recent_offence)
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        let remaining = persistence.load_peer_offences_by_ip(peer_ip).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].offence_number, 2);
+    }
+
     async fn test_persistence() -> Persistence {
         Persistence::connect(&DatabaseConfig {
             path: PathBuf::from(":memory:"),
