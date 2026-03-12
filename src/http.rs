@@ -933,10 +933,12 @@ mod tests {
     }
 
     fn test_qbittorrent_client(base_url: &str) -> Arc<QbittorrentClient> {
-        let mut config = QbittorrentConfig::default();
-        config.base_url = base_url.to_string();
-        config.request_timeout = Duration::from_secs(1);
-        config.poll_interval = Duration::from_secs(1);
+        let config = QbittorrentConfig {
+            base_url: base_url.to_string(),
+            poll_interval: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            ..QbittorrentConfig::default()
+        };
         Arc::new(
             QbittorrentClient::new(
                 config,
