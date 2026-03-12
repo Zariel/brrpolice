@@ -15,6 +15,7 @@
 
 - Startup runs DB migrations, starts HTTP endpoints, then initializes qBittorrent access and recovery in the control loop.
 - Peer state, offence history, and active bans are stored in SQLite.
+- Retention pruning periodically deletes stale rows so SQLite size converges instead of growing without bound.
 - Ban duration increases by offence count using a configurable ban ladder.
 - Expired bans are reconciled so qBittorrent and the database stay consistent.
 - Policy logic overview: [`docs/policy-engine.md`](docs/policy-engine.md).
@@ -138,6 +139,20 @@ qBittorrent auth rule:
 | `filters.allowlist_peer_ips` | `BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS` | `[]` | Peer IPs that are never banned. |
 | `filters.allowlist_peer_cidrs` | `BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS` | `[]` | Peer CIDR ranges that are never banned. |
 
+### Retention Settings
+
+| Setting | Env Var | Default | Impact |
+|---|---|---|---|
+| `retention.enabled` | `BRRPOLICE_RETENTION__ENABLED` | `true` | Enables periodic SQLite retention pruning. |
+| `retention.prune_interval` | `BRRPOLICE_RETENTION__PRUNE_INTERVAL` | `1h` | Minimum time between prune runs. |
+| `retention.peer_session_max_age` | `BRRPOLICE_RETENTION__PEER_SESSION_MAX_AGE` | `7d` | Maximum age of peer session rows before they become prune-eligible. |
+| `retention.peer_offence_max_age` | `BRRPOLICE_RETENTION__PEER_OFFENCE_MAX_AGE` | `90d` | Maximum age of offence history rows before they become prune-eligible. |
+| `retention.reconciled_ban_max_age` | `BRRPOLICE_RETENTION__RECONCILED_BAN_MAX_AGE` | `30d` | Maximum age of reconciled active ban rows before cleanup. |
+| `retention.pending_intent_max_age` | `BRRPOLICE_RETENTION__PENDING_INTENT_MAX_AGE` | `24h` | Maximum age for failed pending ban intents once expired. Replayable intents are retained. |
+| `retention.max_rows_per_run` | `BRRPOLICE_RETENTION__MAX_ROWS_PER_RUN` | `5000` | Per-table delete cap per prune run to bound write pressure. |
+| `retention.vacuum.mode` | `BRRPOLICE_RETENTION__VACUUM__MODE` | `incremental` | SQLite reclaim mode after prune runs (`incremental` or `off`). |
+| `retention.vacuum.incremental_pages` | `BRRPOLICE_RETENTION__VACUUM__INCREMENTAL_PAGES` | `200` | Number of SQLite pages requested per incremental vacuum run. |
+
 ### Storage, HTTP, and Logging Settings
 
 | Setting | Env Var | Default | Impact |
@@ -165,6 +180,14 @@ BRRPOLICE_HTTP__BIND=0.0.0.0:9090
 ```
 
 For list values, use comma-separated entries.
+
+## Retention Tuning
+
+- Start with defaults and observe `brrpolice_sqlite_size_bytes` over multiple prune intervals.
+- Reduce `retention.prune_interval` or increase `retention.max_rows_per_run` when stale rows accumulate faster than cleanup.
+- Lower `retention.peer_session_max_age` first if database growth is dominated by session churn.
+- Keep `retention.peer_offence_max_age` long enough to preserve meaningful offence history for ban ladder continuity.
+- Use incremental vacuum for bounded background reclaim; switch to `off` only if disk reclaim is managed externally.
 
 ## HTTP Endpoints
 
