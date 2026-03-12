@@ -9,3 +9,6 @@ target/
 # Added by cargo
 
 /target
+
+# Local evaluation logs
+prodlogs.json

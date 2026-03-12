@@ -71,21 +71,6 @@ Use a non-default config path:
 BRRPOLICE_CONFIG=/path/to/config.toml cargo run
 ```
 
-## Score Simulator
-
-Use the built-in simulator to replay exported decision logs and test alternative score thresholds offline:
-
-```bash
-cargo run -- simulate-score \
-  --input /Users/chrisbannister/Downloads/vmui_logs_export.jsonl \
-  --target-rate-bps 65536 \
-  --required-progress-delta 0.005 \
-  --ban-threshold 0.8 \
-  --sustain-seconds 60
-```
-
-Use `cargo run -- simulate-score --help` to view all knobs, including weights, decay, and optional peer-IP filtering.
-
 ## Configuration
 
 Configuration load order:
@@ -125,6 +110,18 @@ qBittorrent auth rule:
 | `policy.ignore_peer_progress_at_or_above` | `BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE` | `0.95` | Exempts peers at or above this completion ratio. |
 | `policy.min_total_seeders` | `BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS` | `3` | Skips torrents below this seeder count. |
 | `policy.reban_cooldown` | `BRRPOLICE_POLICY__REBAN_COOLDOWN` | `30m` | Cooldown before re-banning a recently handled peer identity. |
+| `policy.ban_decision_mode` | `BRRPOLICE_POLICY__BAN_DECISION_MODE` | `duration` | Ban decision model. `duration` uses accumulated bad-time windows, `score` uses sustained score thresholding. |
+| `policy.score.target_rate_bps` | `BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS` | `65536` | Score model upload target in bytes/sec. Lower observed rates increase score risk. |
+| `policy.score.required_progress_delta` | `BRRPOLICE_POLICY__SCORE__REQUIRED_PROGRESS_DELTA` | `0.02` | Score model progress target as a fraction (`0.02` = `2%`). Lower progress increases score risk. |
+| `policy.score.weight_rate` | `BRRPOLICE_POLICY__SCORE__WEIGHT_RATE` | `0.35` | Weight for upload-rate risk in score calculations. |
+| `policy.score.weight_progress` | `BRRPOLICE_POLICY__SCORE__WEIGHT_PROGRESS` | `0.65` | Weight for progress risk in score calculations. |
+| `policy.score.rate_risk_floor` | `BRRPOLICE_POLICY__SCORE__RATE_RISK_FLOOR` | `0.4` | Non-compensatory floor for upload-rate risk (`sample_risk >= rate_risk_floor * rate_risk`). |
+| `policy.score.ban_threshold` | `BRRPOLICE_POLICY__SCORE__BAN_THRESHOLD` | `1.6` | Score threshold that starts/continues ban-eligible accumulation. |
+| `policy.score.clear_threshold` | `BRRPOLICE_POLICY__SCORE__CLEAR_THRESHOLD` | `0.8` | Score threshold that resets accumulated above-threshold time. |
+| `policy.score.sustain_duration` | `BRRPOLICE_POLICY__SCORE__SUSTAIN_DURATION` | `240s` | Time score must stay at or above `ban_threshold` before a ban is allowed. |
+| `policy.score.decay_per_second` | `BRRPOLICE_POLICY__SCORE__DECAY_PER_SECOND` | `0.02` | Passive score decay rate per second between observations. |
+| `policy.score.min_observation_duration` | `BRRPOLICE_POLICY__SCORE__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked peer age before score-based bans can trigger. |
+| `policy.score.max_score` | `BRRPOLICE_POLICY__SCORE__MAX_SCORE` | `5.0` | Upper clamp for per-peer score state. |
 | `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
 
 ### Filter Settings

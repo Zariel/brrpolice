@@ -74,6 +74,8 @@ pub struct PeerSessionState {
     pub rolling_avg_up_rate_bps: u64,
     pub observed_duration: Duration,
     pub bad_duration: Duration,
+    pub ban_score: f64,
+    pub ban_score_above_threshold_duration: Duration,
     pub sample_count: u32,
     pub last_torrent_seeder_count: u32,
     pub last_exemption_reason: Option<ExemptionReason>,
@@ -104,6 +106,7 @@ pub struct PeerEvaluation {
     pub sample_up_rate_bps: u64,
     pub is_bad_sample: bool,
     pub is_bannable: bool,
+    pub sample_score_risk: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

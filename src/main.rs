@@ -1,35 +1,21 @@
-mod config;
-mod control;
-mod http;
-mod metrics;
-mod persistence;
-mod policy;
-mod qbittorrent;
-mod runtime;
-mod simulator;
-mod types;
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use secrecy::SecretString;
-use tokio::{signal, sync::watch};
-use tracing::{error, info};
-
-use crate::{
+use brrpolice::{
     config::AppConfig, control::ControlLoop, http::HttpServer, metrics::AppMetrics,
     persistence::Persistence, policy::PolicyEngine, qbittorrent::QbittorrentClient,
     runtime::ServiceState,
 };
+use secrecy::SecretString;
+use tokio::{signal, sync::watch};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut cli_args = std::env::args();
-    let _binary = cli_args.next();
-    if let Some(command) = cli_args.next()
-        && command == "simulate-score"
-    {
-        return simulator::run(cli_args.collect());
+    if let Some(arg) = std::env::args().nth(1) {
+        anyhow::bail!(
+            "unexpected argument `{arg}`; run score simulation via `cargo run -p score-simulator -- ...`"
+        );
     }
 
     let config = Arc::new(AppConfig::load(None)?);
@@ -204,7 +190,8 @@ mod tests {
 
     use tokio::{sync::watch, time::Duration};
 
-    use crate::{run_until_shutdown, runtime::ServiceState};
+    use crate::run_until_shutdown;
+    use brrpolice::runtime::ServiceState;
 
     #[tokio::test]
     async fn waits_for_sibling_task_when_one_task_exits_first() {

@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 
@@ -243,6 +243,8 @@ impl Persistence {
                 rolling_avg_up_rate_bps,
                 observed_seconds,
                 bad_seconds,
+                ban_score,
+                ban_score_above_seconds,
                 sample_count,
                 last_torrent_seeder_count,
                 last_exemption_reason,
@@ -667,6 +669,8 @@ struct PeerSessionRow {
     rolling_avg_up_rate_bps: i64,
     observed_seconds: i64,
     bad_seconds: i64,
+    ban_score: f64,
+    ban_score_above_seconds: i64,
     sample_count: i64,
     last_torrent_seeder_count: i64,
     last_exemption_reason: Option<String>,
@@ -822,6 +826,10 @@ fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
         rolling_avg_up_rate_bps: u64::try_from(row.rolling_avg_up_rate_bps)?,
         observed_duration: Duration::from_secs(u64::try_from(row.observed_seconds)?),
         bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
+        ban_score: row.ban_score,
+        ban_score_above_threshold_duration: Duration::from_secs(u64::try_from(
+            row.ban_score_above_seconds,
+        )?),
         sample_count: u32::try_from(row.sample_count)?,
         last_torrent_seeder_count: u32::try_from(row.last_torrent_seeder_count)?,
         last_exemption_reason: row
@@ -883,9 +891,11 @@ where
             baseline_progress,
             latest_progress,
             rolling_avg_up_rate_bps,
-            observed_seconds,
-            bad_seconds,
-            sample_count,
+                observed_seconds,
+                bad_seconds,
+                ban_score,
+                ban_score_above_seconds,
+                sample_count,
             last_torrent_seeder_count,
             last_exemption_reason,
             bannable_since,
@@ -917,9 +927,11 @@ where
             baseline_progress,
             latest_progress,
             rolling_avg_up_rate_bps,
-            observed_seconds,
-            bad_seconds,
-            sample_count,
+                observed_seconds,
+                bad_seconds,
+                ban_score,
+                ban_score_above_seconds,
+                sample_count,
             last_torrent_seeder_count,
             last_exemption_reason,
             bannable_since,
@@ -957,6 +969,8 @@ where
             rolling_avg_up_rate_bps,
             observed_seconds,
             bad_seconds,
+            ban_score,
+            ban_score_above_seconds,
             sample_count,
             last_torrent_seeder_count,
             last_exemption_reason,
@@ -964,7 +978,7 @@ where
             bannable_since,
             last_ban_decision_at
         )
-        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(torrent_hash, peer_key) DO UPDATE SET
             peer_ip = excluded.peer_ip,
             peer_port = excluded.peer_port,
@@ -975,6 +989,8 @@ where
             rolling_avg_up_rate_bps = excluded.rolling_avg_up_rate_bps,
             observed_seconds = excluded.observed_seconds,
             bad_seconds = excluded.bad_seconds,
+            ban_score = excluded.ban_score,
+            ban_score_above_seconds = excluded.ban_score_above_seconds,
             sample_count = excluded.sample_count,
             last_torrent_seeder_count = excluded.last_torrent_seeder_count,
             last_exemption_reason = excluded.last_exemption_reason,
@@ -1005,6 +1021,11 @@ where
     .bind(
         i64::try_from(session.bad_duration.as_secs())
             .context("bad duration exceeds sqlite integer range")?,
+    )
+    .bind(session.ban_score)
+    .bind(
+        i64::try_from(session.ban_score_above_threshold_duration.as_secs())
+            .context("ban score above-threshold duration exceeds sqlite integer range")?,
     )
     .bind(i64::from(session.sample_count))
     .bind(i64::from(session.last_torrent_seeder_count))
@@ -1834,6 +1855,8 @@ mod tests {
             rolling_avg_up_rate_bps: 512,
             observed_duration: Duration::from_secs(120),
             bad_duration: Duration::from_secs(90),
+            ban_score: 0.0,
+            ban_score_above_threshold_duration: Duration::ZERO,
             sample_count: 3,
             last_torrent_seeder_count: 5,
             last_exemption_reason: Some(ExemptionReason::NearComplete {
@@ -1856,6 +1879,7 @@ mod tests {
             sample_up_rate_bps: 512,
             is_bad_sample: true,
             is_bannable: true,
+            sample_score_risk: 0.0,
         }
     }
 

@@ -277,6 +277,14 @@ impl ControlLoop {
                     .policy
                     .evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
                 self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
+                if self.config.policy.ban_decision_mode == "score" {
+                    self.metrics.record_score_evaluation(
+                        evaluation.session.ban_score,
+                        evaluation.sample_score_risk,
+                        evaluation.session.ban_score_above_threshold_duration,
+                        evaluation.is_bannable,
+                    );
+                }
                 let history = self
                     .persistence
                     .load_offence_history(&evaluation.session.offence_identity)
@@ -292,6 +300,12 @@ impl ControlLoop {
                         observed_at = %observed_at_rfc3339,
                         sample_duration_seconds = evaluation.sample_duration.as_secs(),
                         bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                        ban_score = evaluation.session.ban_score,
+                        ban_score_above_threshold_seconds = evaluation
+                            .session
+                            .ban_score_above_threshold_duration
+                            .as_secs(),
+                        sample_score_risk = evaluation.sample_score_risk,
                         progress_delta = evaluation.progress_delta,
                         average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                         "peer classified bad"
@@ -300,6 +314,7 @@ impl ControlLoop {
 
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
+                        self.metrics.record_policy_ban_decision();
                         let active_before = active_bans
                             .iter()
                             .filter(|ban| {
@@ -353,6 +368,12 @@ impl ControlLoop {
                                 offence_number = decision.offence_number,
                                 observed_at = %observed_at_rfc3339,
                                 bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                ban_score = evaluation.session.ban_score,
+                                ban_score_above_threshold_seconds = evaluation
+                                    .session
+                                    .ban_score_above_threshold_duration
+                                    .as_secs(),
+                                sample_score_risk = evaluation.sample_score_risk,
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                 selected_ban_ttl_seconds = decision.ttl.as_secs(),
@@ -384,6 +405,12 @@ impl ControlLoop {
                                     offence_number = decision.offence_number,
                                     observed_at = %observed_at_rfc3339,
                                     bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                    ban_score = evaluation.session.ban_score,
+                                    ban_score_above_threshold_seconds = evaluation
+                                        .session
+                                        .ban_score_above_threshold_duration
+                                        .as_secs(),
+                                    sample_score_risk = evaluation.sample_score_risk,
                                     progress_delta = evaluation.progress_delta,
                                     average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                     selected_ban_ttl_seconds = decision.ttl.as_secs(),
@@ -412,8 +439,10 @@ impl ControlLoop {
                         }
                         if !stored.duplicate_suppressed {
                             ban_count += 1;
-                            self.metrics
-                                .record_ban_applied(evaluation.session.bad_duration);
+                            self.metrics.record_ban_applied(
+                                evaluation.session.bad_duration,
+                                &decision.reason_code,
+                            );
                             warn!(
                                 torrent_hash = %torrent.hash,
                                 torrent_name = %torrent.name,
@@ -423,6 +452,12 @@ impl ControlLoop {
                                 offence_number = decision.offence_number,
                                 observed_at = %observed_at_rfc3339,
                                 bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                                ban_score = evaluation.session.ban_score,
+                                ban_score_above_threshold_seconds = evaluation
+                                    .session
+                                    .ban_score_above_threshold_duration
+                                    .as_secs(),
+                                sample_score_risk = evaluation.sample_score_risk,
                                 progress_delta = evaluation.progress_delta,
                                 average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                                 selected_ban_ttl_seconds = decision.ttl.as_secs(),
@@ -433,6 +468,7 @@ impl ControlLoop {
                         }
                     }
                     BanDisposition::Exempt(reason) => {
+                        self.metrics.record_policy_exemption_decision();
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
@@ -441,6 +477,12 @@ impl ControlLoop {
                             peer_port = peer.peer.port,
                             observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            ban_score = evaluation.session.ban_score,
+                            ban_score_above_threshold_seconds = evaluation
+                                .session
+                                .ban_score_above_threshold_duration
+                                .as_secs(),
+                            sample_score_risk = evaluation.sample_score_risk,
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                             exemption_reason = ?reason,
@@ -456,6 +498,7 @@ impl ControlLoop {
                         bad_duration,
                         required_bad_duration,
                     } => {
+                        self.metrics.record_policy_not_bannable_decision();
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
@@ -464,6 +507,12 @@ impl ControlLoop {
                             peer_port = peer.peer.port,
                             observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            ban_score = evaluation.session.ban_score,
+                            ban_score_above_threshold_seconds = evaluation
+                                .session
+                                .ban_score_above_threshold_duration
+                                .as_secs(),
+                            sample_score_risk = evaluation.sample_score_risk,
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                             observed_duration_seconds = observed_duration.as_secs(),
@@ -477,6 +526,7 @@ impl ControlLoop {
                             .await?;
                     }
                     BanDisposition::RebanCooldown { remaining } => {
+                        self.metrics.record_policy_reban_cooldown_decision();
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
@@ -485,6 +535,12 @@ impl ControlLoop {
                             peer_port = peer.peer.port,
                             observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            ban_score = evaluation.session.ban_score,
+                            ban_score_above_threshold_seconds = evaluation
+                                .session
+                                .ban_score_above_threshold_duration
+                                .as_secs(),
+                            sample_score_risk = evaluation.sample_score_risk,
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                             reban_cooldown_remaining_seconds = remaining.as_secs(),
@@ -495,6 +551,7 @@ impl ControlLoop {
                             .await?;
                     }
                     BanDisposition::DuplicateSuppressed => {
+                        self.metrics.record_policy_duplicate_suppressed_decision();
                         info!(
                             torrent_hash = %torrent.hash,
                             torrent_name = %torrent.name,
@@ -503,6 +560,12 @@ impl ControlLoop {
                             peer_port = peer.peer.port,
                             observed_at = %observed_at_rfc3339,
                             bad_time_seconds = evaluation.session.bad_duration.as_secs(),
+                            ban_score = evaluation.session.ban_score,
+                            ban_score_above_threshold_seconds = evaluation
+                                .session
+                                .ban_score_above_threshold_duration
+                                .as_secs(),
+                            sample_score_risk = evaluation.sample_score_risk,
                             progress_delta = evaluation.progress_delta,
                             average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
                             "peer duplicate ban suppression decision"
@@ -762,6 +825,8 @@ impl ControlLoop {
             rolling_avg_up_rate_bps: intent.avg_up_rate_bps,
             observed_duration: intent.bad_duration,
             bad_duration: intent.bad_duration,
+            ban_score: 0.0,
+            ban_score_above_threshold_duration: Duration::ZERO,
             sample_count: 1,
             last_torrent_seeder_count: 0,
             last_exemption_reason: None,
@@ -776,6 +841,7 @@ impl ControlLoop {
             sample_up_rate_bps: intent.avg_up_rate_bps,
             is_bad_sample: true,
             is_bannable: true,
+            sample_score_risk: 0.0,
         };
         let decision = BanDecision {
             peer_ip: intent.peer_ip,
@@ -815,7 +881,8 @@ impl ControlLoop {
             active_bans.push(active_ban);
         }
         if !stored.duplicate_suppressed {
-            self.metrics.record_ban_applied(intent.bad_duration);
+            self.metrics
+                .record_ban_applied(intent.bad_duration, &intent.reason_code);
         }
 
         warn!(
@@ -1577,6 +1644,8 @@ mod tests {
                     rolling_avg_up_rate_bps: 512,
                     observed_duration: Duration::from_secs(120),
                     bad_duration: Duration::from_secs(120),
+                    ban_score: 0.0,
+                    ban_score_above_threshold_duration: Duration::ZERO,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
@@ -1650,6 +1719,8 @@ mod tests {
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 1,
             reban_cooldown: Duration::from_secs(1),
+            ban_decision_mode: "duration".to_string(),
+            score: crate::config::ScorePolicyConfig::default(),
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -1979,6 +2050,8 @@ mod tests {
                     rolling_avg_up_rate_bps: 512,
                     observed_duration: Duration::from_secs(120),
                     bad_duration: Duration::from_secs(120),
+                    ban_score: 0.0,
+                    ban_score_above_threshold_duration: Duration::ZERO,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
@@ -2028,6 +2101,8 @@ mod tests {
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 1,
             reban_cooldown: Duration::from_secs(1),
+            ban_decision_mode: "duration".to_string(),
+            score: crate::config::ScorePolicyConfig::default(),
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -2119,6 +2194,8 @@ mod tests {
                 ignore_peer_progress_at_or_above: 0.95,
                 min_total_seeders: 3,
                 reban_cooldown: Duration::from_secs(1800),
+                ban_decision_mode: "duration".to_string(),
+                score: crate::config::ScorePolicyConfig::default(),
                 ban_ladder: BanLadderConfig {
                     durations: vec![Duration::from_secs(3600)],
                 },

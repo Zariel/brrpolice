@@ -60,6 +60,18 @@ impl AppConfig {
             .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
             .set_default("policy.min_total_seeders", 3_u32)?
             .set_default("policy.reban_cooldown", "30m")?
+            .set_default("policy.ban_decision_mode", "duration")?
+            .set_default("policy.score.target_rate_bps", 65_536_u64)?
+            .set_default("policy.score.required_progress_delta", 0.02_f64)?
+            .set_default("policy.score.weight_rate", 0.35_f64)?
+            .set_default("policy.score.weight_progress", 0.65_f64)?
+            .set_default("policy.score.rate_risk_floor", 0.4_f64)?
+            .set_default("policy.score.ban_threshold", 1.6_f64)?
+            .set_default("policy.score.clear_threshold", 0.8_f64)?
+            .set_default("policy.score.sustain_duration", "240s")?
+            .set_default("policy.score.decay_per_second", 0.02_f64)?
+            .set_default("policy.score.min_observation_duration", "5m")?
+            .set_default("policy.score.max_score", 5.0_f64)?
             .set_default(
                 "policy.ban_ladder.durations",
                 vec!["1h", "6h", "24h", "168h"],
@@ -115,6 +127,18 @@ impl AppConfig {
                 "policy.ignore_peer_progress_at_or_above={:.6}\n",
                 "policy.min_total_seeders={}\n",
                 "policy.reban_cooldown={}\n",
+                "policy.ban_decision_mode={}\n",
+                "policy.score.target_rate_bps={}\n",
+                "policy.score.required_progress_delta={:.6}\n",
+                "policy.score.weight_rate={:.6}\n",
+                "policy.score.weight_progress={:.6}\n",
+                "policy.score.rate_risk_floor={:.6}\n",
+                "policy.score.ban_threshold={:.6}\n",
+                "policy.score.clear_threshold={:.6}\n",
+                "policy.score.sustain_duration={}\n",
+                "policy.score.decay_per_second={:.6}\n",
+                "policy.score.min_observation_duration={}\n",
+                "policy.score.max_score={:.6}\n",
                 "policy.ban_ladder={}\n",
                 "filters.include_categories={}\n",
                 "filters.exclude_categories={}\n",
@@ -142,6 +166,18 @@ impl AppConfig {
             self.policy.ignore_peer_progress_at_or_above,
             self.policy.min_total_seeders,
             self.policy.reban_cooldown.as_secs(),
+            self.policy.ban_decision_mode,
+            self.policy.score.target_rate_bps,
+            self.policy.score.required_progress_delta,
+            self.policy.score.weight_rate,
+            self.policy.score.weight_progress,
+            self.policy.score.rate_risk_floor,
+            self.policy.score.ban_threshold,
+            self.policy.score.clear_threshold,
+            self.policy.score.sustain_duration.as_secs(),
+            self.policy.score.decay_per_second,
+            self.policy.score.min_observation_duration.as_secs(),
+            self.policy.score.max_score,
             self.policy
                 .ban_ladder
                 .durations
@@ -201,6 +237,9 @@ impl AppConfig {
         if self.policy.slow_rate_bps == 0 {
             bail!("policy.slow_rate_bps must be positive");
         }
+        if !matches!(self.policy.ban_decision_mode.as_str(), "duration" | "score") {
+            bail!("policy.ban_decision_mode must be either `duration` or `score`");
+        }
         if !(0.0..=1.0).contains(&self.policy.ignore_peer_progress_at_or_above) {
             bail!("policy.ignore_peer_progress_at_or_above must be between 0.0 and 1.0");
         }
@@ -221,11 +260,46 @@ impl AppConfig {
             self.policy.min_observation_duration,
             "policy.min_observation_duration",
         )?;
+        require_positive_duration(
+            self.policy.score.min_observation_duration,
+            "policy.score.min_observation_duration",
+        )?;
         require_positive_duration(self.policy.bad_for_duration, "policy.bad_for_duration")?;
         require_positive_duration(self.policy.decay_window, "policy.decay_window")?;
         require_positive_duration(self.policy.reban_cooldown, "policy.reban_cooldown")?;
+        require_positive_duration(
+            self.policy.score.sustain_duration,
+            "policy.score.sustain_duration",
+        )?;
         if self.policy.bad_for_duration > self.policy.decay_window {
             bail!("policy.bad_for_duration must be less than or equal to policy.decay_window");
+        }
+        if self.policy.score.target_rate_bps == 0 {
+            bail!("policy.score.target_rate_bps must be positive");
+        }
+        if self.policy.score.required_progress_delta < 0.0 {
+            bail!("policy.score.required_progress_delta must be >= 0.0");
+        }
+        if self.policy.score.required_progress_delta > 1.0 {
+            bail!("policy.score.required_progress_delta must be <= 1.0");
+        }
+        if self.policy.score.weight_rate < 0.0 || self.policy.score.weight_progress < 0.0 {
+            bail!("policy.score weights must be >= 0.0");
+        }
+        if !(0.0..=1.0).contains(&self.policy.score.rate_risk_floor) {
+            bail!("policy.score.rate_risk_floor must be between 0.0 and 1.0");
+        }
+        if (self.policy.score.weight_rate + self.policy.score.weight_progress) <= 0.0 {
+            bail!("policy.score weight_rate + weight_progress must be > 0.0");
+        }
+        if self.policy.score.clear_threshold < 0.0 {
+            bail!("policy.score.clear_threshold must be >= 0.0");
+        }
+        if self.policy.score.ban_threshold <= self.policy.score.clear_threshold {
+            bail!("policy.score.ban_threshold must be > policy.score.clear_threshold");
+        }
+        if self.policy.score.max_score <= 0.0 {
+            bail!("policy.score.max_score must be > 0.0");
         }
         if self.policy.min_total_seeders == 0 {
             bail!("policy.min_total_seeders must be at least 1");
@@ -289,6 +363,9 @@ pub struct PolicyConfig {
     pub min_total_seeders: u32,
     #[serde(deserialize_with = "deserialize_duration")]
     pub reban_cooldown: Duration,
+    pub ban_decision_mode: String,
+    #[serde(default)]
+    pub score: ScorePolicyConfig,
     #[serde(default)]
     pub ban_ladder: BanLadderConfig,
 }
@@ -305,7 +382,44 @@ impl Default for PolicyConfig {
             ignore_peer_progress_at_or_above: 0.95,
             min_total_seeders: 3,
             reban_cooldown: Duration::from_secs(1_800),
+            ban_decision_mode: "duration".to_string(),
+            score: ScorePolicyConfig::default(),
             ban_ladder: BanLadderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScorePolicyConfig {
+    pub target_rate_bps: u64,
+    pub required_progress_delta: f64,
+    pub weight_rate: f64,
+    pub weight_progress: f64,
+    pub rate_risk_floor: f64,
+    pub ban_threshold: f64,
+    pub clear_threshold: f64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub sustain_duration: Duration,
+    pub decay_per_second: f64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub min_observation_duration: Duration,
+    pub max_score: f64,
+}
+
+impl Default for ScorePolicyConfig {
+    fn default() -> Self {
+        Self {
+            target_rate_bps: 65_536,
+            required_progress_delta: 0.02,
+            weight_rate: 0.35,
+            weight_progress: 0.65,
+            rate_risk_floor: 0.4,
+            ban_threshold: 1.6,
+            clear_threshold: 0.8,
+            sustain_duration: Duration::from_secs(240),
+            decay_per_second: 0.02,
+            min_observation_duration: Duration::from_secs(300),
+            max_score: 5.0,
         }
     }
 }
