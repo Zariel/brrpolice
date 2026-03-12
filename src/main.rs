@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
     let http_server = HttpServer::new(
         config.clone(),
         persistence.clone(),
+        qbittorrent.clone(),
         state.clone(),
         metrics.clone(),
         shutdown_rx.clone(),
