@@ -64,7 +64,7 @@ impl AppConfig {
             .set_default("policy.score.rate_risk_floor", 0.4_f64)?
             .set_default("policy.score.ban_threshold", 1.6_f64)?
             .set_default("policy.score.clear_threshold", 0.8_f64)?
-            .set_default("policy.score.sustain_duration", "240s")?
+            .set_default("policy.score.sustain_duration", "120s")?
             .set_default("policy.score.decay_per_second", 0.02_f64)?
             .set_default("policy.score.min_observation_duration", "2m")?
             .set_default("policy.score.max_score", 5.0_f64)?
@@ -407,7 +407,7 @@ impl Default for ScorePolicyConfig {
             rate_risk_floor: 0.4,
             ban_threshold: 1.6,
             clear_threshold: 0.8,
-            sustain_duration: Duration::from_secs(240),
+            sustain_duration: Duration::from_secs(120),
             decay_per_second: 0.02,
             min_observation_duration: Duration::from_secs(120),
             max_score: 5.0,
