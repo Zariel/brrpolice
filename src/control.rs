@@ -79,6 +79,7 @@ impl ControlLoop {
     pub async fn recover_startup_state(&self) -> Result<RecoverySnapshot> {
         let snapshot = self.persistence.load_recovery_snapshot().await?;
         let now = std::time::SystemTime::now();
+        // Only unreconciled + unexpired rows represent bans that should still exist in qBittorrent.
         let mut active_bans = snapshot
             .active_bans
             .iter()
@@ -326,6 +327,8 @@ impl ControlLoop {
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
                         self.metrics.record_policy_ban_decision();
+                        // Persist intent before calling qBittorrent so startup recovery can
+                        // replay or cleanly drop unfinished enforcement attempts.
                         let pending_intent = PendingBanIntentRecord {
                             torrent_hash: torrent.hash.clone(),
                             peer_ip: decision.peer_ip,
@@ -651,6 +654,8 @@ impl ControlLoop {
             }
 
             let started = std::time::Instant::now();
+            // Allow shutdown to preempt an in-flight poll cycle at await boundaries
+            // instead of waiting for the next outer interval tick.
             let cycle_result = tokio::select! {
                 result = self.run_poll_cycle() => result,
                 _ = wait_for_shutdown_signal(&mut shutdown) => {

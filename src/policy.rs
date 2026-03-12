@@ -149,6 +149,8 @@ impl PolicyEngine {
                 .observed_at
                 .duration_since(previous.last_seen_at)
                 .unwrap_or_default();
+            // Carry-over preserves identity across reconnects on a new peer port so we
+            // don't reset behaviour history when a client churns endpoints.
             session.first_seen_at = previous.first_seen_at;
             session.baseline_progress = previous.baseline_progress.min(peer.peer.progress);
             session.rolling_avg_up_rate_bps = previous.rolling_avg_up_rate_bps;
@@ -450,6 +452,8 @@ impl PolicyEngine {
             return bad_duration;
         }
 
+        // bad_duration decays on inactivity so stale poor behaviour does not keep a peer
+        // bannable forever; sustain_duration controls how quickly we forget it.
         let decay_ratio = self.config.score.sustain_duration.as_secs_f64()
             / self.config.decay_window.as_secs_f64();
         let decay = elapsed.mul_f64(decay_ratio);
@@ -512,6 +516,8 @@ impl PolicyEngine {
             return (reconnect_count, window_started_at, 0.0);
         }
 
+        // Churn only adds risk when reconnect churn and poor sample quality happen together.
+        // Reconnects by themselves are common for healthy peers and should not trigger bans.
         if is_bad_sample && reconnect_count >= churn.min_reconnects {
             let reconnect_excess = reconnect_count - churn.min_reconnects + 1;
             let reconnect_factor =
@@ -548,6 +554,8 @@ impl PolicyEngine {
             return baseline_progress.min(latest_progress);
         }
 
+        // Move the baseline toward latest progress over sustain_duration. This prevents
+        // one early burst of progress from permanently masking later stagnation.
         let sustain_secs = self.config.score.sustain_duration.as_secs_f64();
         if sustain_secs <= 0.0 {
             return latest_progress;

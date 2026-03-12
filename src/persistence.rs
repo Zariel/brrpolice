@@ -127,6 +127,8 @@ impl Persistence {
         .busy_timeout(config.busy_timeout);
 
         let pool = SqlitePoolOptions::new()
+            // A single SQLite writer connection avoids lock thrash and keeps writes
+            // serialized with the control loop's transactional assumptions.
             .max_connections(1)
             .connect_with(connect_options)
             .await?;
@@ -410,6 +412,8 @@ impl Persistence {
         enforced_at: SystemTime,
     ) -> Result<EnforcementWriteResult> {
         let mut tx = self.pool.begin().await?;
+        // Re-read inside the transaction to suppress duplicate offence rows when the same
+        // ban decision is retried after partial failures.
         if let Some(session) =
             get_peer_session_exec(&mut *tx, &evaluation.session.observation_id).await?
             && session.last_ban_decision_at.is_some()

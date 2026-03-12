@@ -179,6 +179,8 @@ impl QbittorrentClient {
 
         let previous_managed_ips = self.managed_banned_ips(active_bans.iter());
         let managed_banned_ips = self.managed_banned_ips(active_bans.iter().chain(bans.iter()));
+        // qBittorrent stores a global banned IP list; after applying per-peer ban endpoints,
+        // reconcile that list so we only mutate addresses managed by brrpolice.
         self.sync_banned_ips(&managed_banned_ips, &previous_managed_ips)
             .await
             .with_context(|| "failed to persist managed banned IPs after banning peers")
@@ -547,6 +549,8 @@ impl QbittorrentClient {
         previous_managed_ips: &[IpAddr],
     ) -> Vec<String> {
         let mut merged_entries = existing_entries.clone();
+        // Remove only entries we previously managed, then add the new managed set.
+        // This preserves manual or third-party bans that are outside brrpolice control.
         for ip in previous_managed_ips {
             merged_entries.remove(&ip.to_string());
         }
