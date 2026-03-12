@@ -24,6 +24,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
     pub http: HttpConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -80,6 +82,15 @@ impl AppConfig {
             )?
             .set_default("database.path", "/data/brrpolice.sqlite")?
             .set_default("database.busy_timeout", "5s")?
+            .set_default("retention.enabled", true)?
+            .set_default("retention.prune_interval", "1h")?
+            .set_default("retention.peer_session_max_age", "7d")?
+            .set_default("retention.peer_offence_max_age", "90d")?
+            .set_default("retention.reconciled_ban_max_age", "30d")?
+            .set_default("retention.pending_intent_max_age", "24h")?
+            .set_default("retention.max_rows_per_run", 5_000_u32)?
+            .set_default("retention.vacuum.mode", "incremental")?
+            .set_default("retention.vacuum.incremental_pages", 200_u32)?
             .set_default("http.bind", "0.0.0.0:9090")?
             .set_default("logging.level", "warn")?
             .set_default("logging.format", "json")?
@@ -152,6 +163,15 @@ impl AppConfig {
                 "filters.allowlist_peer_cidrs={}\n",
                 "database.path={}\n",
                 "database.busy_timeout={}\n",
+                "retention.enabled={}\n",
+                "retention.prune_interval={}\n",
+                "retention.peer_session_max_age={}\n",
+                "retention.peer_offence_max_age={}\n",
+                "retention.reconciled_ban_max_age={}\n",
+                "retention.pending_intent_max_age={}\n",
+                "retention.max_rows_per_run={}\n",
+                "retention.vacuum.mode={}\n",
+                "retention.vacuum.incremental_pages={}\n",
                 "http.bind={}\n",
                 "logging.level={}\n",
                 "logging.format={}\n"
@@ -199,6 +219,15 @@ impl AppConfig {
             join(&self.filters.allowlist_peer_cidrs),
             self.database.path.display(),
             self.database.busy_timeout.as_secs(),
+            self.retention.enabled,
+            self.retention.prune_interval.as_secs(),
+            self.retention.peer_session_max_age.as_secs(),
+            self.retention.peer_offence_max_age.as_secs(),
+            self.retention.reconciled_ban_max_age.as_secs(),
+            self.retention.pending_intent_max_age.as_secs(),
+            self.retention.max_rows_per_run,
+            self.retention.vacuum.mode.as_str(),
+            self.retention.vacuum.incremental_pages,
             self.http.bind,
             self.logging.level,
             self.logging.format,
@@ -312,6 +341,36 @@ impl AppConfig {
         }
         for (index, duration) in self.policy.ban_ladder.durations.iter().enumerate() {
             require_positive_duration(*duration, &format!("policy.ban_ladder.durations[{index}]"))?;
+        }
+        require_positive_duration(self.retention.prune_interval, "retention.prune_interval")?;
+        require_positive_duration(
+            self.retention.peer_session_max_age,
+            "retention.peer_session_max_age",
+        )?;
+        require_positive_duration(
+            self.retention.peer_offence_max_age,
+            "retention.peer_offence_max_age",
+        )?;
+        require_positive_duration(
+            self.retention.reconciled_ban_max_age,
+            "retention.reconciled_ban_max_age",
+        )?;
+        require_positive_duration(
+            self.retention.pending_intent_max_age,
+            "retention.pending_intent_max_age",
+        )?;
+        if self.retention.max_rows_per_run == 0 {
+            bail!("retention.max_rows_per_run must be at least 1");
+        }
+        if self.retention.vacuum.incremental_pages == 0 {
+            bail!("retention.vacuum.incremental_pages must be at least 1");
+        }
+        if matches!(self.retention.vacuum.mode, VacuumMode::Off)
+            && self.retention.vacuum.incremental_pages != 200
+        {
+            bail!(
+                "retention.vacuum.incremental_pages can only be set when retention.vacuum.mode is `incremental`"
+            );
         }
         if self.http.bind.parse::<SocketAddr>().is_err() {
             bail!("http.bind must be a valid socket address");
@@ -500,6 +559,72 @@ impl Default for DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub prune_interval: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub peer_session_max_age: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub peer_offence_max_age: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub reconciled_ban_max_age: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub pending_intent_max_age: Duration,
+    pub max_rows_per_run: u32,
+    #[serde(default)]
+    pub vacuum: VacuumConfig,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prune_interval: Duration::from_secs(3_600),
+            peer_session_max_age: Duration::from_secs(604_800),
+            peer_offence_max_age: Duration::from_secs(7_776_000),
+            reconciled_ban_max_age: Duration::from_secs(2_592_000),
+            pending_intent_max_age: Duration::from_secs(86_400),
+            max_rows_per_run: 5_000,
+            vacuum: VacuumConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VacuumConfig {
+    #[serde(default)]
+    pub mode: VacuumMode,
+    pub incremental_pages: u32,
+}
+
+impl Default for VacuumConfig {
+    fn default() -> Self {
+        Self {
+            mode: VacuumMode::Incremental,
+            incremental_pages: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VacuumMode {
+    Off,
+    #[default]
+    Incremental,
+}
+
+impl VacuumMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct HttpConfig {
     pub bind: String,
 }
@@ -649,6 +774,27 @@ mod tests {
         assert_eq!(config.qbittorrent.pool_idle_timeout, Duration::from_secs(5));
         assert_eq!(config.qbittorrent.transient_retries, 10);
         assert_eq!(config.logging.level, "warn");
+        assert!(config.retention.enabled);
+        assert_eq!(config.retention.prune_interval, Duration::from_secs(3_600));
+        assert_eq!(
+            config.retention.peer_session_max_age,
+            Duration::from_secs(604_800)
+        );
+        assert_eq!(
+            config.retention.peer_offence_max_age,
+            Duration::from_secs(7_776_000)
+        );
+        assert_eq!(
+            config.retention.reconciled_ban_max_age,
+            Duration::from_secs(2_592_000)
+        );
+        assert_eq!(
+            config.retention.pending_intent_max_age,
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(config.retention.max_rows_per_run, 5_000);
+        assert_eq!(config.retention.vacuum.mode.as_str(), "incremental");
+        assert_eq!(config.retention.vacuum.incremental_pages, 200);
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
         assert!(config.policy.score.churn.enabled);
         assert_eq!(
@@ -719,6 +865,19 @@ allowlist_peer_cidrs = ["10.0.0.0/24"]
 path = "/tmp/test.sqlite"
 busy_timeout = "7s"
 
+[retention]
+enabled = false
+prune_interval = "2h"
+peer_session_max_age = "14d"
+peer_offence_max_age = "120d"
+reconciled_ban_max_age = "45d"
+pending_intent_max_age = "48h"
+max_rows_per_run = 4000
+
+[retention.vacuum]
+mode = "off"
+incremental_pages = 200
+
 [http]
 bind = "127.0.0.1:9191"
 
@@ -737,6 +896,10 @@ format = "plain"
             config.policy.new_peer_grace_period,
             Duration::from_secs(600)
         );
+        assert!(!config.retention.enabled);
+        assert_eq!(config.retention.prune_interval, Duration::from_secs(7_200));
+        assert_eq!(config.retention.max_rows_per_run, 4_000);
+        assert_eq!(config.retention.vacuum.mode.as_str(), "off");
         assert_eq!(config.filters.allowlist_peer_cidrs, vec!["10.0.0.0/24"]);
         assert_eq!(config.http.bind, "127.0.0.1:9191");
         assert_eq!(config.logging.format, "plain");
@@ -793,6 +956,14 @@ allowlist_peer_ips = ["127.0.0.1"]
                     "4096".to_string(),
                 ),
                 (
+                    "BRRPOLICE_RETENTION__MAX_ROWS_PER_RUN".to_string(),
+                    "12000".to_string(),
+                ),
+                (
+                    "BRRPOLICE_RETENTION__VACUUM__MODE".to_string(),
+                    "off".to_string(),
+                ),
+                (
                     "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS".to_string(),
                     "192.168.1.10,192.168.1.11".to_string(),
                 ),
@@ -805,9 +976,61 @@ allowlist_peer_ips = ["127.0.0.1"]
         assert_eq!(config.qbittorrent.pool_idle_timeout, Duration::from_secs(3));
         assert_eq!(config.qbittorrent.transient_retries, 12);
         assert_eq!(config.policy.score.target_rate_bps, 4096);
+        assert_eq!(config.retention.max_rows_per_run, 12_000);
+        assert_eq!(config.retention.vacuum.mode.as_str(), "off");
         assert_eq!(
             config.filters.allowlist_peer_ips,
             vec!["192.168.1.10", "192.168.1.11"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_retention_values() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[retention]
+prune_interval = "0s"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("retention.prune_interval"));
+    }
+
+    #[test]
+    fn rejects_invalid_retention_max_rows_per_run() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[retention]
+max_rows_per_run = 0
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("retention.max_rows_per_run"));
+    }
+
+    #[test]
+    fn rejects_retention_vacuum_incremental_pages_when_mode_off_and_customized() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[retention.vacuum]
+mode = "off"
+incremental_pages = 123
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("retention.vacuum.incremental_pages can only be set")
         );
     }
 

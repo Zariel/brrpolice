@@ -1162,7 +1162,7 @@ mod tests {
     use crate::{
         config::{
             AppConfig, BanLadderConfig, DatabaseConfig, FiltersConfig, HttpConfig, LoggingConfig,
-            PolicyConfig, QbittorrentConfig,
+            PolicyConfig, QbittorrentConfig, RetentionConfig,
         },
         metrics::AppMetrics,
         persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence},
@@ -2334,6 +2334,7 @@ mod tests {
                 path: PathBuf::from(":memory:"),
                 busy_timeout: Duration::from_secs(1),
             },
+            retention: RetentionConfig::default(),
             http: HttpConfig {
                 bind: "127.0.0.1:0".to_string(),
             },
