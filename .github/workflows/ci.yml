@@ -7,7 +7,7 @@ on:
       - "**"
 
 jobs:
-  rust:
+  cargo-gates:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -28,8 +28,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
+      - name: Cargo build
+        run: cargo build --locked
+
+      - name: Cargo check
+        run: cargo check --locked
+
+      - name: Cargo test
         run: cargo test --locked
 
-      - name: Run clippy
+      - name: Cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
