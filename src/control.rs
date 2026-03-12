@@ -101,6 +101,7 @@ pub struct ControlLoop {
     metrics: Arc<AppMetrics>,
     shutdown: watch::Receiver<bool>,
     peer_decision_log_states: HashMap<String, PeerDecisionLogState>,
+    last_retention_prune_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -163,6 +164,7 @@ impl ControlLoop {
             metrics,
             shutdown,
             peer_decision_log_states: HashMap::new(),
+            last_retention_prune_at: None,
         }
     }
 
@@ -545,6 +547,7 @@ impl ControlLoop {
                 &observed_at_rfc3339,
             )
             .await?;
+        self.maybe_run_retention_prune(observed_at).await;
         self.peer_decision_log_states
             .retain(|key, _| seen_peer_keys.contains(key));
         self.refresh_gauges().await?;
@@ -1005,6 +1008,40 @@ impl ControlLoop {
         self.metrics
             .set_sqlite_size_bytes(self.persistence.sqlite_size_bytes().await?);
         Ok(())
+    }
+
+    async fn maybe_run_retention_prune(&mut self, now: std::time::SystemTime) {
+        if !self.config.retention.enabled {
+            return;
+        }
+
+        if let Some(last_pruned_at) = self.last_retention_prune_at
+            && now.duration_since(last_pruned_at).unwrap_or_default()
+                < self.config.retention.prune_interval
+        {
+            return;
+        }
+        self.last_retention_prune_at = Some(now);
+
+        match self
+            .persistence
+            .run_retention_prune(&self.config.retention, now)
+            .await
+        {
+            Ok(pruned) => {
+                debug!(
+                    peer_sessions_deleted = pruned.peer_sessions_deleted,
+                    peer_offences_deleted = pruned.peer_offences_deleted,
+                    active_bans_deleted = pruned.active_bans_deleted,
+                    pending_ban_intents_deleted = pruned.pending_ban_intents_deleted,
+                    incremental_vacuum_pages = pruned.incremental_vacuum_pages,
+                    "retention prune completed"
+                );
+            }
+            Err(error) => {
+                warn!(?error, "retention prune failed");
+            }
+        }
     }
 
     async fn mark_expired_bans_reconciled(
