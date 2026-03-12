@@ -23,6 +23,7 @@ use crate::{
 macro_rules! warn_peer_decision {
     (
         $message:literal,
+        $state:expr,
         $torrent:expr,
         $torrent_tracker:expr,
         $peer:expr,
@@ -31,6 +32,7 @@ macro_rules! warn_peer_decision {
         $(, $extra_key:ident = $extra_value:expr )* $(,)?
     ) => {
         warn!(
+            state = $state,
             torrent_hash = %$torrent.hash,
             torrent_name = %$torrent.name,
             torrent_tracker = %$torrent_tracker,
@@ -58,11 +60,13 @@ macro_rules! warn_peer_decision {
 macro_rules! warn_ban_action {
     (
         $message:literal,
+        $state:expr,
         $action:expr,
         $observed_at_rfc3339:expr
         $(, $extra_key:ident = $extra_value:expr )* $(,)?
     ) => {
         warn!(
+            state = $state,
             torrent_hash = %$action.torrent_hash,
             torrent_name = %$action.torrent_name,
             torrent_tracker = %$action.torrent_tracker,
@@ -442,6 +446,7 @@ impl ControlLoop {
                         if self.should_log_peer_decision_state_change(&peer_key, state) {
                             warn_peer_decision!(
                                 "peer exemption decision",
+                                "exempt",
                                 torrent,
                                 torrent_tracker,
                                 peer,
@@ -474,6 +479,7 @@ impl ControlLoop {
                         if self.should_log_peer_decision_state_change(&peer_key, state) {
                             warn_peer_decision!(
                                 "peer not bannable yet decision",
+                                "not_bannable",
                                 torrent,
                                 torrent_tracker,
                                 peer,
@@ -502,6 +508,7 @@ impl ControlLoop {
                         ) {
                             warn_peer_decision!(
                                 "peer reban cooldown decision",
+                                "reban_cooldown",
                                 torrent,
                                 torrent_tracker,
                                 peer,
@@ -523,6 +530,7 @@ impl ControlLoop {
                         ) {
                             warn_peer_decision!(
                                 "peer duplicate ban suppression decision",
+                                "duplicate_suppressed",
                                 torrent,
                                 torrent_tracker,
                                 peer,
@@ -611,6 +619,7 @@ impl ControlLoop {
                 self.metrics.record_ban_failure();
                 warn_ban_action!(
                     "peer ban application failed",
+                    "ban_failed",
                     action,
                     observed_at_rfc3339,
                     error = error.to_string(),
@@ -636,6 +645,7 @@ impl ControlLoop {
                     self.metrics.record_ban_failure();
                     warn_ban_action!(
                         "peer ban persistence failed",
+                        "ban_persist_failed",
                         action,
                         observed_at_rfc3339,
                         error = error.to_string(),
@@ -665,7 +675,7 @@ impl ControlLoop {
                     action.evaluation.session.bad_duration,
                     &action.decision.reason_code,
                 );
-                warn_ban_action!("peer ban applied", action, observed_at_rfc3339,);
+                warn_ban_action!("peer ban applied", "ban", action, observed_at_rfc3339,);
             }
         }
 
