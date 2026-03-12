@@ -896,6 +896,9 @@ impl ControlLoop {
             bad_duration: intent.bad_duration,
             ban_score: 0.0,
             ban_score_above_threshold_duration: Duration::ZERO,
+            churn_reconnect_count: 0,
+            churn_window_started_at: None,
+            churn_penalty: 0.0,
             sample_count: 1,
             last_torrent_seeder_count: 0,
             last_exemption_reason: None,
@@ -1712,6 +1715,9 @@ mod tests {
                     bad_duration: Duration::from_secs(120),
                     ban_score: 0.0,
                     ban_score_above_threshold_duration: Duration::ZERO,
+                    churn_reconnect_count: 0,
+                    churn_window_started_at: None,
+                    churn_penalty: 0.0,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
@@ -1793,6 +1799,7 @@ mod tests {
                 decay_per_second: 0.0,
                 min_observation_duration: Duration::from_secs(1),
                 max_score: 5.0,
+                ..crate::config::ScorePolicyConfig::default()
             },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
@@ -2125,6 +2132,9 @@ mod tests {
                     bad_duration: Duration::from_secs(120),
                     ban_score: 0.0,
                     ban_score_above_threshold_duration: Duration::ZERO,
+                    churn_reconnect_count: 0,
+                    churn_window_started_at: None,
+                    churn_penalty: 0.0,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
@@ -2182,6 +2192,7 @@ mod tests {
                 decay_per_second: 0.0,
                 min_observation_duration: Duration::from_secs(1),
                 max_score: 5.0,
+                ..crate::config::ScorePolicyConfig::default()
             },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],

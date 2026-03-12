@@ -94,7 +94,7 @@ qBittorrent auth rule:
 | `qbittorrent.base_url` | `BRRPOLICE_QBITTORRENT__BASE_URL` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. |
 | `qbittorrent.username` | `BRRPOLICE_QBITTORRENT__USERNAME` | `""` | Enables authenticated API mode when set together with `password_env`. |
 | `qbittorrent.password_env` | `BRRPOLICE_QBITTORRENT__PASSWORD_ENV` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
-| `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `15s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
+| `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `10s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
 | `qbittorrent.request_timeout` | `BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT` | `10s` | Timeout per qBittorrent API request. Must be `<= poll_interval`. |
 
 ### Policy Settings
@@ -117,6 +117,11 @@ qBittorrent auth rule:
 | `policy.score.decay_per_second` | `BRRPOLICE_POLICY__SCORE__DECAY_PER_SECOND` | `0.02` | Passive score decay rate per second between observations. |
 | `policy.score.min_observation_duration` | `BRRPOLICE_POLICY__SCORE__MIN_OBSERVATION_DURATION` | `5m` | Minimum tracked peer age before score-based bans can trigger. |
 | `policy.score.max_score` | `BRRPOLICE_POLICY__SCORE__MAX_SCORE` | `5.0` | Upper clamp for per-peer score state. |
+| `policy.score.churn.enabled` | `BRRPOLICE_POLICY__SCORE__CHURN__ENABLED` | `true` | Enables reconnect churn as an additive score signal for repeatedly reconnecting low-rate, low-progress peers. |
+| `policy.score.churn.reconnect_window` | `BRRPOLICE_POLICY__SCORE__CHURN__RECONNECT_WINDOW` | `30m` | Time window used to count reconnects for churn scoring. |
+| `policy.score.churn.min_reconnects` | `BRRPOLICE_POLICY__SCORE__CHURN__MIN_RECONNECTS` | `2` | Minimum reconnect count in the churn window before churn penalty starts applying. |
+| `policy.score.churn.max_penalty` | `BRRPOLICE_POLICY__SCORE__CHURN__MAX_PENALTY` | `1.0` | Maximum additional score contribution from churn for a single peer session. |
+| `policy.score.churn.decay_per_second` | `BRRPOLICE_POLICY__SCORE__CHURN__DECAY_PER_SECOND` | `0.002` | Decay rate for accumulated churn penalty between observations. |
 | `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
 
 ### Filter Settings

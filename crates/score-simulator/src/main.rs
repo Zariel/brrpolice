@@ -107,6 +107,10 @@ struct Summary {
     peers_seen: u64,
     simulated_bans: u64,
     actual_bans: u64,
+    simulated_bans_with_churn: u64,
+    churn_samples: u64,
+    churn_max_penalty: f64,
+    churn_max_reconnect_count: u32,
 }
 
 #[derive(Default)]
@@ -286,9 +290,21 @@ fn process_fields(
         });
 
     let mut session_to_store = evaluation.session.clone();
+    if evaluation.session.churn_penalty > 0.0 {
+        summary.churn_samples += 1;
+        summary.churn_max_penalty = summary
+            .churn_max_penalty
+            .max(evaluation.session.churn_penalty);
+    }
+    summary.churn_max_reconnect_count = summary
+        .churn_max_reconnect_count
+        .max(evaluation.session.churn_reconnect_count);
     match policy.decide_ban(&peer_context, &evaluation, &history) {
         BanDisposition::Ban(decision) => {
             summary.simulated_bans += 1;
+            if evaluation.session.churn_penalty > 0.0 {
+                summary.simulated_bans_with_churn += 1;
+            }
             *state.ban_events.entry(session_key.clone()).or_default() += 1;
             let expires_at = observed_at + decision.ttl;
             state.active_bans.insert(
@@ -456,7 +472,7 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
             .join(",")
     );
     println!(
-        "config: target_rate_bps={} required_progress_delta={:.6} weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={}",
+        "config: target_rate_bps={} required_progress_delta={:.6} weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_penalty={:.3},decay_per_second={:.6})",
         config.policy.score.target_rate_bps,
         config.policy.score.required_progress_delta,
         config.policy.score.weight_rate,
@@ -468,17 +484,26 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         config.policy.score.decay_per_second,
         config.policy.score.min_observation_duration.as_secs(),
         config.policy.reban_cooldown.as_secs(),
+        config.policy.score.churn.enabled,
+        config.policy.score.churn.reconnect_window.as_secs(),
+        config.policy.score.churn.min_reconnects,
+        config.policy.score.churn.max_penalty,
+        config.policy.score.churn.decay_per_second,
     );
     if let Some(peer_ip) = config.peer_ip {
         println!("peer_filter_ip={peer_ip}");
     }
     println!(
-        "lines_total={} decision_lines={} peers_seen={} simulated_bans={} actual_bans={}",
+        "lines_total={} decision_lines={} peers_seen={} simulated_bans={} actual_bans={} simulated_bans_with_churn={} churn_samples={} churn_max_penalty={:.4} churn_max_reconnect_count={}",
         summary.lines_total,
         summary.lines_decision,
         summary.peers_seen,
         summary.simulated_bans,
-        summary.actual_bans
+        summary.actual_bans,
+        summary.simulated_bans_with_churn,
+        summary.churn_samples,
+        summary.churn_max_penalty,
+        summary.churn_max_reconnect_count
     );
 
     let mut interesting: Vec<(&SessionKey, &u32)> = state
@@ -494,12 +519,22 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
             .map(|session| session.ban_score)
             .unwrap_or(0.0);
         println!(
-            "simulated_ban peer={} port={} torrent_hash={} ban_events={} final_score={:.3}",
+            "simulated_ban peer={} port={} torrent_hash={} ban_events={} final_score={:.3} final_churn_penalty={:.3} final_churn_reconnect_count={}",
             observation_id.peer_ip,
             observation_id.peer_port,
             observation_id.torrent_hash,
             count,
-            final_score
+            final_score,
+            state
+                .sessions
+                .get(observation_id)
+                .map(|session| session.churn_penalty)
+                .unwrap_or(0.0),
+            state
+                .sessions
+                .get(observation_id)
+                .map(|session| session.churn_reconnect_count)
+                .unwrap_or(0),
         );
     }
 }
@@ -556,6 +591,30 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                 config.policy.reban_cooldown =
                     Duration::from_secs(parse_u64_arg(&mut iter, "--reban-cooldown-seconds")?);
             }
+            "--churn-enabled" => {
+                config.policy.score.churn.enabled = true;
+            }
+            "--churn-disabled" => {
+                config.policy.score.churn.enabled = false;
+            }
+            "--churn-reconnect-window-seconds" => {
+                config.policy.score.churn.reconnect_window = Duration::from_secs(parse_u64_arg(
+                    &mut iter,
+                    "--churn-reconnect-window-seconds",
+                )?);
+            }
+            "--churn-min-reconnects" => {
+                config.policy.score.churn.min_reconnects =
+                    parse_u32_arg(&mut iter, "--churn-min-reconnects")?;
+            }
+            "--churn-max-penalty" => {
+                config.policy.score.churn.max_penalty =
+                    parse_f64_arg(&mut iter, "--churn-max-penalty")?;
+            }
+            "--churn-decay-per-second" => {
+                config.policy.score.churn.decay_per_second =
+                    parse_f64_arg(&mut iter, "--churn-decay-per-second")?;
+            }
             "--peer-ip" => {
                 let value = iter.next().context("expected peer IP after `--peer-ip`")?;
                 config.peer_ip = Some(
@@ -587,8 +646,26 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
     if config.policy.score.clear_threshold > config.policy.score.ban_threshold {
         bail!("--clear-threshold must be <= --ban-threshold");
     }
+    if config.policy.score.churn.min_reconnects == 0 {
+        bail!("--churn-min-reconnects must be >= 1");
+    }
+    if config.policy.score.churn.max_penalty < 0.0 {
+        bail!("--churn-max-penalty must be >= 0.0");
+    }
+    if config.policy.score.churn.decay_per_second < 0.0 {
+        bail!("--churn-decay-per-second must be >= 0.0");
+    }
 
     Ok(config)
+}
+
+fn parse_u32_arg(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<u32> {
+    let value = iter
+        .next()
+        .with_context(|| format!("expected value after `{flag}`"))?;
+    value
+        .parse::<u32>()
+        .with_context(|| format!("invalid integer for `{flag}`: `{value}`"))
 }
 
 fn parse_u64_arg(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<u64> {
@@ -625,6 +702,12 @@ fn print_help() {
     println!("  --decay-per-second <f>           Score decay rate per second");
     println!("  --min-observation-seconds <n>    Minimum observation before scoring can ban");
     println!("  --reban-cooldown-seconds <n>     Cooldown after ban expiry before re-banning");
+    println!("  --churn-enabled                  Enable churn penalty feature");
+    println!("  --churn-disabled                 Disable churn penalty feature");
+    println!("  --churn-reconnect-window-seconds <n>  Reconnect counting window");
+    println!("  --churn-min-reconnects <n>       Reconnect threshold before churn penalty");
+    println!("  --churn-max-penalty <f>          Maximum additive churn penalty");
+    println!("  --churn-decay-per-second <f>     Churn penalty decay rate");
     println!("  --peer-ip <ip>                   Optional peer IP filter");
 }
 
@@ -665,6 +748,29 @@ mod tests {
             config.inputs,
             vec![PathBuf::from("one.jsonl"), PathBuf::from("two.jsonl")]
         );
+    }
+
+    #[test]
+    fn parse_args_supports_churn_flags() {
+        let args = vec![
+            "--input".to_string(),
+            "one.jsonl".to_string(),
+            "--churn-enabled".to_string(),
+            "--churn-reconnect-window-seconds".to_string(),
+            "120".to_string(),
+            "--churn-min-reconnects".to_string(),
+            "2".to_string(),
+            "--churn-max-penalty".to_string(),
+            "0.8".to_string(),
+            "--churn-decay-per-second".to_string(),
+            "0.03".to_string(),
+        ];
+        let config = parse_args(args).expect("expected args to parse");
+        assert!(config.policy.score.churn.enabled);
+        assert_eq!(config.policy.score.churn.reconnect_window.as_secs(), 120);
+        assert_eq!(config.policy.score.churn.min_reconnects, 2);
+        assert!((config.policy.score.churn.max_penalty - 0.8).abs() < f64::EPSILON);
+        assert!((config.policy.score.churn.decay_per_second - 0.03).abs() < f64::EPSILON);
     }
 
     #[test]

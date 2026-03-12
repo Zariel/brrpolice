@@ -49,7 +49,7 @@ impl AppConfig {
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
             .set_default("qbittorrent.username", "")?
             .set_default("qbittorrent.password_env", "")?
-            .set_default("qbittorrent.poll_interval", "15s")?
+            .set_default("qbittorrent.poll_interval", "10s")?
             .set_default("qbittorrent.request_timeout", "10s")?
             .set_default("policy.new_peer_grace_period", "60s")?
             .set_default("policy.decay_window", "60m")?
@@ -67,6 +67,11 @@ impl AppConfig {
             .set_default("policy.score.decay_per_second", 0.02_f64)?
             .set_default("policy.score.min_observation_duration", "5m")?
             .set_default("policy.score.max_score", 5.0_f64)?
+            .set_default("policy.score.churn.enabled", true)?
+            .set_default("policy.score.churn.reconnect_window", "30m")?
+            .set_default("policy.score.churn.min_reconnects", 2_u32)?
+            .set_default("policy.score.churn.max_penalty", 1.0_f64)?
+            .set_default("policy.score.churn.decay_per_second", 0.002_f64)?
             .set_default(
                 "policy.ban_ladder.durations",
                 vec!["1h", "6h", "24h", "168h"],
@@ -129,6 +134,11 @@ impl AppConfig {
                 "policy.score.decay_per_second={:.6}\n",
                 "policy.score.min_observation_duration={}\n",
                 "policy.score.max_score={:.6}\n",
+                "policy.score.churn.enabled={}\n",
+                "policy.score.churn.reconnect_window={}\n",
+                "policy.score.churn.min_reconnects={}\n",
+                "policy.score.churn.max_penalty={:.6}\n",
+                "policy.score.churn.decay_per_second={:.6}\n",
                 "policy.ban_ladder={}\n",
                 "filters.include_categories={}\n",
                 "filters.exclude_categories={}\n",
@@ -163,6 +173,11 @@ impl AppConfig {
             self.policy.score.decay_per_second,
             self.policy.score.min_observation_duration.as_secs(),
             self.policy.score.max_score,
+            self.policy.score.churn.enabled,
+            self.policy.score.churn.reconnect_window.as_secs(),
+            self.policy.score.churn.min_reconnects,
+            self.policy.score.churn.max_penalty,
+            self.policy.score.churn.decay_per_second,
             self.policy
                 .ban_ladder
                 .durations
@@ -266,6 +281,19 @@ impl AppConfig {
         if self.policy.score.max_score <= 0.0 {
             bail!("policy.score.max_score must be > 0.0");
         }
+        require_positive_duration(
+            self.policy.score.churn.reconnect_window,
+            "policy.score.churn.reconnect_window",
+        )?;
+        if self.policy.score.churn.min_reconnects == 0 {
+            bail!("policy.score.churn.min_reconnects must be >= 1");
+        }
+        if self.policy.score.churn.max_penalty < 0.0 {
+            bail!("policy.score.churn.max_penalty must be >= 0.0");
+        }
+        if self.policy.score.churn.decay_per_second < 0.0 {
+            bail!("policy.score.churn.decay_per_second must be >= 0.0");
+        }
         if self.policy.min_total_seeders == 0 {
             bail!("policy.min_total_seeders must be at least 1");
         }
@@ -306,7 +334,7 @@ impl Default for QbittorrentConfig {
             base_url: "http://qbittorrent:8080".to_string(),
             username: String::new(),
             password_env: String::new(),
-            poll_interval: Duration::from_secs(15),
+            poll_interval: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -357,6 +385,8 @@ pub struct ScorePolicyConfig {
     #[serde(deserialize_with = "deserialize_duration")]
     pub min_observation_duration: Duration,
     pub max_score: f64,
+    #[serde(default)]
+    pub churn: ChurnPolicyConfig,
 }
 
 impl Default for ScorePolicyConfig {
@@ -373,6 +403,29 @@ impl Default for ScorePolicyConfig {
             decay_per_second: 0.02,
             min_observation_duration: Duration::from_secs(300),
             max_score: 5.0,
+            churn: ChurnPolicyConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChurnPolicyConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub reconnect_window: Duration,
+    pub min_reconnects: u32,
+    pub max_penalty: f64,
+    pub decay_per_second: f64,
+}
+
+impl Default for ChurnPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reconnect_window: Duration::from_secs(1_800),
+            min_reconnects: 2,
+            max_penalty: 1.0,
+            decay_per_second: 0.002,
         }
     }
 }
@@ -574,9 +627,17 @@ mod tests {
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
-        assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(15));
+        assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(10));
         assert_eq!(config.logging.level, "warn");
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
+        assert!(config.policy.score.churn.enabled);
+        assert_eq!(
+            config.policy.score.churn.reconnect_window,
+            Duration::from_secs(1_800)
+        );
+        assert_eq!(config.policy.score.churn.min_reconnects, 2);
+        assert_eq!(config.policy.score.churn.max_penalty, 1.0);
+        assert_eq!(config.policy.score.churn.decay_per_second, 0.002);
         assert_eq!(
             config.policy.ban_ladder.durations,
             vec![
@@ -618,6 +679,13 @@ ignore_peer_progress_at_or_above = 0.9
 min_total_seeders = 5
 reban_cooldown = "45m"
 
+[policy.score.churn]
+enabled = true
+reconnect_window = "15m"
+min_reconnects = 4
+max_penalty = 0.75
+decay_per_second = 0.02
+
 [policy.ban_ladder]
 durations = ["2h", "12h"]
 
@@ -648,6 +716,14 @@ format = "plain"
         assert_eq!(config.filters.allowlist_peer_cidrs, vec!["10.0.0.0/24"]);
         assert_eq!(config.http.bind, "127.0.0.1:9191");
         assert_eq!(config.logging.format, "plain");
+        assert!(config.policy.score.churn.enabled);
+        assert_eq!(
+            config.policy.score.churn.reconnect_window,
+            Duration::from_secs(900)
+        );
+        assert_eq!(config.policy.score.churn.min_reconnects, 4);
+        assert_eq!(config.policy.score.churn.max_penalty, 0.75);
+        assert_eq!(config.policy.score.churn.decay_per_second, 0.02);
     }
 
     #[test]
@@ -730,6 +806,25 @@ request_timeout = "10s"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("request_timeout"));
+    }
+
+    #[test]
+    fn rejects_invalid_churn_min_reconnects() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.score.churn]
+min_reconnects = 0
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("policy.score.churn.min_reconnects")
+        );
     }
 
     #[test]
