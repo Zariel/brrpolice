@@ -19,6 +19,78 @@ use crate::{
     },
 };
 
+macro_rules! info_peer_decision {
+    (
+        $message:literal,
+        $torrent:expr,
+        $torrent_tracker:expr,
+        $peer:expr,
+        $evaluation:expr,
+        $observed_at_rfc3339:expr
+        $(, $extra_key:ident = $extra_value:expr )* $(,)?
+    ) => {
+        info!(
+            torrent_hash = %$torrent.hash,
+            torrent_name = %$torrent.name,
+            torrent_tracker = %$torrent_tracker,
+            peer_ip = %$peer.peer.ip,
+            peer_port = $peer.peer.port,
+            observed_at = %$observed_at_rfc3339,
+            bad_time_seconds = $evaluation.session.bad_duration.as_secs(),
+            ban_score = $evaluation.session.ban_score,
+            ban_score_above_threshold_seconds = $evaluation
+                .session
+                .ban_score_above_threshold_duration
+                .as_secs(),
+            sample_score_risk = $evaluation.sample_score_risk,
+            progress_delta = $evaluation.progress_delta,
+            average_upload_rate_bps = $evaluation.session.rolling_avg_up_rate_bps,
+            churn_reconnect_count = $evaluation.session.churn_reconnect_count,
+            churn_penalty = $evaluation.session.churn_penalty,
+            sample_count = $evaluation.session.sample_count,
+            $( $extra_key = $extra_value, )*
+            $message
+        );
+    };
+}
+
+macro_rules! warn_ban_action {
+    (
+        $message:literal,
+        $action:expr,
+        $observed_at_rfc3339:expr
+        $(, $extra_key:ident = $extra_value:expr )* $(,)?
+    ) => {
+        warn!(
+            torrent_hash = %$action.torrent_hash,
+            torrent_name = %$action.torrent_name,
+            torrent_tracker = %$action.torrent_tracker,
+            peer_ip = %$action.decision.peer_ip,
+            peer_port = $action.decision.peer_port,
+            offence_number = $action.decision.offence_number,
+            observed_at = $observed_at_rfc3339,
+            bad_time_seconds = $action.evaluation.session.bad_duration.as_secs(),
+            ban_score = $action.evaluation.session.ban_score,
+            ban_score_above_threshold_seconds = $action
+                .evaluation
+                .session
+                .ban_score_above_threshold_duration
+                .as_secs(),
+            sample_score_risk = $action.evaluation.sample_score_risk,
+            progress_delta = $action.evaluation.progress_delta,
+            average_upload_rate_bps = $action.evaluation.session.rolling_avg_up_rate_bps,
+            churn_reconnect_count = $action.evaluation.session.churn_reconnect_count,
+            churn_penalty = $action.evaluation.session.churn_penalty,
+            sample_count = $action.evaluation.session.sample_count,
+            selected_ban_ttl_seconds = $action.decision.ttl.as_secs(),
+            reason_code = %$action.decision.reason_code,
+            reason_details = %$action.decision.reason_details,
+            $( $extra_key = $extra_value, )*
+            $message
+        );
+    };
+}
+
 pub struct ControlLoop {
     config: Arc<AppConfig>,
     persistence: Arc<Persistence>,
@@ -303,24 +375,15 @@ impl ControlLoop {
                     .await?;
 
                 if evaluation.is_bad_sample {
-                    info!(
-                        torrent_hash = %torrent.hash,
-                        torrent_name = %torrent.name,
-                        torrent_tracker = %torrent_tracker,
-                        peer_ip = %peer.peer.ip,
-                        peer_port = peer.peer.port,
-                        observed_at = %observed_at_rfc3339,
+                    info_peer_decision!(
+                        "peer classified bad",
+                        torrent,
+                        torrent_tracker,
+                        peer,
+                        evaluation,
+                        observed_at_rfc3339,
                         sample_duration_seconds = evaluation.sample_duration.as_secs(),
-                        bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                        ban_score = evaluation.session.ban_score,
-                        ban_score_above_threshold_seconds = evaluation
-                            .session
-                            .ban_score_above_threshold_duration
-                            .as_secs(),
-                        sample_score_risk = evaluation.sample_score_risk,
-                        progress_delta = evaluation.progress_delta,
-                        average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                        "peer classified bad"
+                        latest_peer_progress = peer.peer.progress
                     );
                 }
 
@@ -361,24 +424,15 @@ impl ControlLoop {
                     }
                     BanDisposition::Exempt(reason) => {
                         self.metrics.record_policy_exemption_decision();
-                        info!(
-                            torrent_hash = %torrent.hash,
-                            torrent_name = %torrent.name,
-                            torrent_tracker = %torrent_tracker,
-                            peer_ip = %peer.peer.ip,
-                            peer_port = peer.peer.port,
-                            observed_at = %observed_at_rfc3339,
-                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                            ban_score = evaluation.session.ban_score,
-                            ban_score_above_threshold_seconds = evaluation
-                                .session
-                                .ban_score_above_threshold_duration
-                                .as_secs(),
-                            sample_score_risk = evaluation.sample_score_risk,
-                            progress_delta = evaluation.progress_delta,
-                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                            exemption_reason = ?reason,
-                            "peer exemption decision"
+                        info_peer_decision!(
+                            "peer exemption decision",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            evaluation,
+                            observed_at_rfc3339,
+                            exemption_reason = format!("{reason:?}"),
+                            latest_peer_progress = peer.peer.progress
                         );
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
@@ -391,27 +445,18 @@ impl ControlLoop {
                         required_bad_duration,
                     } => {
                         self.metrics.record_policy_not_bannable_decision();
-                        info!(
-                            torrent_hash = %torrent.hash,
-                            torrent_name = %torrent.name,
-                            torrent_tracker = %torrent_tracker,
-                            peer_ip = %peer.peer.ip,
-                            peer_port = peer.peer.port,
-                            observed_at = %observed_at_rfc3339,
-                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                            ban_score = evaluation.session.ban_score,
-                            ban_score_above_threshold_seconds = evaluation
-                                .session
-                                .ban_score_above_threshold_duration
-                                .as_secs(),
-                            sample_score_risk = evaluation.sample_score_risk,
-                            progress_delta = evaluation.progress_delta,
-                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                        info_peer_decision!(
+                            "peer not bannable yet decision",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            evaluation,
+                            observed_at_rfc3339,
                             observed_duration_seconds = observed_duration.as_secs(),
                             required_observation_seconds = required_observation.as_secs(),
                             observed_bad_duration_seconds = bad_duration.as_secs(),
                             required_bad_duration_seconds = required_bad_duration.as_secs(),
-                            "peer not bannable yet decision"
+                            latest_peer_progress = peer.peer.progress
                         );
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
@@ -419,24 +464,15 @@ impl ControlLoop {
                     }
                     BanDisposition::RebanCooldown { remaining } => {
                         self.metrics.record_policy_reban_cooldown_decision();
-                        info!(
-                            torrent_hash = %torrent.hash,
-                            torrent_name = %torrent.name,
-                            torrent_tracker = %torrent_tracker,
-                            peer_ip = %peer.peer.ip,
-                            peer_port = peer.peer.port,
-                            observed_at = %observed_at_rfc3339,
-                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                            ban_score = evaluation.session.ban_score,
-                            ban_score_above_threshold_seconds = evaluation
-                                .session
-                                .ban_score_above_threshold_duration
-                                .as_secs(),
-                            sample_score_risk = evaluation.sample_score_risk,
-                            progress_delta = evaluation.progress_delta,
-                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
+                        info_peer_decision!(
+                            "peer reban cooldown decision",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            evaluation,
+                            observed_at_rfc3339,
                             reban_cooldown_remaining_seconds = remaining.as_secs(),
-                            "peer reban cooldown decision"
+                            latest_peer_progress = peer.peer.progress
                         );
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
@@ -444,23 +480,14 @@ impl ControlLoop {
                     }
                     BanDisposition::DuplicateSuppressed => {
                         self.metrics.record_policy_duplicate_suppressed_decision();
-                        info!(
-                            torrent_hash = %torrent.hash,
-                            torrent_name = %torrent.name,
-                            torrent_tracker = %torrent_tracker,
-                            peer_ip = %peer.peer.ip,
-                            peer_port = peer.peer.port,
-                            observed_at = %observed_at_rfc3339,
-                            bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                            ban_score = evaluation.session.ban_score,
-                            ban_score_above_threshold_seconds = evaluation
-                                .session
-                                .ban_score_above_threshold_duration
-                                .as_secs(),
-                            sample_score_risk = evaluation.sample_score_risk,
-                            progress_delta = evaluation.progress_delta,
-                            average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                            "peer duplicate ban suppression decision"
+                        info_peer_decision!(
+                            "peer duplicate ban suppression decision",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            evaluation,
+                            observed_at_rfc3339,
+                            latest_peer_progress = peer.peer.progress
                         );
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
@@ -524,29 +551,11 @@ impl ControlLoop {
         {
             for action in actions {
                 self.metrics.record_ban_failure();
-                warn!(
-                    torrent_hash = %action.torrent_hash,
-                    torrent_name = %action.torrent_name,
-                    torrent_tracker = %action.torrent_tracker,
-                    peer_ip = %action.decision.peer_ip,
-                    peer_port = action.decision.peer_port,
-                    offence_number = action.decision.offence_number,
-                    observed_at = observed_at_rfc3339,
-                    bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
-                    ban_score = action.evaluation.session.ban_score,
-                    ban_score_above_threshold_seconds = action
-                        .evaluation
-                        .session
-                        .ban_score_above_threshold_duration
-                        .as_secs(),
-                    sample_score_risk = action.evaluation.sample_score_risk,
-                    progress_delta = action.evaluation.progress_delta,
-                    average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
-                    selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
-                    reason_code = %action.decision.reason_code,
-                    reason_details = %action.decision.reason_details,
-                    error = ?error,
-                    "peer ban application failed"
+                warn_ban_action!(
+                    "peer ban application failed",
+                    action,
+                    observed_at_rfc3339,
+                    error = error.to_string(),
                 );
                 let mut failed_intent = action.pending_intent.clone();
                 failed_intent.last_error = error.to_string();
@@ -567,29 +576,11 @@ impl ControlLoop {
                 Ok(stored) => stored,
                 Err(error) => {
                     self.metrics.record_ban_failure();
-                    warn!(
-                        torrent_hash = %action.torrent_hash,
-                        torrent_name = %action.torrent_name,
-                        torrent_tracker = %action.torrent_tracker,
-                        peer_ip = %action.decision.peer_ip,
-                        peer_port = action.decision.peer_port,
-                        offence_number = action.decision.offence_number,
-                        observed_at = observed_at_rfc3339,
-                        bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
-                        ban_score = action.evaluation.session.ban_score,
-                        ban_score_above_threshold_seconds = action
-                            .evaluation
-                            .session
-                            .ban_score_above_threshold_duration
-                            .as_secs(),
-                        sample_score_risk = action.evaluation.sample_score_risk,
-                        progress_delta = action.evaluation.progress_delta,
-                        average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
-                        selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
-                        reason_code = %action.decision.reason_code,
-                        reason_details = %action.decision.reason_details,
-                        error = ?error,
-                        "peer ban persistence failed"
+                    warn_ban_action!(
+                        "peer ban persistence failed",
+                        action,
+                        observed_at_rfc3339,
+                        error = error.to_string(),
                     );
                     let mut failed_intent = action.pending_intent.clone();
                     failed_intent.last_error = error.to_string();
@@ -616,29 +607,7 @@ impl ControlLoop {
                     action.evaluation.session.bad_duration,
                     &action.decision.reason_code,
                 );
-                warn!(
-                    torrent_hash = %action.torrent_hash,
-                    torrent_name = %action.torrent_name,
-                    torrent_tracker = %action.torrent_tracker,
-                    peer_ip = %action.decision.peer_ip,
-                    peer_port = action.decision.peer_port,
-                    offence_number = action.decision.offence_number,
-                    observed_at = observed_at_rfc3339,
-                    bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
-                    ban_score = action.evaluation.session.ban_score,
-                    ban_score_above_threshold_seconds = action
-                        .evaluation
-                        .session
-                        .ban_score_above_threshold_duration
-                        .as_secs(),
-                    sample_score_risk = action.evaluation.sample_score_risk,
-                    progress_delta = action.evaluation.progress_delta,
-                    average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
-                    selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
-                    reason_code = %action.decision.reason_code,
-                    reason_details = %action.decision.reason_details,
-                    "peer ban applied"
-                );
+                warn_ban_action!("peer ban applied", action, observed_at_rfc3339,);
             }
         }
 

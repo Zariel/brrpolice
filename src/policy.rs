@@ -380,17 +380,33 @@ impl PolicyEngine {
 
         let offence_number = history.offence_count + 1;
         let reason_code = SCORE_BASED_REASON_CODE.to_string();
+        let required_progress_delta =
+            self.required_progress_delta(evaluation.session.observed_duration);
+        let rate_risk = normalized_rate_risk(
+            evaluation.sample_up_rate_bps,
+            self.config.score.target_rate_bps,
+        );
+        let progress_risk =
+            normalized_progress_risk(evaluation.progress_delta, required_progress_delta);
+        let factors = self.reason_factors(rate_risk, progress_risk, evaluation);
         let reason_details = format!(
-            "score peer: score={:.4} sample_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} score_above_seconds={} observed_seconds={}",
+            "score peer: factors={} score={:.4} sample_risk={:.4} rate_risk={:.4} progress_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} required_progress_delta={:.4} score_above_seconds={} observed_seconds={} reconnects={} churn_penalty={:.4} samples={}",
+            factors,
             evaluation.session.ban_score,
             evaluation.sample_score_risk,
+            rate_risk,
+            progress_risk,
             evaluation.session.rolling_avg_up_rate_bps,
             evaluation.progress_delta,
+            required_progress_delta,
             evaluation
                 .session
                 .ban_score_above_threshold_duration
                 .as_secs(),
-            evaluation.session.observed_duration.as_secs()
+            evaluation.session.observed_duration.as_secs(),
+            evaluation.session.churn_reconnect_count,
+            evaluation.session.churn_penalty,
+            evaluation.session.sample_count
         );
 
         BanDisposition::Ban(BanDecision {
@@ -637,6 +653,40 @@ impl PolicyEngine {
         }
 
         Some(self.config.reban_cooldown - elapsed)
+    }
+
+    fn reason_factors(
+        &self,
+        rate_risk: f64,
+        progress_risk: f64,
+        evaluation: &PeerEvaluation,
+    ) -> String {
+        let mut factors = Vec::new();
+
+        if rate_risk >= 0.75 {
+            factors.push("severe_rate_deficit");
+        } else if rate_risk >= 0.5 {
+            factors.push("rate_deficit");
+        }
+
+        if progress_risk >= 0.75 {
+            factors.push("severe_progress_deficit");
+        } else if progress_risk >= 0.5 {
+            factors.push("progress_deficit");
+        }
+
+        if self.config.score.churn.enabled
+            && evaluation.session.churn_reconnect_count >= self.config.score.churn.min_reconnects
+            && evaluation.session.churn_penalty > 0.0
+        {
+            factors.push("reconnect_churn");
+        }
+
+        if factors.is_empty() {
+            factors.push("composite_risk");
+        }
+
+        factors.join(",")
     }
 }
 
