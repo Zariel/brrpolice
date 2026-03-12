@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::{
+    backoff::jittered_exponential_backoff,
     config::{FiltersConfig, QbittorrentConfig},
     metrics::AppMetrics,
     persistence::ActiveBanRecord,
@@ -30,6 +31,9 @@ const TORRENTS_INFO_PATH: &str = "api/v2/torrents/info";
 const SYNC_TORRENT_PEERS_PATH: &str = "api/v2/sync/torrentPeers";
 const TRANSFER_BAN_PEERS_PATH: &str = "api/v2/transfer/banPeers";
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+const MAX_TRANSIENT_RETRIES: usize = 3;
+const REQUEST_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const REQUEST_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct QbittorrentClient {
@@ -79,11 +83,14 @@ impl QbittorrentClient {
         }
 
         let username = self.config.username.trim();
+        let login_url = self.api_url(AUTH_LOGIN_PATH)?;
         let response = self
-            .execute_request(self.client.post(self.api_url(AUTH_LOGIN_PATH)?).form(&[
-                ("username", username),
-                ("password", self.password.expose_secret()),
-            ]))
+            .execute_request(&|| {
+                self.client.post(login_url.clone()).form(&[
+                    ("username", username),
+                    ("password", self.password.expose_secret()),
+                ])
+            })
             .await
             .context("qbittorrent login request failed")?;
         let status = response.status();
@@ -134,8 +141,29 @@ impl QbittorrentClient {
         ban: &ActiveBanRecord,
         active_bans: &[ActiveBanRecord],
     ) -> Result<BanSyncResult> {
+        self.apply_peer_bans(std::slice::from_ref(ban), active_bans)
+            .await
+    }
+
+    pub async fn apply_peer_bans(
+        &self,
+        bans: &[ActiveBanRecord],
+        active_bans: &[ActiveBanRecord],
+    ) -> Result<BanSyncResult> {
+        if bans.is_empty() {
+            let managed_banned_ips = self.managed_banned_ips(active_bans.iter());
+            return Ok(BanSyncResult {
+                banned_ips: managed_banned_ips,
+            });
+        }
+
         let ban_url = self.ban_peers_url()?;
-        let peers = self.encode_ban_peers(&[(ban.peer_ip, ban.peer_port)]);
+        let peers = self.encode_ban_peers(
+            &bans
+                .iter()
+                .map(|ban| (ban.peer_ip, ban.peer_port))
+                .collect::<Vec<_>>(),
+        );
         self.send_authenticated(|| {
             self.client
                 .post(ban_url.clone())
@@ -144,22 +172,16 @@ impl QbittorrentClient {
         .await
         .with_context(|| {
             format!(
-                "failed to apply qbittorrent peer ban for {}:{}",
-                ban.peer_ip, ban.peer_port
+                "failed to apply {} qbittorrent peer ban endpoints",
+                bans.len()
             )
         })?;
 
         let previous_managed_ips = self.managed_banned_ips(active_bans.iter());
-        let managed_banned_ips =
-            self.managed_banned_ips(active_bans.iter().chain(std::iter::once(ban)));
+        let managed_banned_ips = self.managed_banned_ips(active_bans.iter().chain(bans.iter()));
         self.sync_banned_ips(&managed_banned_ips, &previous_managed_ips)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to persist managed banned IPs after banning {}:{}",
-                    ban.peer_ip, ban.peer_port
-                )
-            })
+            .with_context(|| "failed to persist managed banned IPs after banning peers")
     }
 
     pub async fn reconcile_expired_bans(
@@ -193,11 +215,11 @@ impl QbittorrentClient {
     where
         F: Fn() -> RequestBuilder,
     {
-        let response = self.execute_request(build()).await?;
+        let response = self.execute_request(&build).await?;
         if response.status() == StatusCode::FORBIDDEN && self.auth_enabled() {
             self.authenticate().await?;
             let retried = self
-                .execute_request(build())
+                .execute_request(&build)
                 .await
                 .context("qbittorrent authenticated retry failed")?;
             return Self::ensure_success(retried).await;
@@ -206,22 +228,67 @@ impl QbittorrentClient {
         Self::ensure_success(response).await
     }
 
-    async fn execute_request(&self, request: RequestBuilder) -> Result<reqwest::Response> {
-        let started = std::time::Instant::now();
-        let result = request.send().await.context("qbittorrent request failed");
-        self.metrics.record_qbittorrent_request(started.elapsed());
-        match result {
-            Ok(response) => {
-                if !response.status().is_success() {
+    async fn execute_request<F>(&self, build: &F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        for attempt in 0..MAX_TRANSIENT_RETRIES {
+            let started = std::time::Instant::now();
+            let result = build().send().await;
+            self.metrics.record_qbittorrent_request(started.elapsed());
+
+            match result {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+
                     self.metrics.record_qbittorrent_api_error();
+                    if attempt + 1 < MAX_TRANSIENT_RETRIES && is_retryable_status(status) {
+                        let delay = jittered_exponential_backoff(
+                            REQUEST_RETRY_BACKOFF_BASE,
+                            attempt as u32,
+                            REQUEST_RETRY_BACKOFF_MAX,
+                        );
+                        warn!(
+                            status = %status,
+                            retry_attempt = attempt + 1,
+                            max_retries = MAX_TRANSIENT_RETRIES,
+                            backoff_ms = delay.as_millis(),
+                            "qbittorrent request returned transient status; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    return Ok(response);
                 }
-                Ok(response)
-            }
-            Err(error) => {
-                self.metrics.record_qbittorrent_api_error();
-                Err(error)
+                Err(error) => {
+                    self.metrics.record_qbittorrent_api_error();
+                    if attempt + 1 < MAX_TRANSIENT_RETRIES && is_transient_transport_error(&error) {
+                        let delay = jittered_exponential_backoff(
+                            REQUEST_RETRY_BACKOFF_BASE,
+                            attempt as u32,
+                            REQUEST_RETRY_BACKOFF_MAX,
+                        );
+                        warn!(
+                            retry_attempt = attempt + 1,
+                            max_retries = MAX_TRANSIENT_RETRIES,
+                            backoff_ms = delay.as_millis(),
+                            error = ?error,
+                            "qbittorrent request transport error; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    return Err(error).context("qbittorrent request failed");
+                }
             }
         }
+
+        unreachable!("qbittorrent request retry loop exhausted unexpectedly")
     }
 
     async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -605,6 +672,21 @@ fn split_tags(value: &str) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_transient_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
 }
 
 fn matches_list(value: Option<&str>, filter_values: &[String]) -> bool {

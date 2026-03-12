@@ -6,6 +6,7 @@ use tokio::{sync::watch, time};
 use tracing::{debug, info, warn};
 
 use crate::{
+    backoff::jittered_exponential_backoff,
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
@@ -35,12 +36,24 @@ pub struct PollCycleResult {
     pub ban_count: usize,
 }
 
+#[derive(Debug, Clone)]
+struct PendingBanAction {
+    torrent_hash: String,
+    torrent_name: String,
+    torrent_tracker: String,
+    decision: BanDecision,
+    evaluation: PeerEvaluation,
+    pending_intent: PendingBanIntentRecord,
+}
+
 const MAX_CYCLE_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const STARTUP_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const STARTUP_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const MAX_PENDING_REPLAY_RETRIES: usize = 3;
 const PENDING_REPLAY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const PENDING_REPLAY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 impl ControlLoop {
     pub fn new(
@@ -197,7 +210,7 @@ impl ControlLoop {
         self.metrics.set_in_scope_torrents(torrents.len());
         let mut active_bans = self.persistence.load_active_bans().await?;
         let mut peer_count = 0;
-        let mut ban_count = 0;
+        let mut pending_ban_actions = Vec::new();
 
         'torrents: for torrent in &torrents {
             if self.shutdown_requested() {
@@ -313,14 +326,7 @@ impl ControlLoop {
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
                         self.metrics.record_policy_ban_decision();
-                        let active_before = active_bans
-                            .iter()
-                            .filter(|ban| {
-                                ban.reconciled_at.is_none() && ban.expires_at > observed_at
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let mut pending_intent = PendingBanIntentRecord {
+                        let pending_intent = PendingBanIntentRecord {
                             torrent_hash: torrent.hash.clone(),
                             peer_ip: decision.peer_ip,
                             peer_port: decision.peer_port,
@@ -341,129 +347,14 @@ impl ControlLoop {
                         self.persistence
                             .upsert_peer_session(&evaluation.session, "policy-v1")
                             .await?;
-                        let active_ban = ActiveBanRecord {
-                            peer_ip: decision.peer_ip,
-                            peer_port: decision.peer_port,
-                            scope: format!("torrent:{}", torrent.hash),
-                            offence_number: decision.offence_number,
-                            reason: decision.reason_code.clone(),
-                            created_at: observed_at,
-                            expires_at: observed_at + decision.ttl,
-                            reconciled_at: None,
-                        };
-                        if let Err(error) = self
-                            .qbittorrent
-                            .apply_peer_ban(&active_ban, &active_before)
-                            .await
-                        {
-                            self.metrics.record_ban_failure();
-                            warn!(
-                                torrent_hash = %torrent.hash,
-                                torrent_name = %torrent.name,
-                                torrent_tracker = %torrent_tracker,
-                                peer_ip = %decision.peer_ip,
-                                peer_port = decision.peer_port,
-                                offence_number = decision.offence_number,
-                                observed_at = %observed_at_rfc3339,
-                                bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                                ban_score = evaluation.session.ban_score,
-                                ban_score_above_threshold_seconds = evaluation
-                                    .session
-                                    .ban_score_above_threshold_duration
-                                    .as_secs(),
-                                sample_score_risk = evaluation.sample_score_risk,
-                                progress_delta = evaluation.progress_delta,
-                                average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                                selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                reason_code = %decision.reason_code,
-                                reason_details = %decision.reason_details,
-                                error = ?error,
-                                "peer ban application failed"
-                            );
-                            pending_intent.last_error = error.to_string();
-                            self.persistence
-                                .upsert_pending_ban_intent(&pending_intent)
-                                .await?;
-                            return Err(error);
-                        }
-                        let stored = match self
-                            .persistence
-                            .record_ban_enforcement(&evaluation, &decision, observed_at)
-                            .await
-                        {
-                            Ok(stored) => stored,
-                            Err(error) => {
-                                self.metrics.record_ban_failure();
-                                warn!(
-                                    torrent_hash = %torrent.hash,
-                                    torrent_name = %torrent.name,
-                                    torrent_tracker = %torrent_tracker,
-                                    peer_ip = %decision.peer_ip,
-                                    peer_port = decision.peer_port,
-                                    offence_number = decision.offence_number,
-                                    observed_at = %observed_at_rfc3339,
-                                    bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                                    ban_score = evaluation.session.ban_score,
-                                    ban_score_above_threshold_seconds = evaluation
-                                        .session
-                                        .ban_score_above_threshold_duration
-                                        .as_secs(),
-                                    sample_score_risk = evaluation.sample_score_risk,
-                                    progress_delta = evaluation.progress_delta,
-                                    average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                                    selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                    reason_code = %decision.reason_code,
-                                    reason_details = %decision.reason_details,
-                                    error = ?error,
-                                    "peer ban persistence failed"
-                                );
-                                pending_intent.last_error = error.to_string();
-                                self.persistence
-                                    .upsert_pending_ban_intent(&pending_intent)
-                                    .await?;
-                                return Err(error);
-                            }
-                        };
-                        self.persistence
-                            .delete_pending_ban_intent(
-                                &torrent.hash,
-                                decision.peer_ip,
-                                decision.peer_port,
-                                decision.offence_number,
-                            )
-                            .await?;
-                        if let Some(active_ban) = stored.active_ban {
-                            active_bans.push(active_ban);
-                        }
-                        if !stored.duplicate_suppressed {
-                            ban_count += 1;
-                            self.metrics.record_ban_applied(
-                                evaluation.session.bad_duration,
-                                &decision.reason_code,
-                            );
-                            warn!(
-                                torrent_hash = %torrent.hash,
-                                torrent_name = %torrent.name,
-                                torrent_tracker = %torrent_tracker,
-                                peer_ip = %decision.peer_ip,
-                                peer_port = decision.peer_port,
-                                offence_number = decision.offence_number,
-                                observed_at = %observed_at_rfc3339,
-                                bad_time_seconds = evaluation.session.bad_duration.as_secs(),
-                                ban_score = evaluation.session.ban_score,
-                                ban_score_above_threshold_seconds = evaluation
-                                    .session
-                                    .ban_score_above_threshold_duration
-                                    .as_secs(),
-                                sample_score_risk = evaluation.sample_score_risk,
-                                progress_delta = evaluation.progress_delta,
-                                average_upload_rate_bps = evaluation.session.rolling_avg_up_rate_bps,
-                                selected_ban_ttl_seconds = decision.ttl.as_secs(),
-                                reason_code = %decision.reason_code,
-                                reason_details = %decision.reason_details,
-                                "peer ban applied"
-                            );
-                        }
+                        pending_ban_actions.push(PendingBanAction {
+                            torrent_hash: torrent.hash.clone(),
+                            torrent_name: torrent.name.clone(),
+                            torrent_tracker: torrent_tracker.clone(),
+                            decision,
+                            evaluation,
+                            pending_intent,
+                        });
                     }
                     BanDisposition::Exempt(reason) => {
                         self.metrics.record_policy_exemption_decision();
@@ -576,6 +467,14 @@ impl ControlLoop {
             }
         }
 
+        let ban_count = self
+            .enforce_pending_bans(
+                &pending_ban_actions,
+                &mut active_bans,
+                observed_at,
+                &observed_at_rfc3339,
+            )
+            .await?;
         self.refresh_gauges().await?;
 
         Ok(PollCycleResult {
@@ -583,6 +482,164 @@ impl ControlLoop {
             peer_count,
             ban_count,
         })
+    }
+
+    async fn enforce_pending_bans(
+        &self,
+        actions: &[PendingBanAction],
+        active_bans: &mut Vec<ActiveBanRecord>,
+        observed_at: std::time::SystemTime,
+        observed_at_rfc3339: &str,
+    ) -> Result<usize> {
+        if actions.is_empty() {
+            return Ok(0);
+        }
+
+        let active_before = active_bans
+            .iter()
+            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > observed_at)
+            .cloned()
+            .collect::<Vec<_>>();
+        let requested_bans = actions
+            .iter()
+            .map(|action| ActiveBanRecord {
+                peer_ip: action.decision.peer_ip,
+                peer_port: action.decision.peer_port,
+                scope: format!("torrent:{}", action.torrent_hash),
+                offence_number: action.decision.offence_number,
+                reason: action.decision.reason_code.clone(),
+                created_at: observed_at,
+                expires_at: observed_at + action.decision.ttl,
+                reconciled_at: None,
+            })
+            .collect::<Vec<_>>();
+
+        if let Err(error) = self
+            .qbittorrent
+            .apply_peer_bans(&requested_bans, &active_before)
+            .await
+        {
+            for action in actions {
+                self.metrics.record_ban_failure();
+                warn!(
+                    torrent_hash = %action.torrent_hash,
+                    torrent_name = %action.torrent_name,
+                    torrent_tracker = %action.torrent_tracker,
+                    peer_ip = %action.decision.peer_ip,
+                    peer_port = action.decision.peer_port,
+                    offence_number = action.decision.offence_number,
+                    observed_at = observed_at_rfc3339,
+                    bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
+                    ban_score = action.evaluation.session.ban_score,
+                    ban_score_above_threshold_seconds = action
+                        .evaluation
+                        .session
+                        .ban_score_above_threshold_duration
+                        .as_secs(),
+                    sample_score_risk = action.evaluation.sample_score_risk,
+                    progress_delta = action.evaluation.progress_delta,
+                    average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
+                    selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
+                    reason_code = %action.decision.reason_code,
+                    reason_details = %action.decision.reason_details,
+                    error = ?error,
+                    "peer ban application failed"
+                );
+                let mut failed_intent = action.pending_intent.clone();
+                failed_intent.last_error = error.to_string();
+                self.persistence
+                    .upsert_pending_ban_intent(&failed_intent)
+                    .await?;
+            }
+            return Err(error);
+        }
+
+        let mut ban_count = 0;
+        for action in actions {
+            let stored = match self
+                .persistence
+                .record_ban_enforcement(&action.evaluation, &action.decision, observed_at)
+                .await
+            {
+                Ok(stored) => stored,
+                Err(error) => {
+                    self.metrics.record_ban_failure();
+                    warn!(
+                        torrent_hash = %action.torrent_hash,
+                        torrent_name = %action.torrent_name,
+                        torrent_tracker = %action.torrent_tracker,
+                        peer_ip = %action.decision.peer_ip,
+                        peer_port = action.decision.peer_port,
+                        offence_number = action.decision.offence_number,
+                        observed_at = observed_at_rfc3339,
+                        bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
+                        ban_score = action.evaluation.session.ban_score,
+                        ban_score_above_threshold_seconds = action
+                            .evaluation
+                            .session
+                            .ban_score_above_threshold_duration
+                            .as_secs(),
+                        sample_score_risk = action.evaluation.sample_score_risk,
+                        progress_delta = action.evaluation.progress_delta,
+                        average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
+                        selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
+                        reason_code = %action.decision.reason_code,
+                        reason_details = %action.decision.reason_details,
+                        error = ?error,
+                        "peer ban persistence failed"
+                    );
+                    let mut failed_intent = action.pending_intent.clone();
+                    failed_intent.last_error = error.to_string();
+                    self.persistence
+                        .upsert_pending_ban_intent(&failed_intent)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            self.persistence
+                .delete_pending_ban_intent(
+                    &action.torrent_hash,
+                    action.decision.peer_ip,
+                    action.decision.peer_port,
+                    action.decision.offence_number,
+                )
+                .await?;
+            if let Some(active_ban) = stored.active_ban {
+                active_bans.push(active_ban);
+            }
+            if !stored.duplicate_suppressed {
+                ban_count += 1;
+                self.metrics.record_ban_applied(
+                    action.evaluation.session.bad_duration,
+                    &action.decision.reason_code,
+                );
+                warn!(
+                    torrent_hash = %action.torrent_hash,
+                    torrent_name = %action.torrent_name,
+                    torrent_tracker = %action.torrent_tracker,
+                    peer_ip = %action.decision.peer_ip,
+                    peer_port = action.decision.peer_port,
+                    offence_number = action.decision.offence_number,
+                    observed_at = observed_at_rfc3339,
+                    bad_time_seconds = action.evaluation.session.bad_duration.as_secs(),
+                    ban_score = action.evaluation.session.ban_score,
+                    ban_score_above_threshold_seconds = action
+                        .evaluation
+                        .session
+                        .ban_score_above_threshold_duration
+                        .as_secs(),
+                    sample_score_risk = action.evaluation.sample_score_risk,
+                    progress_delta = action.evaluation.progress_delta,
+                    average_upload_rate_bps = action.evaluation.session.rolling_avg_up_rate_bps,
+                    selected_ban_ttl_seconds = action.decision.ttl.as_secs(),
+                    reason_code = %action.decision.reason_code,
+                    reason_details = %action.decision.reason_details,
+                    "peer ban applied"
+                );
+            }
+        }
+
+        Ok(ban_count)
     }
 
     async fn run_poll_cycle_with_retry(&mut self) -> Result<PollCycleResult> {
@@ -616,7 +673,11 @@ impl ControlLoop {
                         return Err(error);
                     }
 
-                    let delay = RETRY_BACKOFF_BASE * (1_u32 << attempt);
+                    let delay = jittered_exponential_backoff(
+                        RETRY_BACKOFF_BASE,
+                        attempt as u32,
+                        RETRY_BACKOFF_MAX,
+                    );
                     warn!(
                         attempt = attempt + 1,
                         max_retries = MAX_CYCLE_RETRIES,
@@ -688,6 +749,7 @@ impl ControlLoop {
         let mut stale_dropped = 0;
         let mut failed = 0;
 
+        let mut shutdown = self.shutdown.clone();
         for intent in pending_ban_intents {
             if intent.ban_expires_at <= recovered_at {
                 self.persistence
@@ -721,7 +783,11 @@ impl ControlLoop {
                         break;
                     }
                     Err(error) if attempt + 1 < MAX_PENDING_REPLAY_RETRIES => {
-                        let delay = PENDING_REPLAY_BACKOFF_BASE * (1_u32 << attempt);
+                        let delay = jittered_exponential_backoff(
+                            PENDING_REPLAY_BACKOFF_BASE,
+                            attempt as u32,
+                            PENDING_REPLAY_BACKOFF_MAX,
+                        );
                         warn!(
                             torrent_hash = %intent.torrent_hash,
                             peer_ip = %intent.peer_ip,
@@ -733,7 +799,12 @@ impl ControlLoop {
                             error = ?error,
                             "pending ban replay failed; retrying"
                         );
-                        time::sleep(delay).await;
+                        tokio::select! {
+                            _ = time::sleep(delay) => {}
+                            _ = wait_for_shutdown_signal(&mut shutdown) => {
+                                return Ok((replayed, stale_dropped, failed));
+                            }
+                        }
                         attempt += 1;
                     }
                     Err(error) => {
@@ -963,10 +1034,11 @@ impl ControlLoop {
 }
 
 fn startup_retry_backoff(attempt: u32) -> Duration {
-    let shift = attempt.min(6);
-    let multiplier = 1_u32 << shift;
-    let delay = STARTUP_RETRY_BACKOFF_BASE * multiplier;
-    delay.min(STARTUP_RETRY_BACKOFF_MAX)
+    jittered_exponential_backoff(
+        STARTUP_RETRY_BACKOFF_BASE,
+        attempt.min(6),
+        STARTUP_RETRY_BACKOFF_MAX,
+    )
 }
 
 async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
@@ -1521,11 +1593,7 @@ mod tests {
         control.recover_startup_state().await.unwrap();
         let pending = persistence.load_pending_ban_intents().await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert!(
-            pending[0]
-                .last_error
-                .contains("failed to apply qbittorrent peer ban")
-        );
+        assert!(pending[0].last_error.contains("failed to apply"));
 
         server.await.unwrap();
     }
@@ -2144,11 +2212,7 @@ mod tests {
         );
 
         let error = control.run_poll_cycle().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to apply qbittorrent peer ban")
-        );
+        assert!(error.to_string().contains("failed to apply"));
         let pending = persistence.load_pending_ban_intents().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].torrent_hash, "abc123");
@@ -2158,11 +2222,7 @@ mod tests {
         );
         assert_eq!(pending[0].peer_port, 51413);
         assert_eq!(pending[0].offence_number, 1);
-        assert!(
-            pending[0]
-                .last_error
-                .contains("failed to apply qbittorrent peer ban")
-        );
+        assert!(pending[0].last_error.contains("failed to apply"));
         let persisted_session = persistence
             .get_peer_session(&PeerObservationId {
                 torrent_hash: "abc123".to_string(),
