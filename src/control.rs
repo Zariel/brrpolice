@@ -1022,6 +1022,7 @@ impl ControlLoop {
             return;
         }
         self.last_retention_prune_at = Some(now);
+        let started = std::time::Instant::now();
 
         match self
             .persistence
@@ -1029,7 +1030,17 @@ impl ControlLoop {
             .await
         {
             Ok(pruned) => {
-                debug!(
+                let duration = started.elapsed();
+                self.metrics.record_prune_success(
+                    duration,
+                    pruned.peer_sessions_deleted,
+                    pruned.peer_offences_deleted,
+                    pruned.active_bans_deleted,
+                    pruned.pending_ban_intents_deleted,
+                    pruned.incremental_vacuum_pages,
+                );
+                info!(
+                    prune_duration_ms = duration.as_millis(),
                     peer_sessions_deleted = pruned.peer_sessions_deleted,
                     peer_offences_deleted = pruned.peer_offences_deleted,
                     active_bans_deleted = pruned.active_bans_deleted,
@@ -1039,6 +1050,7 @@ impl ControlLoop {
                 );
             }
             Err(error) => {
+                self.metrics.record_prune_failure(started.elapsed());
                 warn!(?error, "retention prune failed");
             }
         }

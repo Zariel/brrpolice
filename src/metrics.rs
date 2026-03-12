@@ -27,6 +27,13 @@ pub struct AppMetrics {
     policy_reban_cooldown_decisions_total: Counter,
     policy_duplicate_suppressed_decisions_total: Counter,
     score_policy_bans_applied_total: Counter,
+    prune_runs_total: Counter,
+    prune_failures_total: Counter,
+    pruned_peer_sessions_total: Counter,
+    pruned_peer_offences_total: Counter,
+    pruned_active_bans_total: Counter,
+    pruned_pending_ban_intents_total: Counter,
+    pruned_vacuum_pages_total: Counter,
     bans_applied_total: Counter,
     bans_expired_total: Counter,
     ban_failures_total: Counter,
@@ -43,6 +50,7 @@ pub struct AppMetrics {
     score_value: Histogram,
     score_sample_risk: Histogram,
     score_above_threshold_seconds: Histogram,
+    prune_duration_seconds: Histogram,
 }
 
 impl AppMetrics {
@@ -117,6 +125,55 @@ impl AppMetrics {
             "brrpolice_score_policy_bans_applied",
             "Total bans applied with score-based reason code.",
             score_policy_bans_applied_total.clone(),
+        );
+
+        let prune_runs_total = Counter::default();
+        registry.register(
+            "brrpolice_prune_runs",
+            "Total retention prune runs attempted.",
+            prune_runs_total.clone(),
+        );
+
+        let prune_failures_total = Counter::default();
+        registry.register(
+            "brrpolice_prune_failures",
+            "Total retention prune runs that failed.",
+            prune_failures_total.clone(),
+        );
+
+        let pruned_peer_sessions_total = Counter::default();
+        registry.register(
+            "brrpolice_pruned_peer_sessions",
+            "Total peer_sessions rows deleted by retention pruning.",
+            pruned_peer_sessions_total.clone(),
+        );
+
+        let pruned_peer_offences_total = Counter::default();
+        registry.register(
+            "brrpolice_pruned_peer_offences",
+            "Total peer_offences rows deleted by retention pruning.",
+            pruned_peer_offences_total.clone(),
+        );
+
+        let pruned_active_bans_total = Counter::default();
+        registry.register(
+            "brrpolice_pruned_active_bans",
+            "Total active_bans rows deleted by retention pruning.",
+            pruned_active_bans_total.clone(),
+        );
+
+        let pruned_pending_ban_intents_total = Counter::default();
+        registry.register(
+            "brrpolice_pruned_pending_ban_intents",
+            "Total pending_ban_intents rows deleted by retention pruning.",
+            pruned_pending_ban_intents_total.clone(),
+        );
+
+        let pruned_vacuum_pages_total = Counter::default();
+        registry.register(
+            "brrpolice_pruned_vacuum_pages",
+            "Total SQLite pages requested via incremental vacuum during retention pruning.",
+            pruned_vacuum_pages_total.clone(),
         );
 
         let bans_applied_total = Counter::default();
@@ -232,6 +289,13 @@ impl AppMetrics {
             score_above_threshold_seconds.clone(),
         );
 
+        let prune_duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 12));
+        registry.register(
+            "brrpolice_prune_duration_seconds",
+            "Duration of retention prune runs.",
+            prune_duration_seconds.clone(),
+        );
+
         Self {
             registry: Arc::new(registry),
             peers_evaluated_total,
@@ -244,6 +308,13 @@ impl AppMetrics {
             policy_reban_cooldown_decisions_total,
             policy_duplicate_suppressed_decisions_total,
             score_policy_bans_applied_total,
+            prune_runs_total,
+            prune_failures_total,
+            pruned_peer_sessions_total,
+            pruned_peer_offences_total,
+            pruned_active_bans_total,
+            pruned_pending_ban_intents_total,
+            pruned_vacuum_pages_total,
             bans_applied_total,
             bans_expired_total,
             ban_failures_total,
@@ -260,6 +331,7 @@ impl AppMetrics {
             score_value,
             score_sample_risk,
             score_above_threshold_seconds,
+            prune_duration_seconds,
         }
     }
 
@@ -348,6 +420,35 @@ impl AppMetrics {
     pub fn record_poll_loop_duration(&self, duration: Duration) {
         self.poll_loop_duration_seconds
             .observe(duration.as_secs_f64());
+    }
+
+    pub fn record_prune_success(
+        &self,
+        duration: Duration,
+        peer_sessions_deleted: u64,
+        peer_offences_deleted: u64,
+        active_bans_deleted: u64,
+        pending_ban_intents_deleted: u64,
+        incremental_vacuum_pages: Option<u32>,
+    ) {
+        self.prune_runs_total.inc();
+        self.prune_duration_seconds.observe(duration.as_secs_f64());
+        self.pruned_peer_sessions_total
+            .inc_by(peer_sessions_deleted);
+        self.pruned_peer_offences_total
+            .inc_by(peer_offences_deleted);
+        self.pruned_active_bans_total.inc_by(active_bans_deleted);
+        self.pruned_pending_ban_intents_total
+            .inc_by(pending_ban_intents_deleted);
+        if let Some(pages) = incremental_vacuum_pages {
+            self.pruned_vacuum_pages_total.inc_by(u64::from(pages));
+        }
+    }
+
+    pub fn record_prune_failure(&self, duration: Duration) {
+        self.prune_runs_total.inc();
+        self.prune_failures_total.inc();
+        self.prune_duration_seconds.observe(duration.as_secs_f64());
     }
 
     pub fn mark_successful_poll(&self, completed_at: SystemTime) {
