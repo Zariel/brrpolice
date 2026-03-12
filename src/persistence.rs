@@ -18,7 +18,7 @@ use sqlx::{
 use tracing::info;
 
 use crate::{
-    config::DatabaseConfig,
+    config::{DatabaseConfig, RetentionConfig, VacuumMode},
     types::{
         BanDecision, ExemptionReason, OffenceIdentity, PeerEvaluation, PeerObservationId,
         PeerSessionState,
@@ -94,6 +94,15 @@ pub struct RecoverySnapshot {
     pub peer_sessions: Vec<PeerSessionState>,
     pub active_bans: Vec<ActiveBanRecord>,
     pub pending_ban_intents: Vec<PendingBanIntentRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionPruneResult {
+    pub peer_sessions_deleted: u64,
+    pub peer_offences_deleted: u64,
+    pub active_bans_deleted: u64,
+    pub pending_ban_intents_deleted: u64,
+    pub incremental_vacuum_pages: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -635,6 +644,146 @@ impl Persistence {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn run_retention_prune(
+        &self,
+        retention: &RetentionConfig,
+        now: SystemTime,
+    ) -> Result<RetentionPruneResult> {
+        if !retention.enabled {
+            return Ok(RetentionPruneResult::default());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let peer_session_cutoff = format_system_time(now - retention.peer_session_max_age);
+        let peer_offence_cutoff = format_system_time(now - retention.peer_offence_max_age);
+        let reconciled_ban_cutoff = format_system_time(now - retention.reconciled_ban_max_age);
+        let pending_intent_cutoff = format_system_time(now - retention.pending_intent_max_age);
+        let now_formatted = format_system_time(now);
+        let row_limit = i64::from(retention.max_rows_per_run);
+
+        let peer_sessions_deleted = sqlx::query(
+            r#"
+            DELETE FROM peer_sessions
+            WHERE rowid IN (
+                SELECT ps.rowid
+                FROM peer_sessions ps
+                WHERE ps.last_seen_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM active_bans ab
+                        WHERE ab.reconciled_at IS NULL
+                            AND ab.scope = ('torrent:' || ps.torrent_hash)
+                            AND ab.peer_ip = ps.peer_ip
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM pending_ban_intents pbi
+                        WHERE pbi.torrent_hash = ps.torrent_hash
+                            AND pbi.peer_ip = ps.peer_ip
+                            AND pbi.peer_port = ps.peer_port
+                    )
+                ORDER BY ps.last_seen_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(peer_session_cutoff)
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let peer_offences_deleted = sqlx::query(
+            r#"
+            DELETE FROM peer_offences
+            WHERE rowid IN (
+                SELECT po.rowid
+                FROM peer_offences po
+                WHERE po.banned_at <= ?
+                    AND (
+                        (po.ban_revoked_at IS NOT NULL AND po.ban_revoked_at <= ?)
+                        OR (po.ban_revoked_at IS NULL AND po.ban_expires_at <= ?)
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM active_bans ab
+                        WHERE ab.reconciled_at IS NULL
+                            AND ab.scope = ('torrent:' || po.torrent_hash)
+                            AND ab.peer_ip = po.peer_ip
+                    )
+                ORDER BY po.banned_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(peer_offence_cutoff.clone())
+        .bind(peer_offence_cutoff)
+        .bind(now_formatted.clone())
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let active_bans_deleted = sqlx::query(
+            r#"
+            DELETE FROM active_bans
+            WHERE rowid IN (
+                SELECT ab.rowid
+                FROM active_bans ab
+                WHERE ab.reconciled_at IS NOT NULL
+                    AND ab.reconciled_at <= ?
+                ORDER BY ab.reconciled_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(reconciled_ban_cutoff)
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let pending_ban_intents_deleted = sqlx::query(
+            r#"
+            DELETE FROM pending_ban_intents
+            WHERE rowid IN (
+                SELECT pbi.rowid
+                FROM pending_ban_intents pbi
+                WHERE pbi.observed_at <= ?
+                    AND pbi.ban_expires_at <= ?
+                ORDER BY pbi.observed_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(pending_intent_cutoff)
+        .bind(now_formatted)
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let incremental_vacuum_pages = match retention.vacuum.mode {
+            VacuumMode::Off => None,
+            VacuumMode::Incremental => {
+                let pages = retention.vacuum.incremental_pages;
+                let statement = format!("PRAGMA incremental_vacuum({pages})");
+                sqlx::query(&statement).execute(&mut *tx).await?;
+                Some(pages)
+            }
+        };
+
+        tx.commit().await?;
+
+        Ok(RetentionPruneResult {
+            peer_sessions_deleted,
+            peer_offences_deleted,
+            active_bans_deleted,
+            pending_ban_intents_deleted,
+            incremental_vacuum_pages,
+        })
     }
 }
 
@@ -1291,9 +1440,10 @@ mod tests {
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
         PeerOffenceRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot,
+        RetentionPruneResult,
     };
     use crate::{
-        config::DatabaseConfig,
+        config::{DatabaseConfig, RetentionConfig, VacuumConfig, VacuumMode},
         types::{
             BanDecision, ExemptionReason, OffenceHistory, OffenceIdentity, PeerEvaluation,
             PeerObservationId, PeerSessionState,
@@ -1869,6 +2019,245 @@ mod tests {
         let error = persistence.run_migrations().await.unwrap_err();
         assert!(error.to_string().contains("failed to run sqlx migrations"));
         assert!(!persistence.is_ready().await);
+    }
+
+    #[tokio::test]
+    async fn retention_prune_deletes_only_safe_stale_rows() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_000_000);
+
+        let mut stale_deletable_session = sample_peer_session();
+        stale_deletable_session.observation_id.torrent_hash = "deletable-session".to_string();
+        stale_deletable_session.offence_identity.torrent_hash = "deletable-session".to_string();
+        stale_deletable_session.observation_id.peer_ip = "10.0.0.11".parse().unwrap();
+        stale_deletable_session.offence_identity.peer_ip =
+            stale_deletable_session.observation_id.peer_ip;
+        stale_deletable_session.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_session(&stale_deletable_session, "policy-v1")
+            .await
+            .unwrap();
+
+        let mut stale_session_with_pending_intent = sample_peer_session();
+        stale_session_with_pending_intent.observation_id.peer_port = 51414;
+        stale_session_with_pending_intent.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_session(&stale_session_with_pending_intent, "policy-v1")
+            .await
+            .unwrap();
+
+        let pending_for_stale_session = PendingBanIntentRecord {
+            torrent_hash: stale_session_with_pending_intent
+                .observation_id
+                .torrent_hash
+                .clone(),
+            peer_ip: stale_session_with_pending_intent.observation_id.peer_ip,
+            peer_port: stale_session_with_pending_intent.observation_id.peer_port,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_at: now - Duration::from_secs(3 * 24 * 3600),
+            ban_expires_at: now + Duration::from_secs(3600),
+            bad_duration: Duration::from_secs(300),
+            progress_delta_per_mille: 1,
+            avg_up_rate_bps: 0,
+            last_error: "retry".to_string(),
+        };
+        persistence
+            .upsert_pending_ban_intent(&pending_for_stale_session)
+            .await
+            .unwrap();
+
+        let active_unreconciled_ban = ActiveBanRecord {
+            peer_ip: stale_session_with_pending_intent.observation_id.peer_ip,
+            peer_port: stale_session_with_pending_intent.observation_id.peer_port,
+            scope: format!(
+                "torrent:{}",
+                stale_session_with_pending_intent
+                    .observation_id
+                    .torrent_hash
+            ),
+            offence_number: 1,
+            reason: "score_based".to_string(),
+            created_at: now - Duration::from_secs(3600),
+            expires_at: now + Duration::from_secs(3600),
+            reconciled_at: None,
+        };
+        persistence
+            .upsert_active_ban(&active_unreconciled_ban)
+            .await
+            .unwrap();
+
+        let stale_reconciled_ban = ActiveBanRecord {
+            peer_ip: "10.0.0.99".parse().unwrap(),
+            peer_port: 40000,
+            scope: "torrent:stale".to_string(),
+            offence_number: 1,
+            reason: "score_based".to_string(),
+            created_at: now - Duration::from_secs(40 * 24 * 3600),
+            expires_at: now - Duration::from_secs(39 * 24 * 3600),
+            reconciled_at: Some(now - Duration::from_secs(35 * 24 * 3600)),
+        };
+        persistence
+            .upsert_active_ban(&stale_reconciled_ban)
+            .await
+            .unwrap();
+
+        let stale_deletable_offence = PeerOffenceRecord {
+            id: None,
+            torrent_hash: "old".to_string(),
+            peer_ip: "10.0.0.50".parse().unwrap(),
+            peer_port: 12345,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(600),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            banned_at: now - Duration::from_secs(120 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(119 * 24 * 3600),
+            ban_revoked_at: Some(now - Duration::from_secs(118 * 24 * 3600)),
+        };
+        persistence
+            .insert_peer_offence(&stale_deletable_offence)
+            .await
+            .unwrap();
+
+        let offence_protected_by_active_ban = PeerOffenceRecord {
+            id: None,
+            torrent_hash: stale_session_with_pending_intent
+                .observation_id
+                .torrent_hash
+                .clone(),
+            peer_ip: stale_session_with_pending_intent.observation_id.peer_ip,
+            peer_port: stale_session_with_pending_intent.observation_id.peer_port,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_duration: Duration::from_secs(600),
+            bad_duration: Duration::from_secs(600),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            banned_at: now - Duration::from_secs(120 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(119 * 24 * 3600),
+            ban_revoked_at: Some(now - Duration::from_secs(118 * 24 * 3600)),
+        };
+        persistence
+            .insert_peer_offence(&offence_protected_by_active_ban)
+            .await
+            .unwrap();
+
+        let stale_deletable_pending_intent = PendingBanIntentRecord {
+            torrent_hash: "stale-intent".to_string(),
+            peer_ip: "10.0.0.70".parse().unwrap(),
+            peer_port: 51413,
+            offence_number: 1,
+            reason_code: "score_based".to_string(),
+            observed_at: now - Duration::from_secs(3 * 24 * 3600),
+            ban_expires_at: now - Duration::from_secs(2 * 24 * 3600),
+            bad_duration: Duration::from_secs(300),
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: 0,
+            last_error: "stale".to_string(),
+        };
+        persistence
+            .upsert_pending_ban_intent(&stale_deletable_pending_intent)
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        let result = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            RetentionPruneResult {
+                peer_sessions_deleted: 1,
+                peer_offences_deleted: 1,
+                active_bans_deleted: 1,
+                pending_ban_intents_deleted: 1,
+                incremental_vacuum_pages: None,
+            }
+        );
+
+        assert!(
+            persistence
+                .get_peer_session(&stale_deletable_session.observation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            persistence
+                .get_peer_session(&stale_session_with_pending_intent.observation_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(persistence.load_active_bans().await.unwrap().len(), 1);
+        assert_eq!(
+            persistence
+                .load_peer_offences_by_ip(offence_protected_by_active_ban.peer_ip)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            persistence.load_pending_ban_intents().await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prune_respects_row_limits() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_000_000);
+
+        for index in 0..3_u16 {
+            let mut session = sample_peer_session();
+            session.observation_id.peer_port = 52000 + index;
+            session.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+            persistence
+                .upsert_peer_session(&session, "policy-v1")
+                .await
+                .unwrap();
+        }
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 2,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        let result = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+        assert_eq!(result.peer_sessions_deleted, 2);
+        assert_eq!(persistence.count_peer_sessions().await.unwrap(), 1);
     }
 
     async fn test_persistence() -> Persistence {
