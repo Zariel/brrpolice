@@ -49,6 +49,7 @@ COPY --from=builder /workspace/migrations /app/migrations
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 ENV BRRPOLICE_DATABASE__PATH=/data/brrpolice.sqlite
+ENV BRRPOLICE_HTTP__HOST=0.0.0.0
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 9090
