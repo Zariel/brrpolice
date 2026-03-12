@@ -17,6 +17,7 @@
 - Peer state, offence history, and active bans are stored in SQLite.
 - Ban duration increases by offence count using a configurable ban ladder.
 - Expired bans are reconciled so qBittorrent and the database stay consistent.
+- Policy logic overview: [`docs/policy-engine.md`](docs/policy-engine.md).
 
 ## Requirements
 
