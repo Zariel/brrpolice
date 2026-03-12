@@ -2252,6 +2252,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: Duration::from_secs(15),
                 request_timeout: Duration::from_secs(10),
+                pool_idle_timeout: Duration::from_secs(5),
                 transient_retries: 10,
             },
             policy: PolicyConfig {

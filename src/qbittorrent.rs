@@ -63,6 +63,7 @@ impl QbittorrentClient {
         let client = Client::builder()
             .cookie_store(true)
             .timeout(timeout)
+            .pool_idle_timeout(config.pool_idle_timeout)
             .build()?;
 
         Ok(Self {
@@ -1226,6 +1227,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
+                pool_idle_timeout: std::time::Duration::from_secs(5),
                 transient_retries: 10,
             },
             "secret".to_string(),
@@ -1797,6 +1799,7 @@ mod tests {
                 password_env: String::new(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(5),
+                pool_idle_timeout: std::time::Duration::from_secs(5),
                 transient_retries: 10,
             },
             String::new(),
@@ -1816,6 +1819,7 @@ mod tests {
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
+                pool_idle_timeout: std::time::Duration::from_secs(5),
                 transient_retries: 10,
             },
             "secret".to_string(),
