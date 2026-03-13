@@ -200,7 +200,8 @@ impl PolicyEngine {
                 .unwrap_or_default();
             let observed_duration = session.observed_duration;
             let progress_delta = (peer.peer.progress - session.baseline_progress).max(0.0);
-            let required_progress_delta = self.required_progress_delta(observed_duration);
+            let required_progress_delta =
+                self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
             let exemption = session.last_exemption_reason.clone();
             let is_bad_sample = exemption.is_none()
                 && peer.peer.up_rate_bps < self.config.score.target_rate_bps
@@ -211,7 +212,11 @@ impl PolicyEngine {
             let sample_score_risk = if exemption.is_some() {
                 0.0
             } else {
-                self.sample_score_risk(peer.peer.up_rate_bps, progress_delta)
+                self.sample_score_risk(
+                    peer.peer.up_rate_bps,
+                    progress_delta,
+                    required_progress_delta,
+                )
             };
             if exemption.is_some() {
                 session.ban_score_above_threshold_duration = Duration::ZERO;
@@ -255,7 +260,8 @@ impl PolicyEngine {
             sample_duration,
         );
         let progress_delta = (peer.peer.progress - baseline_progress).max(0.0);
-        let required_progress_delta = self.required_progress_delta(observed_duration);
+        let required_progress_delta =
+            self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
         let exemption = self.classify_exemption(peer);
         let is_bad_sample = exemption.is_none()
             && peer.peer.up_rate_bps < self.config.score.target_rate_bps
@@ -269,7 +275,11 @@ impl PolicyEngine {
         let mut ban_score = self.decay_score(previous.ban_score, sample_duration);
         let mut ban_score_above_threshold_duration = previous.ban_score_above_threshold_duration;
         let sample_score_risk = if exemption.is_none() {
-            self.sample_score_risk(peer.peer.up_rate_bps, progress_delta)
+            self.sample_score_risk(
+                peer.peer.up_rate_bps,
+                progress_delta,
+                required_progress_delta,
+            )
         } else {
             0.0
         };
@@ -380,8 +390,10 @@ impl PolicyEngine {
 
         let offence_number = history.offence_count + 1;
         let reason_code = SCORE_BASED_REASON_CODE.to_string();
-        let required_progress_delta =
-            self.required_progress_delta(evaluation.session.observed_duration);
+        let required_progress_delta = self.required_progress_delta(
+            evaluation.session.observed_duration,
+            evaluation.session.rolling_avg_up_rate_bps,
+        );
         let rate_risk = normalized_rate_risk(
             evaluation.sample_up_rate_bps,
             self.config.score.target_rate_bps,
@@ -545,19 +557,42 @@ impl PolicyEngine {
         (reconnect_count, window_started_at, penalty)
     }
 
-    fn required_progress_delta(&self, observed_duration: Duration) -> f64 {
+    fn required_progress_delta(&self, observed_duration: Duration, up_rate_bps: u64) -> f64 {
         if observed_duration.is_zero() || self.config.score.required_progress_delta <= 0.0 {
             return 0.0;
         }
 
         let sustain_secs = self.config.score.sustain_duration.as_secs_f64();
         if sustain_secs <= 0.0 {
-            return self.config.score.required_progress_delta;
+            return self.config.score.required_progress_delta
+                * self.progress_rate_scale(up_rate_bps);
         }
 
         let observed_secs = observed_duration.as_secs_f64();
         let ramp = (observed_secs / sustain_secs).clamp(0.0, 1.0);
-        self.config.score.required_progress_delta * ramp
+        self.config.score.required_progress_delta * ramp * self.progress_rate_scale(up_rate_bps)
+    }
+
+    fn progress_rate_scale(&self, up_rate_bps: u64) -> f64 {
+        let target_rate_bps = self.config.score.target_rate_bps;
+        if target_rate_bps == 0 {
+            return 1.0;
+        }
+
+        let ratio = up_rate_bps as f64 / target_rate_bps as f64;
+        let start = self.config.score.progress_rate_scale_start;
+        let end = self.config.score.progress_rate_scale_end;
+        let min_scale = self.config.score.progress_rate_min_scale;
+
+        if ratio <= start {
+            return 1.0;
+        }
+        if ratio >= end || end <= start {
+            return min_scale;
+        }
+
+        let progress = ((ratio - start) / (end - start)).clamp(0.0, 1.0);
+        1.0 - ((1.0 - min_scale) * progress)
     }
 
     fn advance_progress_baseline(
@@ -624,10 +659,14 @@ impl PolicyEngine {
             && score_above_threshold_duration >= self.config.score.sustain_duration
     }
 
-    fn sample_score_risk(&self, up_rate_bps: u64, progress_delta: f64) -> f64 {
+    fn sample_score_risk(
+        &self,
+        up_rate_bps: u64,
+        progress_delta: f64,
+        required_progress_delta: f64,
+    ) -> f64 {
         let rate_risk = normalized_rate_risk(up_rate_bps, self.config.score.target_rate_bps);
-        let progress_risk =
-            normalized_progress_risk(progress_delta, self.config.score.required_progress_delta);
+        let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
         let weight_total = self.config.score.weight_rate + self.config.score.weight_progress;
         if weight_total <= 0.0 {
             return 0.0;
@@ -907,6 +946,28 @@ mod tests {
             decay_per_second: 0.0,
         };
         score
+    }
+
+    #[test]
+    fn progress_rate_scale_relaxes_required_progress_for_high_rate_peers() {
+        let config = PolicyConfig {
+            score: ScorePolicyConfig {
+                target_rate_bps: 1_000,
+                required_progress_delta: 0.02,
+                progress_rate_scale_start: 2.0,
+                progress_rate_scale_end: 4.0,
+                progress_rate_min_scale: 0.25,
+                ..ScorePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let baseline = engine.required_progress_delta(Duration::from_secs(120), 1_000);
+        let scaled = engine.required_progress_delta(Duration::from_secs(120), 4_000);
+
+        assert_eq!(baseline, 0.02);
+        assert_eq!(scaled, 0.005);
     }
 
     #[test]
@@ -1709,5 +1770,42 @@ mod tests {
             BanDisposition::Ban(decision) => assert_eq!(decision.reason_code, "score_based"),
             other => panic!("expected score-based ban, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn score_mode_avoids_progress_only_ban_for_high_rate_peer_when_scaled() {
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            score: ScorePolicyConfig {
+                target_rate_bps: 1_000,
+                required_progress_delta: 0.01,
+                progress_rate_scale_start: 2.0,
+                progress_rate_scale_end: 4.0,
+                progress_rate_min_scale: 0.25,
+                weight_rate: 0.0,
+                weight_progress: 1.0,
+                rate_risk_floor: 0.0,
+                ban_threshold: 0.8,
+                clear_threshold: 0.4,
+                sustain_duration: Duration::from_secs(120),
+                decay_per_second: 0.0,
+                min_observation_duration: Duration::from_secs(120),
+                max_score: 5.0,
+                ..ScorePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let first = engine.evaluate_peer(&seeded_peer(60, 0.10, 4_000), None);
+        let second = engine.evaluate_peer(&seeded_peer(120, 0.104, 4_000), Some(&first.session));
+        let third_peer = seeded_peer(180, 0.108, 4_000);
+        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+
+        assert!(third.sample_score_risk.abs() < f64::EPSILON);
+        assert!(matches!(
+            engine.decide_ban(&third_peer, &third, &empty_history()),
+            BanDisposition::NotBannableYet { .. }
+        ));
     }
 }

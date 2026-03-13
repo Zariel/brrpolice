@@ -483,9 +483,12 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
             .join(",")
     );
     println!(
-        "config: target_rate_bps={} required_progress_delta={:.6} weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_penalty={:.3},decay_per_second={:.6})",
+        "config: target_rate_bps={} required_progress_delta={:.6} progress_rate_scale(start={:.3},end={:.3},min={:.3}) weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_penalty={:.3},decay_per_second={:.6})",
         config.policy.score.target_rate_bps,
         config.policy.score.required_progress_delta,
+        config.policy.score.progress_rate_scale_start,
+        config.policy.score.progress_rate_scale_end,
+        config.policy.score.progress_rate_min_scale,
         config.policy.score.weight_rate,
         config.policy.score.weight_progress,
         config.policy.score.rate_risk_floor,
@@ -567,6 +570,18 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
             "--required-progress-delta" => {
                 config.policy.score.required_progress_delta =
                     parse_f64_arg(&mut iter, "--required-progress-delta")?;
+            }
+            "--progress-rate-scale-start" => {
+                config.policy.score.progress_rate_scale_start =
+                    parse_f64_arg(&mut iter, "--progress-rate-scale-start")?;
+            }
+            "--progress-rate-scale-end" => {
+                config.policy.score.progress_rate_scale_end =
+                    parse_f64_arg(&mut iter, "--progress-rate-scale-end")?;
+            }
+            "--progress-rate-min-scale" => {
+                config.policy.score.progress_rate_min_scale =
+                    parse_f64_arg(&mut iter, "--progress-rate-min-scale")?;
             }
             "--weight-rate" => {
                 config.policy.score.weight_rate = parse_f64_arg(&mut iter, "--weight-rate")?;
@@ -651,6 +666,15 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
     if !(0.0..=1.0).contains(&config.policy.score.required_progress_delta) {
         bail!("--required-progress-delta must be between 0.0 and 1.0");
     }
+    if config.policy.score.progress_rate_scale_start < 1.0 {
+        bail!("--progress-rate-scale-start must be >= 1.0");
+    }
+    if config.policy.score.progress_rate_scale_end < config.policy.score.progress_rate_scale_start {
+        bail!("--progress-rate-scale-end must be >= --progress-rate-scale-start");
+    }
+    if !(0.0..=1.0).contains(&config.policy.score.progress_rate_min_scale) {
+        bail!("--progress-rate-min-scale must be between 0.0 and 1.0");
+    }
     if config.policy.score.weight_rate < 0.0 || config.policy.score.weight_progress < 0.0 {
         bail!("weights must be non-negative");
     }
@@ -707,6 +731,9 @@ fn print_help() {
     println!("Options:");
     println!("  --target-rate-bps <n>            Upload target for rate-risk");
     println!("  --required-progress-delta <f>    Required progress fraction in window");
+    println!("  --progress-rate-scale-start <f>  Rate multiple where progress scaling begins");
+    println!("  --progress-rate-scale-end <f>    Rate multiple where progress scaling reaches min");
+    println!("  --progress-rate-min-scale <f>    Minimum scale applied to required progress");
     println!("  --weight-rate <f>                Weight for rate-risk feature");
     println!("  --weight-progress <f>            Weight for progress-risk feature");
     println!("  --rate-risk-floor <f>            Non-compensatory floor multiplier for rate risk");

@@ -62,6 +62,9 @@ impl AppConfig {
             .set_default("policy.reban_cooldown", "30m")?
             .set_default("policy.score.target_rate_bps", 65_536_u64)?
             .set_default("policy.score.required_progress_delta", 0.02_f64)?
+            .set_default("policy.score.progress_rate_scale_start", 2.0_f64)?
+            .set_default("policy.score.progress_rate_scale_end", 16.0_f64)?
+            .set_default("policy.score.progress_rate_min_scale", 0.25_f64)?
             .set_default("policy.score.weight_rate", 0.35_f64)?
             .set_default("policy.score.weight_progress", 0.65_f64)?
             .set_default("policy.score.rate_risk_floor", 0.4_f64)?
@@ -141,6 +144,9 @@ impl AppConfig {
                 "policy.reban_cooldown={}\n",
                 "policy.score.target_rate_bps={}\n",
                 "policy.score.required_progress_delta={:.6}\n",
+                "policy.score.progress_rate_scale_start={:.6}\n",
+                "policy.score.progress_rate_scale_end={:.6}\n",
+                "policy.score.progress_rate_min_scale={:.6}\n",
                 "policy.score.weight_rate={:.6}\n",
                 "policy.score.weight_progress={:.6}\n",
                 "policy.score.rate_risk_floor={:.6}\n",
@@ -192,6 +198,9 @@ impl AppConfig {
             self.policy.reban_cooldown.as_secs(),
             self.policy.score.target_rate_bps,
             self.policy.score.required_progress_delta,
+            self.policy.score.progress_rate_scale_start,
+            self.policy.score.progress_rate_scale_end,
+            self.policy.score.progress_rate_min_scale,
             self.policy.score.weight_rate,
             self.policy.score.weight_progress,
             self.policy.score.rate_risk_floor,
@@ -307,6 +316,17 @@ impl AppConfig {
         }
         if self.policy.score.required_progress_delta > 1.0 {
             bail!("policy.score.required_progress_delta must be <= 1.0");
+        }
+        if self.policy.score.progress_rate_scale_start < 1.0 {
+            bail!("policy.score.progress_rate_scale_start must be >= 1.0");
+        }
+        if self.policy.score.progress_rate_scale_end < self.policy.score.progress_rate_scale_start {
+            bail!(
+                "policy.score.progress_rate_scale_end must be >= policy.score.progress_rate_scale_start"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.policy.score.progress_rate_min_scale) {
+            bail!("policy.score.progress_rate_min_scale must be between 0.0 and 1.0");
         }
         if self.policy.score.weight_rate < 0.0 || self.policy.score.weight_progress < 0.0 {
             bail!("policy.score weights must be >= 0.0");
@@ -455,6 +475,9 @@ impl Default for PolicyConfig {
 pub struct ScorePolicyConfig {
     pub target_rate_bps: u64,
     pub required_progress_delta: f64,
+    pub progress_rate_scale_start: f64,
+    pub progress_rate_scale_end: f64,
+    pub progress_rate_min_scale: f64,
     pub weight_rate: f64,
     pub weight_progress: f64,
     pub rate_risk_floor: f64,
@@ -475,6 +498,9 @@ impl Default for ScorePolicyConfig {
         Self {
             target_rate_bps: 65_536,
             required_progress_delta: 0.02,
+            progress_rate_scale_start: 2.0,
+            progress_rate_scale_end: 16.0,
+            progress_rate_min_scale: 0.25,
             weight_rate: 0.35,
             weight_progress: 0.65,
             rate_risk_floor: 0.4,
@@ -803,6 +829,9 @@ mod tests {
         assert_eq!(config.retention.vacuum.incremental_pages, 200);
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
         assert!(config.policy.score.churn.enabled);
+        assert_eq!(config.policy.score.progress_rate_scale_start, 2.0);
+        assert_eq!(config.policy.score.progress_rate_scale_end, 16.0);
+        assert_eq!(config.policy.score.progress_rate_min_scale, 0.25);
         assert_eq!(
             config.policy.score.churn.reconnect_window,
             Duration::from_secs(1_800)
@@ -1133,6 +1162,24 @@ min_reconnects = 0
                 .to_string()
                 .contains("policy.score.churn.min_reconnects")
         );
+    }
+
+    #[test]
+    fn rejects_invalid_progress_rate_scaling_configuration() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.score]
+progress_rate_scale_start = 4.0
+progress_rate_scale_end = 2.0
+"#,
+        );
+
+        let err = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains(
+            "policy.score.progress_rate_scale_end must be >= policy.score.progress_rate_scale_start"
+        ));
     }
 
     #[test]
