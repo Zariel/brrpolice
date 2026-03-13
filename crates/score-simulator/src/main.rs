@@ -62,6 +62,7 @@ struct SimulatorConfig {
     inputs: Vec<PathBuf>,
     policy: PolicyConfig,
     peer_ip: Option<IpAddr>,
+    hydrate_logged_score_state: bool,
 }
 
 impl Default for SimulatorConfig {
@@ -71,6 +72,7 @@ impl Default for SimulatorConfig {
             inputs: Vec::new(),
             policy,
             peer_ip: None,
+            hydrate_logged_score_state: true,
         }
     }
 }
@@ -277,7 +279,16 @@ fn process_fields(
 
     let mut evaluation =
         policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
-    hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
+    if config.hydrate_logged_score_state {
+        hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
+    } else if let Some(seconds) = fields.observed_duration_seconds {
+        evaluation.session.observed_duration = Duration::from_secs(seconds);
+        let exemption_free = evaluation.session.last_exemption_reason.is_none();
+        evaluation.is_bannable = exemption_free
+            && evaluation.session.observed_duration >= config.policy.score.min_observation_duration
+            && evaluation.session.ban_score_above_threshold_duration
+                >= config.policy.score.sustain_duration;
+    }
     let history = state
         .offences
         .get(&OffenceKey::from_offence_identity(
@@ -623,6 +634,9 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                         .with_context(|| format!("invalid peer IP `{value}`"))?,
                 );
             }
+            "--recompute-score" => {
+                config.hydrate_logged_score_state = false;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -709,6 +723,9 @@ fn print_help() {
     println!("  --churn-max-penalty <f>          Maximum additive churn penalty");
     println!("  --churn-decay-per-second <f>     Churn penalty decay rate");
     println!("  --peer-ip <ip>                   Optional peer IP filter");
+    println!(
+        "  --recompute-score                Recompute score instead of hydrating logged score state"
+    );
 }
 
 #[cfg(test)]
@@ -771,6 +788,17 @@ mod tests {
         assert_eq!(config.policy.score.churn.min_reconnects, 2);
         assert!((config.policy.score.churn.max_penalty - 0.8).abs() < f64::EPSILON);
         assert!((config.policy.score.churn.decay_per_second - 0.03).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_args_supports_recompute_score_flag() {
+        let args = vec![
+            "--input".to_string(),
+            "one.jsonl".to_string(),
+            "--recompute-score".to_string(),
+        ];
+        let config = parse_args(args).expect("expected args to parse");
+        assert!(!config.hydrate_logged_score_state);
     }
 
     #[test]
