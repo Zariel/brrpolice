@@ -826,10 +826,17 @@ async fn preflight_legacy_churn_amplifier_migration(pool: &SqlitePool) -> Result
 
     let mut tx = pool.begin().await?;
     if churn_amplifier_exists == 0 {
-        // Migration 0006 originally backfilled the new column from churn_penalty, but
-        // that full-table rewrite has failed on existing PVC-backed databases in
-        // production. The runtime only reads churn_amplifier going forward, so adding
-        // the column with its zero default is enough to preserve upgrade safety.
+        // This compatibility shim exists because migration 0006 originally added the
+        // new column and then rewrote every peer_sessions row to backfill it from
+        // churn_penalty. That rewrite failed in production on PVC-backed SQLite and
+        // crash-looped startup.
+        //
+        // The runtime only reads churn_amplifier going forward, so adding the column
+        // with its zero default is enough to preserve upgrade safety. The important
+        // guardrail is that startup migrations should remain additive and restart-safe.
+        // If we ever need another shim like this, treat it as a migration design bug
+        // to fix by changing how migrations are authored and tested, not as a normal
+        // pattern to copy.
         tx.execute("ALTER TABLE peer_sessions ADD COLUMN churn_amplifier REAL NOT NULL DEFAULT 0;")
             .await?;
     }
