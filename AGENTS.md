@@ -151,4 +151,7 @@ use prose, avoid lists and overly explainging things, be concise.
 
 ### Release tags
 When creating a tag, include a very brief changelog in the tag annotation using
-one concise line per notable change item.
+one concise line per notable change item. Keep the annotation focused on the
+externally meaningful behavior change, not implementation details. Do not list
+docs, refactors, config renames, or internal plumbing unless they are
+themselves the notable user-facing change.
