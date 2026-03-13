@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use humantime::{format_rfc3339_seconds, parse_rfc3339_weak};
+use sha2::{Digest, Sha384};
 use sqlx::{
     Executor, Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqliteJournalMode,
     sqlite::SqlitePoolOptions,
@@ -28,6 +29,19 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = 6;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
+const MIGRATIONS_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN NOT NULL,
+    checksum BLOB NOT NULL,
+    execution_time BIGINT NOT NULL
+);
+"#;
+const MIGRATION_0006_DESCRIPTION: &str = "peer session churn amplifier";
+const MIGRATION_0006_SQL: &str =
+    include_str!("../migrations/0006_peer_session_churn_amplifier.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceMetaRecord {
@@ -151,6 +165,8 @@ impl Persistence {
 
     pub async fn run_migrations(&self) -> Result<()> {
         self.migrations_succeeded.store(false, Ordering::Relaxed);
+
+        preflight_legacy_churn_amplifier_migration(&self.pool).await?;
 
         let migration_path = resolve_migrations_path()?;
         let migration_path_display = migration_path.display().to_string();
@@ -787,6 +803,52 @@ impl Persistence {
     }
 }
 
+async fn preflight_legacy_churn_amplifier_migration(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(MIGRATIONS_TABLE_SQL).execute(pool).await?;
+
+    let version_5_applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 5")
+            .fetch_one(pool)
+            .await?;
+    let version_6_applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 6")
+            .fetch_one(pool)
+            .await?;
+    if version_5_applied == 0 || version_6_applied > 0 {
+        return Ok(());
+    }
+
+    let churn_amplifier_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('peer_sessions') WHERE name = 'churn_amplifier'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    if churn_amplifier_exists == 0 {
+        // Migration 0006 originally backfilled the new column from churn_penalty, but
+        // that full-table rewrite has failed on existing PVC-backed databases in
+        // production. The runtime only reads churn_amplifier going forward, so adding
+        // the column with its zero default is enough to preserve upgrade safety.
+        tx.execute("ALTER TABLE peer_sessions ADD COLUMN churn_amplifier REAL NOT NULL DEFAULT 0;")
+            .await?;
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+        VALUES (?, ?, TRUE, ?, 0)
+        "#,
+    )
+    .bind(6_i64)
+    .bind(MIGRATION_0006_DESCRIPTION)
+    .bind(migration_checksum(MIGRATION_0006_SQL))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
 fn resolve_migrations_path() -> Result<PathBuf> {
     let mut candidates = vec![
         PathBuf::from("./migrations"),
@@ -927,6 +989,10 @@ fn format_system_time(value: SystemTime) -> String {
 
 fn parse_system_time(value: &str) -> Result<SystemTime> {
     Ok(parse_rfc3339_weak(value)?)
+}
+
+fn migration_checksum(sql: &str) -> Vec<u8> {
+    Sha384::digest(sql.as_bytes()).to_vec()
 }
 
 fn encode_exemption_reason(reason: &ExemptionReason) -> String {
@@ -1435,12 +1501,13 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
+    use sqlx::Executor;
     use tempfile::tempdir;
 
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
-        PeerOffenceRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot,
-        RetentionPruneResult,
+        MIGRATIONS_TABLE_SQL, PeerOffenceRecord, PendingBanIntentRecord, Persistence,
+        RecoverySnapshot, RetentionPruneResult, migration_checksum,
     };
     use crate::{
         config::{DatabaseConfig, RetentionConfig, VacuumConfig, VacuumMode},
@@ -1449,6 +1516,34 @@ mod tests {
             PeerObservationId, PeerSessionState,
         },
     };
+
+    const MIGRATION_FIXTURES: &[(i64, &str, &str)] = &[
+        (
+            1,
+            "initial schema",
+            include_str!("../migrations/0001_initial_schema.sql"),
+        ),
+        (
+            2,
+            "peer session bannable columns",
+            include_str!("../migrations/0002_peer_session_bannable_columns.sql"),
+        ),
+        (
+            3,
+            "pending ban intents",
+            include_str!("../migrations/0003_pending_ban_intents.sql"),
+        ),
+        (
+            4,
+            "peer session score fields",
+            include_str!("../migrations/0004_peer_session_score_fields.sql"),
+        ),
+        (
+            5,
+            "peer session churn fields",
+            include_str!("../migrations/0005_peer_session_churn_fields.sql"),
+        ),
+    ];
 
     #[tokio::test]
     async fn migrations_create_expected_tables_and_readiness() {
@@ -2005,6 +2100,165 @@ mod tests {
         assert_eq!(churn_penalty_exists, 1);
         assert_eq!(churn_amplifier_exists, 1);
         assert_eq!(churn_window_started_at_exists, 1);
+    }
+
+    #[tokio::test]
+    async fn migrations_upgrade_cleanly_from_each_prior_schema_version() {
+        for applied_count in 0..=MIGRATION_FIXTURES.len() {
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join(format!("upgrade-from-{applied_count}.sqlite"));
+            let persistence = file_persistence(&db_path).await;
+
+            if applied_count > 0 {
+                persistence
+                    .pool
+                    .execute(MIGRATIONS_TABLE_SQL)
+                    .await
+                    .unwrap();
+            }
+
+            for (version, description, sql) in MIGRATION_FIXTURES.iter().take(applied_count) {
+                persistence.pool.execute(*sql).await.unwrap();
+                sqlx::query(
+                    r#"
+                    INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                    VALUES (?, ?, TRUE, ?, 0)
+                    "#,
+                )
+                .bind(*version)
+                .bind(*description)
+                .bind(migration_checksum(sql))
+                .execute(&persistence.pool)
+                .await
+                .unwrap();
+            }
+
+            persistence.run_migrations().await.unwrap();
+            assert!(
+                persistence.is_ready().await,
+                "expected migrations to upgrade cleanly from schema prefix {applied_count}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migrations_from_schema_v5_do_not_rewrite_peer_sessions() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy-v5.sqlite");
+        let persistence = file_persistence(&db_path).await;
+
+        for (_, _, sql) in MIGRATION_FIXTURES {
+            persistence.pool.execute(*sql).await.unwrap();
+        }
+        persistence
+            .pool
+            .execute(MIGRATIONS_TABLE_SQL)
+            .await
+            .unwrap();
+        for (version, description, sql) in MIGRATION_FIXTURES {
+            sqlx::query(
+                r#"
+                INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                VALUES (?, ?, TRUE, ?, 0)
+                "#,
+            )
+            .bind(version)
+            .bind(description)
+            .bind(migration_checksum(sql))
+            .execute(&persistence.pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_peer_session_updates
+            BEFORE UPDATE ON peer_sessions
+            BEGIN
+                SELECT RAISE(FAIL, 'peer_sessions updates forbidden during migration');
+            END;
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO peer_sessions (
+                torrent_hash,
+                peer_key,
+                peer_ip,
+                peer_port,
+                client_name,
+                first_seen_at,
+                last_seen_at,
+                baseline_progress,
+                latest_progress,
+                rolling_avg_up_rate_bps,
+                observed_seconds,
+                bad_seconds,
+                sample_count,
+                last_torrent_seeder_count,
+                last_exemption_reason,
+                policy_version,
+                bannable_since,
+                last_ban_decision_at,
+                ban_score,
+                ban_score_above_seconds,
+                churn_reconnect_count,
+                churn_penalty,
+                churn_window_started_at
+            ) VALUES (
+                'torrent',
+                'peer',
+                '10.0.0.2',
+                51413,
+                'client',
+                '1970-01-01T00:01:00Z',
+                '1970-01-01T00:02:00Z',
+                0.10,
+                0.15,
+                65536,
+                60,
+                30,
+                2,
+                5,
+                NULL,
+                'policy-v5',
+                NULL,
+                NULL,
+                0.5,
+                15,
+                2,
+                0.8,
+                '1970-01-01T00:02:00Z'
+            )
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+
+        persistence.run_migrations().await.unwrap();
+
+        let churn_amplifier = sqlx::query_scalar::<_, f64>(
+            "SELECT churn_amplifier FROM peer_sessions WHERE torrent_hash = 'torrent'",
+        )
+        .fetch_one(&persistence.pool)
+        .await
+        .unwrap();
+        let migration_6_applied = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 6 AND success = TRUE",
+        )
+        .fetch_one(&persistence.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(churn_amplifier, 0.0);
+        assert_eq!(migration_6_applied, 1);
     }
 
     #[tokio::test]
