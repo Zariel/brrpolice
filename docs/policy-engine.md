@@ -40,23 +40,37 @@ For non-exempt samples, risk is computed from:
 - upload-rate risk: how far current upload rate is below `policy.score.target_rate_bps`
 - progress risk: how far observed progress is below `policy.score.required_progress_delta`
 
-These are combined by `policy.score.weight_rate` and `policy.score.weight_progress`, with `policy.score.rate_risk_floor` preventing very low upload rate from being fully masked by progress alone.
+The progress target is rate-aware. Once a peer is well above the upload target, the engine scales down the required progress expectation using:
+
+- `policy.score.progress_rate_scale_start`
+- `policy.score.progress_rate_scale_end`
+- `policy.score.progress_rate_min_scale`
+
+This keeps very fast peers from being treated the same as low-rate peers on large torrents where completion percentage moves more slowly.
+
+Rate and progress risk are then combined by `policy.score.weight_rate` and `policy.score.weight_progress`, with `policy.score.rate_risk_floor` preventing very low upload rate from being fully masked by progress alone.
 
 The running score:
 
 1. Decays over time by `policy.score.decay_per_second`.
-2. Adds current sample risk.
+2. Adds the current sample risk after any churn amplification.
 3. Is clamped to `policy.score.max_score`.
 
 ## Churn signal
 
-If churn scoring is enabled, reconnect behaviour can add extra score when all are true:
+If churn scoring is enabled, reconnect behaviour can amplify the current sample risk when all are true:
 
 - reconnect count in `policy.score.churn.reconnect_window` is at least `policy.score.churn.min_reconnects`
 - current sample is still poor
 - peer is not exempt
 
-This targets peers that repeatedly reconnect while staying slow/non-progressing.
+The churn state decays over time by `policy.score.churn.decay_per_second` and is capped by `policy.score.churn.max_amplifier`.
+
+The effective sample contribution is:
+
+`effective_sample_score_risk = sample_score_risk * (1 + churn_amplifier)`
+
+This means churn is a force multiplier on already-bad samples rather than an independent source of score. Reconnects by themselves should not turn a borderline peer into a ban.
 
 ## When a peer becomes bannable
 

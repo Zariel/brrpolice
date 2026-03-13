@@ -47,10 +47,11 @@ macro_rules! log_peer_decision {
                 .ban_score_above_threshold_duration
                 .as_secs(),
             sample_score_risk = $evaluation.sample_score_risk,
+            effective_sample_score_risk = $evaluation.effective_sample_score_risk,
             progress_delta = $evaluation.progress_delta,
             average_upload_rate_bps = $evaluation.session.rolling_avg_up_rate_bps,
             churn_reconnect_count = $evaluation.session.churn_reconnect_count,
-            churn_penalty = $evaluation.session.churn_penalty,
+            churn_amplifier = $evaluation.session.churn_amplifier,
             sample_count = $evaluation.session.sample_count,
             $( $extra_key = $extra_value, )*
             $message
@@ -84,10 +85,11 @@ macro_rules! log_ban_action {
                 .ban_score_above_threshold_duration
                 .as_secs(),
             sample_score_risk = $action.evaluation.sample_score_risk,
+            effective_sample_score_risk = $action.evaluation.effective_sample_score_risk,
             progress_delta = $action.evaluation.progress_delta,
             average_upload_rate_bps = $action.evaluation.session.rolling_avg_up_rate_bps,
             churn_reconnect_count = $action.evaluation.session.churn_reconnect_count,
-            churn_penalty = $action.evaluation.session.churn_penalty,
+            churn_amplifier = $action.evaluation.session.churn_amplifier,
             sample_count = $action.evaluation.session.sample_count,
             selected_ban_ttl_seconds = $action.decision.ttl.as_secs(),
             reason_code = %$action.decision.reason_code,
@@ -1040,7 +1042,7 @@ impl ControlLoop {
             ban_score_above_threshold_duration: Duration::ZERO,
             churn_reconnect_count: 0,
             churn_window_started_at: None,
-            churn_penalty: 0.0,
+            churn_amplifier: 0.0,
             sample_count: 1,
             last_torrent_seeder_count: 0,
             last_exemption_reason: None,
@@ -1056,6 +1058,7 @@ impl ControlLoop {
             is_bad_sample: true,
             is_bannable: true,
             sample_score_risk: 0.0,
+            effective_sample_score_risk: 0.0,
         };
         let decision = BanDecision {
             peer_ip: intent.peer_ip,
@@ -1923,7 +1926,7 @@ mod tests {
                     ban_score_above_threshold_duration: Duration::ZERO,
                     churn_reconnect_count: 0,
                     churn_window_started_at: None,
-                    churn_penalty: 0.0,
+                    churn_amplifier: 0.0,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,
@@ -2343,7 +2346,7 @@ mod tests {
                     ban_score_above_threshold_duration: Duration::ZERO,
                     churn_reconnect_count: 0,
                     churn_window_started_at: None,
-                    churn_penalty: 0.0,
+                    churn_amplifier: 0.0,
                     sample_count: 2,
                     last_torrent_seeder_count: 5,
                     last_exemption_reason: None,

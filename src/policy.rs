@@ -134,7 +134,7 @@ impl PolicyEngine {
             ban_score_above_threshold_duration: Duration::ZERO,
             churn_reconnect_count: 0,
             churn_window_started_at: None,
-            churn_penalty: 0.0,
+            churn_amplifier: 0.0,
             sample_count: 1,
             last_torrent_seeder_count: peer.torrent.total_seeders,
             last_exemption_reason: self.classify_exemption(peer),
@@ -166,7 +166,7 @@ impl PolicyEngine {
                     Duration::ZERO
                 };
             let reconnect = previous.observation_id != observation_id;
-            let (churn_reconnect_count, churn_window_started_at, churn_penalty) = self
+            let (churn_reconnect_count, churn_window_started_at, churn_amplifier) = self
                 .update_churn_state(
                     previous,
                     peer.observed_at,
@@ -177,7 +177,7 @@ impl PolicyEngine {
                 );
             session.churn_reconnect_count = churn_reconnect_count;
             session.churn_window_started_at = churn_window_started_at;
-            session.churn_penalty = churn_penalty;
+            session.churn_amplifier = churn_amplifier;
             session.sample_count = previous.sample_count + 1;
             session.last_exemption_reason = self.classify_exemption(peer);
             session.bannable_since = previous.bannable_since;
@@ -218,16 +218,18 @@ impl PolicyEngine {
                     required_progress_delta,
                 )
             };
+            let effective_sample_score_risk =
+                self.effective_sample_score_risk(sample_score_risk, session.churn_amplifier);
             if exemption.is_some() {
                 session.ban_score_above_threshold_duration = Duration::ZERO;
             } else {
-                session.ban_score =
-                    (session.ban_score + sample_score_risk).clamp(0.0, self.config.score.max_score);
+                session.ban_score = (session.ban_score + effective_sample_score_risk)
+                    .clamp(0.0, self.config.score.max_score);
                 if session.ban_score >= self.config.score.ban_threshold {
                     session.ban_score_above_threshold_duration = sample_duration;
                 }
             }
-            session.churn_penalty = 0.0;
+            session.churn_amplifier = 0.0;
 
             let is_bannable = self.is_bannable(&session, exemption.is_none());
             if is_bannable {
@@ -242,6 +244,7 @@ impl PolicyEngine {
                 is_bad_sample,
                 is_bannable,
                 sample_score_risk,
+                effective_sample_score_risk,
             };
         }
 
@@ -283,7 +286,7 @@ impl PolicyEngine {
         } else {
             0.0
         };
-        let (churn_reconnect_count, churn_window_started_at, churn_penalty) = self
+        let (churn_reconnect_count, churn_window_started_at, churn_amplifier) = self
             .update_churn_state(
                 &previous,
                 peer.observed_at,
@@ -292,12 +295,13 @@ impl PolicyEngine {
                 is_bad_sample,
                 exemption.is_none(),
             );
+        let effective_sample_score_risk =
+            self.effective_sample_score_risk(sample_score_risk, churn_amplifier);
         if exemption.is_some() {
             ban_score_above_threshold_duration = Duration::ZERO;
         } else {
-            let churn_contribution = if is_bad_sample { churn_penalty } else { 0.0 };
-            ban_score = (ban_score + sample_score_risk + churn_contribution)
-                .clamp(0.0, self.config.score.max_score);
+            ban_score =
+                (ban_score + effective_sample_score_risk).clamp(0.0, self.config.score.max_score);
             if ban_score >= self.config.score.ban_threshold {
                 ban_score_above_threshold_duration += sample_duration;
             } else if ban_score <= self.config.score.clear_threshold {
@@ -340,7 +344,7 @@ impl PolicyEngine {
             ban_score_above_threshold_duration,
             churn_reconnect_count,
             churn_window_started_at,
-            churn_penalty,
+            churn_amplifier,
             sample_count: previous.sample_count + 1,
             last_torrent_seeder_count: peer.torrent.total_seeders,
             last_exemption_reason: exemption.clone(),
@@ -356,6 +360,7 @@ impl PolicyEngine {
             is_bad_sample,
             is_bannable,
             sample_score_risk,
+            effective_sample_score_risk,
         }
     }
 
@@ -402,10 +407,11 @@ impl PolicyEngine {
             normalized_progress_risk(evaluation.progress_delta, required_progress_delta);
         let factors = self.reason_factors(rate_risk, progress_risk, evaluation);
         let reason_details = format!(
-            "score peer: factors={} score={:.4} sample_risk={:.4} rate_risk={:.4} progress_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} required_progress_delta={:.4} score_above_seconds={} observed_seconds={} reconnects={} churn_penalty={:.4} samples={}",
+            "score peer: factors={} score={:.4} sample_risk={:.4} effective_sample_risk={:.4} rate_risk={:.4} progress_risk={:.4} avg_up_rate_bps={} progress_delta={:.4} required_progress_delta={:.4} score_above_seconds={} observed_seconds={} reconnects={} churn_amplifier={:.4} samples={}",
             factors,
             evaluation.session.ban_score,
             evaluation.sample_score_risk,
+            evaluation.effective_sample_score_risk,
             rate_risk,
             progress_risk,
             evaluation.session.rolling_avg_up_rate_bps,
@@ -417,7 +423,7 @@ impl PolicyEngine {
                 .as_secs(),
             evaluation.session.observed_duration.as_secs(),
             evaluation.session.churn_reconnect_count,
-            evaluation.session.churn_penalty,
+            evaluation.session.churn_amplifier,
             evaluation.session.sample_count
         );
 
@@ -516,7 +522,8 @@ impl PolicyEngine {
         let churn = &self.config.score.churn;
         let mut reconnect_count = previous.churn_reconnect_count;
         let mut window_started_at = previous.churn_window_started_at;
-        let mut penalty = self.decay_value(previous.churn_penalty, elapsed, churn.decay_per_second);
+        let mut amplifier =
+            self.decay_value(previous.churn_amplifier, elapsed, churn.decay_per_second);
 
         if let Some(started_at) = window_started_at
             && observed_at.duration_since(started_at).unwrap_or_default() > churn.reconnect_window
@@ -544,17 +551,17 @@ impl PolicyEngine {
             return (reconnect_count, window_started_at, 0.0);
         }
 
-        // Churn only adds risk when reconnect churn and poor sample quality happen together.
-        // Reconnects by themselves are common for healthy peers and should not trigger bans.
+        // Churn only amplifies already-bad samples. Reconnects by themselves are common for
+        // healthy peers and should not become an independent ban engine.
         if is_bad_sample && reconnect_count >= churn.min_reconnects {
             let reconnect_excess = reconnect_count - churn.min_reconnects + 1;
             let reconnect_factor =
                 (reconnect_excess as f64 / churn.min_reconnects as f64).clamp(0.0, 1.0);
-            let increment = churn.max_penalty * reconnect_factor;
-            penalty = (penalty + increment).clamp(0.0, churn.max_penalty);
+            let increment = churn.max_amplifier * reconnect_factor;
+            amplifier = (amplifier + increment).clamp(0.0, churn.max_amplifier);
         }
 
-        (reconnect_count, window_started_at, penalty)
+        (reconnect_count, window_started_at, amplifier)
     }
 
     fn required_progress_delta(&self, observed_duration: Duration, up_rate_bps: u64) -> f64 {
@@ -680,6 +687,14 @@ impl PolicyEngine {
         weighted_risk.max(floor_risk)
     }
 
+    fn effective_sample_score_risk(&self, sample_score_risk: f64, churn_amplifier: f64) -> f64 {
+        if sample_score_risk <= 0.0 {
+            return 0.0;
+        }
+
+        sample_score_risk * (1.0 + churn_amplifier.max(0.0))
+    }
+
     fn remaining_reban_cooldown(
         &self,
         last_ban_expires_at: Option<SystemTime>,
@@ -716,7 +731,7 @@ impl PolicyEngine {
 
         if self.config.score.churn.enabled
             && evaluation.session.churn_reconnect_count >= self.config.score.churn.min_reconnects
-            && evaluation.session.churn_penalty > 0.0
+            && evaluation.session.churn_amplifier > 0.0
         {
             factors.push("reconnect_churn");
         }
@@ -942,7 +957,7 @@ mod tests {
             enabled: true,
             reconnect_window: Duration::from_secs(600),
             min_reconnects: 2,
-            max_penalty: 0.6,
+            max_amplifier: 0.6,
             decay_per_second: 0.0,
         };
         score
@@ -1026,7 +1041,7 @@ mod tests {
             ban_score_above_threshold_duration: Duration::ZERO,
             churn_reconnect_count: 0,
             churn_window_started_at: None,
-            churn_penalty: 0.0,
+            churn_amplifier: 0.0,
             sample_count: 3,
             last_torrent_seeder_count: 5,
             last_exemption_reason: None,
@@ -1069,7 +1084,7 @@ mod tests {
             ban_score_above_threshold_duration: Duration::ZERO,
             churn_reconnect_count: 0,
             churn_window_started_at: None,
-            churn_penalty: 0.0,
+            churn_amplifier: 0.0,
             sample_count: 2,
             last_torrent_seeder_count: 5,
             last_exemption_reason: None,
@@ -1450,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn churn_penalty_accumulates_on_repeated_bad_reconnects() {
+    fn churn_amplifier_accumulates_on_repeated_bad_reconnects() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             decay_window: Duration::from_secs(600),
@@ -1466,25 +1481,32 @@ mod tests {
         let second = engine.evaluate_peer(&second_peer, Some(&first.session));
         assert!(second.is_bad_sample);
         assert_eq!(second.session.churn_reconnect_count, 1);
-        assert!((second.session.churn_penalty - 0.0).abs() < 0.0001);
+        assert!((second.session.churn_amplifier - 0.0).abs() < 0.0001);
+        assert!((second.effective_sample_score_risk - second.sample_score_risk).abs() < 0.0001);
 
         let mut third_peer = seeded_peer(240, 0.10, 0);
         third_peer.peer.port = 51415;
         let third = engine.evaluate_peer(&third_peer, Some(&second.session));
         assert!(third.is_bad_sample);
         assert_eq!(third.session.churn_reconnect_count, 2);
-        assert!((third.session.churn_penalty - 0.3).abs() < 0.0001);
+        assert!((third.session.churn_amplifier - 0.3).abs() < 0.0001);
+        assert!(
+            (third.effective_sample_score_risk - (third.sample_score_risk * 1.3)).abs() < 0.0001
+        );
 
         let mut fourth_peer = seeded_peer(300, 0.10, 0);
         fourth_peer.peer.port = 51416;
         let fourth = engine.evaluate_peer(&fourth_peer, Some(&third.session));
         assert!(fourth.is_bad_sample);
         assert_eq!(fourth.session.churn_reconnect_count, 3);
-        assert!((fourth.session.churn_penalty - 0.6).abs() < 0.0001);
+        assert!((fourth.session.churn_amplifier - 0.6).abs() < 0.0001);
+        assert!(
+            (fourth.effective_sample_score_risk - (fourth.sample_score_risk * 1.6)).abs() < 0.0001
+        );
     }
 
     #[test]
-    fn churn_penalty_does_not_accumulate_for_healthy_reconnects() {
+    fn churn_amplifier_does_not_accumulate_for_healthy_reconnects() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             decay_window: Duration::from_secs(600),
@@ -1501,21 +1523,78 @@ mod tests {
         let second = engine.evaluate_peer(&second_peer, Some(&first.session));
         assert!(!second.is_bad_sample);
         assert_eq!(second.session.churn_reconnect_count, 1);
-        assert!((second.session.churn_penalty - 0.0).abs() < 0.0001);
+        assert!((second.session.churn_amplifier - 0.0).abs() < 0.0001);
 
         let mut third_peer = seeded_peer(240, 0.14, 10_000);
         third_peer.peer.port = 51415;
         let third = engine.evaluate_peer(&third_peer, Some(&second.session));
         assert!(!third.is_bad_sample);
         assert_eq!(third.session.churn_reconnect_count, 2);
-        assert!((third.session.churn_penalty - 0.0).abs() < 0.0001);
+        assert!((third.session.churn_amplifier - 0.0).abs() < 0.0001);
     }
 
     #[test]
-    fn churn_penalty_is_capped_at_max_penalty() {
+    fn churn_amplifier_does_not_ban_borderline_peer_on_its_own() {
+        let mut score = score_policy_for_tests(60, 120, 0.01);
+        score.weight_rate = 0.0;
+        score.weight_progress = 1.0;
+        score.ban_threshold = 1.6;
+        score.clear_threshold = 0.8;
+        score.decay_per_second = 0.0;
+        score.churn = ChurnPolicyConfig {
+            enabled: true,
+            reconnect_window: Duration::from_secs(600),
+            min_reconnects: 1,
+            max_amplifier: 1.0,
+            decay_per_second: 0.0,
+        };
+        let config = PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            decay_window: Duration::from_secs(600),
+            score,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let previous = PeerSessionState {
+            observation_id: engine.peer_observation_id(&seeded_peer(120, 0.10, 900)),
+            offence_identity: engine.offence_identity(&seeded_peer(120, 0.10, 900)),
+            first_seen_at: SystemTime::UNIX_EPOCH,
+            last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
+            baseline_progress: 0.10,
+            latest_progress: 0.10,
+            rolling_avg_up_rate_bps: 900,
+            observed_duration: Duration::from_secs(120),
+            bad_duration: Duration::from_secs(120),
+            ban_score: 1.1,
+            ban_score_above_threshold_duration: Duration::ZERO,
+            churn_reconnect_count: 0,
+            churn_window_started_at: None,
+            churn_amplifier: 0.0,
+            sample_count: 2,
+            last_torrent_seeder_count: 5,
+            last_exemption_reason: None,
+            bannable_since: None,
+            last_ban_decision_at: None,
+        };
+
+        let mut peer = seeded_peer(180, 0.108, 900);
+        peer.peer.port = 51414;
+        let evaluation = engine.evaluate_peer(&peer, Some(&previous));
+
+        assert!(evaluation.is_bad_sample);
+        assert!((evaluation.sample_score_risk - 0.2).abs() < 0.0001);
+        assert!((evaluation.session.churn_amplifier - 1.0).abs() < 0.0001);
+        assert!((evaluation.effective_sample_score_risk - 0.4).abs() < 0.0001);
+        assert!((evaluation.session.ban_score - 1.5).abs() < 0.0001);
+        assert!(!evaluation.is_bannable);
+    }
+
+    #[test]
+    fn churn_amplifier_is_capped_at_max_amplifier() {
         let mut score = churn_enabled_score_policy_for_tests();
         score.churn.min_reconnects = 1;
-        score.churn.max_penalty = 0.5;
+        score.churn.max_amplifier = 0.5;
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             decay_window: Duration::from_secs(600),
@@ -1529,19 +1608,19 @@ mod tests {
         let mut second_peer = seeded_peer(180, 0.10, 0);
         second_peer.peer.port = 51414;
         let second = engine.evaluate_peer(&second_peer, Some(&first.session));
-        assert!((second.session.churn_penalty - 0.5).abs() < 0.0001);
+        assert!((second.session.churn_amplifier - 0.5).abs() < 0.0001);
 
         let mut third_peer = seeded_peer(240, 0.10, 0);
         third_peer.peer.port = 51415;
         let third = engine.evaluate_peer(&third_peer, Some(&second.session));
-        assert!((third.session.churn_penalty - 0.5).abs() < 0.0001);
+        assert!((third.session.churn_amplifier - 0.5).abs() < 0.0001);
     }
 
     #[test]
-    fn churn_penalty_resets_when_sample_becomes_exempt() {
+    fn churn_amplifier_resets_when_sample_becomes_exempt() {
         let mut score = churn_enabled_score_policy_for_tests();
         score.churn.min_reconnects = 1;
-        score.churn.max_penalty = 0.5;
+        score.churn.max_amplifier = 0.5;
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             decay_window: Duration::from_secs(600),
@@ -1555,7 +1634,7 @@ mod tests {
         let mut second_peer = seeded_peer(180, 0.10, 0);
         second_peer.peer.port = 51414;
         let second = engine.evaluate_peer(&second_peer, Some(&first.session));
-        assert!(second.session.churn_penalty > 0.0);
+        assert!(second.session.churn_amplifier > 0.0);
 
         let mut exempt_peer = seeded_peer(240, 0.99, 0);
         exempt_peer.peer.port = 51415;
@@ -1565,7 +1644,7 @@ mod tests {
             exempt.session.last_exemption_reason,
             Some(ExemptionReason::NearComplete { .. })
         ));
-        assert!((exempt.session.churn_penalty - 0.0).abs() < 0.0001);
+        assert!((exempt.session.churn_amplifier - 0.0).abs() < 0.0001);
     }
 
     #[test]

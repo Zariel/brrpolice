@@ -118,6 +118,9 @@ qBittorrent auth rule:
 | `policy.reban_cooldown` | `BRRPOLICE_POLICY__REBAN_COOLDOWN` | `30m` | Cooldown before re-banning a recently handled peer identity. |
 | `policy.score.target_rate_bps` | `BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS` | `65536` | Score model upload target in bytes/sec. Lower observed rates increase score risk. |
 | `policy.score.required_progress_delta` | `BRRPOLICE_POLICY__SCORE__REQUIRED_PROGRESS_DELTA` | `0.02` | Score model progress target as a fraction (`0.02` = `2%`). Lower progress increases score risk. |
+| `policy.score.progress_rate_scale_start` | `BRRPOLICE_POLICY__SCORE__PROGRESS_RATE_SCALE_START` | `2.0` | Upload-rate multiple where progress expectation starts relaxing for fast peers. |
+| `policy.score.progress_rate_scale_end` | `BRRPOLICE_POLICY__SCORE__PROGRESS_RATE_SCALE_END` | `16.0` | Upload-rate multiple where progress expectation reaches its minimum scale. |
+| `policy.score.progress_rate_min_scale` | `BRRPOLICE_POLICY__SCORE__PROGRESS_RATE_MIN_SCALE` | `0.25` | Lowest fraction of the base progress requirement that can apply to very fast peers. |
 | `policy.score.weight_rate` | `BRRPOLICE_POLICY__SCORE__WEIGHT_RATE` | `0.35` | Weight for upload-rate risk in score calculations. |
 | `policy.score.weight_progress` | `BRRPOLICE_POLICY__SCORE__WEIGHT_PROGRESS` | `0.65` | Weight for progress risk in score calculations. |
 | `policy.score.rate_risk_floor` | `BRRPOLICE_POLICY__SCORE__RATE_RISK_FLOOR` | `0.4` | Non-compensatory floor for upload-rate risk (`sample_risk >= rate_risk_floor * rate_risk`). |
@@ -127,11 +130,11 @@ qBittorrent auth rule:
 | `policy.score.decay_per_second` | `BRRPOLICE_POLICY__SCORE__DECAY_PER_SECOND` | `0.02` | Passive score decay rate per second between observations. |
 | `policy.score.min_observation_duration` | `BRRPOLICE_POLICY__SCORE__MIN_OBSERVATION_DURATION` | `2m` | Minimum tracked peer age before score-based bans can trigger. |
 | `policy.score.max_score` | `BRRPOLICE_POLICY__SCORE__MAX_SCORE` | `5.0` | Upper clamp for per-peer score state. |
-| `policy.score.churn.enabled` | `BRRPOLICE_POLICY__SCORE__CHURN__ENABLED` | `true` | Enables reconnect churn as an additive score signal for repeatedly reconnecting low-rate, low-progress peers. |
+| `policy.score.churn.enabled` | `BRRPOLICE_POLICY__SCORE__CHURN__ENABLED` | `true` | Enables reconnect churn as a multiplier on already-bad samples. |
 | `policy.score.churn.reconnect_window` | `BRRPOLICE_POLICY__SCORE__CHURN__RECONNECT_WINDOW` | `30m` | Time window used to count reconnects for churn scoring. |
-| `policy.score.churn.min_reconnects` | `BRRPOLICE_POLICY__SCORE__CHURN__MIN_RECONNECTS` | `2` | Minimum reconnect count in the churn window before churn penalty starts applying. |
-| `policy.score.churn.max_penalty` | `BRRPOLICE_POLICY__SCORE__CHURN__MAX_PENALTY` | `1.0` | Maximum additional score contribution from churn for a single peer session. |
-| `policy.score.churn.decay_per_second` | `BRRPOLICE_POLICY__SCORE__CHURN__DECAY_PER_SECOND` | `0.002` | Decay rate for accumulated churn penalty between observations. |
+| `policy.score.churn.min_reconnects` | `BRRPOLICE_POLICY__SCORE__CHURN__MIN_RECONNECTS` | `2` | Minimum reconnect count in the churn window before churn amplification starts applying. |
+| `policy.score.churn.max_amplifier` | `BRRPOLICE_POLICY__SCORE__CHURN__MAX_AMPLIFIER` | `1.0` | Maximum extra multiplier applied to sample risk (`effective = sample * (1 + churn_amplifier)`). |
+| `policy.score.churn.decay_per_second` | `BRRPOLICE_POLICY__SCORE__CHURN__DECAY_PER_SECOND` | `0.002` | Decay rate for accumulated churn amplification between observations. |
 | `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
 
 ### Filter Settings

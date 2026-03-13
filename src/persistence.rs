@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 
@@ -257,7 +257,7 @@ impl Persistence {
                 ban_score,
                 ban_score_above_seconds,
                 churn_reconnect_count,
-                churn_penalty,
+                churn_amplifier,
                 churn_window_started_at,
                 sample_count,
                 last_torrent_seeder_count,
@@ -828,7 +828,7 @@ struct PeerSessionRow {
     ban_score: f64,
     ban_score_above_seconds: i64,
     churn_reconnect_count: i64,
-    churn_penalty: f64,
+    churn_amplifier: f64,
     churn_window_started_at: Option<String>,
     sample_count: i64,
     last_torrent_seeder_count: i64,
@@ -990,7 +990,7 @@ fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
             row.ban_score_above_seconds,
         )?),
         churn_reconnect_count: u32::try_from(row.churn_reconnect_count)?,
-        churn_penalty: row.churn_penalty,
+        churn_amplifier: row.churn_amplifier,
         churn_window_started_at: row
             .churn_window_started_at
             .map(|value| parse_system_time(&value))
@@ -1061,7 +1061,7 @@ where
                 ban_score,
                 ban_score_above_seconds,
                 churn_reconnect_count,
-                churn_penalty,
+                churn_amplifier,
                 churn_window_started_at,
                 sample_count,
             last_torrent_seeder_count,
@@ -1100,7 +1100,7 @@ where
                 ban_score,
                 ban_score_above_seconds,
                 churn_reconnect_count,
-                churn_penalty,
+                churn_amplifier,
                 churn_window_started_at,
                 sample_count,
             last_torrent_seeder_count,
@@ -1143,7 +1143,7 @@ where
             ban_score,
             ban_score_above_seconds,
             churn_reconnect_count,
-            churn_penalty,
+            churn_amplifier,
             churn_window_started_at,
             sample_count,
             last_torrent_seeder_count,
@@ -1166,7 +1166,7 @@ where
             ban_score = excluded.ban_score,
             ban_score_above_seconds = excluded.ban_score_above_seconds,
             churn_reconnect_count = excluded.churn_reconnect_count,
-            churn_penalty = excluded.churn_penalty,
+            churn_amplifier = excluded.churn_amplifier,
             churn_window_started_at = excluded.churn_window_started_at,
             sample_count = excluded.sample_count,
             last_torrent_seeder_count = excluded.last_torrent_seeder_count,
@@ -1205,7 +1205,7 @@ where
             .context("ban score above-threshold duration exceeds sqlite integer range")?,
     )
     .bind(i64::from(session.churn_reconnect_count))
-    .bind(session.churn_penalty)
+    .bind(session.churn_amplifier)
     .bind(session.churn_window_started_at.map(format_system_time))
     .bind(i64::from(session.sample_count))
     .bind(i64::from(session.last_torrent_seeder_count))
@@ -1986,6 +1986,12 @@ mod tests {
         .fetch_one(&persistence.pool)
         .await
         .unwrap();
+        let churn_amplifier_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('peer_sessions') WHERE name = 'churn_amplifier'",
+        )
+        .fetch_one(&persistence.pool)
+        .await
+        .unwrap();
         let churn_window_started_at_exists = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM pragma_table_info('peer_sessions') WHERE name = 'churn_window_started_at'",
         )
@@ -1997,6 +2003,7 @@ mod tests {
         assert_eq!(pending_ban_intents_exists, 1);
         assert_eq!(churn_reconnect_count_exists, 1);
         assert_eq!(churn_penalty_exists, 1);
+        assert_eq!(churn_amplifier_exists, 1);
         assert_eq!(churn_window_started_at_exists, 1);
     }
 
@@ -2552,7 +2559,7 @@ mod tests {
                     ban_score: 0.0,
                     ban_score_above_threshold_duration: Duration::from_secs(0),
                     churn_reconnect_count: 0,
-                    churn_penalty: 0.0,
+                    churn_amplifier: 0.0,
                     churn_window_started_at: None,
                     sample_count: 1,
                     last_torrent_seeder_count: 10,
@@ -2714,7 +2721,7 @@ mod tests {
             ban_score_above_threshold_duration: Duration::ZERO,
             churn_reconnect_count: 0,
             churn_window_started_at: None,
-            churn_penalty: 0.0,
+            churn_amplifier: 0.0,
             sample_count: 3,
             last_torrent_seeder_count: 5,
             last_exemption_reason: Some(ExemptionReason::NearComplete {
@@ -2738,6 +2745,7 @@ mod tests {
             is_bad_sample: true,
             is_bannable: true,
             sample_score_risk: 0.0,
+            effective_sample_score_risk: 0.0,
         }
     }
 

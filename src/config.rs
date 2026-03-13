@@ -77,7 +77,7 @@ impl AppConfig {
             .set_default("policy.score.churn.enabled", true)?
             .set_default("policy.score.churn.reconnect_window", "30m")?
             .set_default("policy.score.churn.min_reconnects", 2_u32)?
-            .set_default("policy.score.churn.max_penalty", 1.0_f64)?
+            .set_default("policy.score.churn.max_amplifier", 1.0_f64)?
             .set_default("policy.score.churn.decay_per_second", 0.002_f64)?
             .set_default(
                 "policy.ban_ladder.durations",
@@ -159,7 +159,7 @@ impl AppConfig {
                 "policy.score.churn.enabled={}\n",
                 "policy.score.churn.reconnect_window={}\n",
                 "policy.score.churn.min_reconnects={}\n",
-                "policy.score.churn.max_penalty={:.6}\n",
+                "policy.score.churn.max_amplifier={:.6}\n",
                 "policy.score.churn.decay_per_second={:.6}\n",
                 "policy.ban_ladder={}\n",
                 "filters.include_categories={}\n",
@@ -213,7 +213,7 @@ impl AppConfig {
             self.policy.score.churn.enabled,
             self.policy.score.churn.reconnect_window.as_secs(),
             self.policy.score.churn.min_reconnects,
-            self.policy.score.churn.max_penalty,
+            self.policy.score.churn.max_amplifier,
             self.policy.score.churn.decay_per_second,
             self.policy
                 .ban_ladder
@@ -353,8 +353,8 @@ impl AppConfig {
         if self.policy.score.churn.min_reconnects == 0 {
             bail!("policy.score.churn.min_reconnects must be >= 1");
         }
-        if self.policy.score.churn.max_penalty < 0.0 {
-            bail!("policy.score.churn.max_penalty must be >= 0.0");
+        if self.policy.score.churn.max_amplifier < 0.0 {
+            bail!("policy.score.churn.max_amplifier must be >= 0.0");
         }
         if self.policy.score.churn.decay_per_second < 0.0 {
             bail!("policy.score.churn.decay_per_second must be >= 0.0");
@@ -521,7 +521,7 @@ pub struct ChurnPolicyConfig {
     #[serde(deserialize_with = "deserialize_duration")]
     pub reconnect_window: Duration,
     pub min_reconnects: u32,
-    pub max_penalty: f64,
+    pub max_amplifier: f64,
     pub decay_per_second: f64,
 }
 
@@ -531,7 +531,7 @@ impl Default for ChurnPolicyConfig {
             enabled: true,
             reconnect_window: Duration::from_secs(1_800),
             min_reconnects: 2,
-            max_penalty: 1.0,
+            max_amplifier: 1.0,
             decay_per_second: 0.002,
         }
     }
@@ -837,7 +837,7 @@ mod tests {
             Duration::from_secs(1_800)
         );
         assert_eq!(config.policy.score.churn.min_reconnects, 2);
-        assert_eq!(config.policy.score.churn.max_penalty, 1.0);
+        assert_eq!(config.policy.score.churn.max_amplifier, 1.0);
         assert_eq!(config.policy.score.churn.decay_per_second, 0.002);
         assert_eq!(
             config.policy.ban_ladder.durations,
@@ -887,7 +887,7 @@ reban_cooldown = "45m"
 enabled = true
 reconnect_window = "15m"
 min_reconnects = 4
-max_penalty = 0.75
+max_amplifier = 0.75
 decay_per_second = 0.02
 
 [policy.ban_ladder]
@@ -951,7 +951,7 @@ format = "plain"
             Duration::from_secs(900)
         );
         assert_eq!(config.policy.score.churn.min_reconnects, 4);
-        assert_eq!(config.policy.score.churn.max_penalty, 0.75);
+        assert_eq!(config.policy.score.churn.max_amplifier, 0.75);
         assert_eq!(config.policy.score.churn.decay_per_second, 0.02);
     }
 
