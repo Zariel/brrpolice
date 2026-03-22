@@ -1,0 +1,10 @@
+command:
+  docker_image_inspect_succeeds:
+    exec: docker image inspect brrpolice-ci:test
+    exit-status: 0
+
+  brrpolice_help_executes:
+    exec: docker run --rm --entrypoint /app/brrpolice brrpolice-ci:test --help
+    exit-status: 0
+    stdout:
+      - "brrpolice usage:"
