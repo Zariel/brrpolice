@@ -689,7 +689,7 @@ mod tests {
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("# TYPE brrpolice_active_bans gauge"));
-        assert!(body.contains("brrpolice_peers_evaluated"));
+        assert!(body.contains("# TYPE brrpolice_prune_duration_seconds histogram"));
     }
 
     #[test]

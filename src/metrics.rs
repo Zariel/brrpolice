@@ -5,38 +5,58 @@ use std::{
 };
 
 use prometheus_client::{
-    encoding::text::encode,
+    encoding::{EncodeLabelSet, text::encode},
     metrics::{
         counter::Counter,
+        family::Family,
         gauge::Gauge,
         histogram::{Histogram, exponential_buckets},
     },
     registry::Registry,
 };
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PeerSampleLabels {
+    sample: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PolicyDecisionLabels {
+    decision: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BanResultLabels {
+    result: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BanAppliedReasonLabels {
+    reason_code: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PruneRunLabels {
+    result: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PrunedRowsLabels {
+    table: &'static str,
+}
+
 #[derive(Clone)]
 pub struct AppMetrics {
     registry: Arc<Registry>,
-    peers_evaluated_total: Counter,
-    bad_peers_total: Counter,
+    peer_samples_total: Family<PeerSampleLabels, Counter>,
     score_policy_evaluations_total: Counter,
     score_policy_bannable_total: Counter,
-    policy_ban_decisions_total: Counter,
-    policy_not_bannable_decisions_total: Counter,
-    policy_exemption_decisions_total: Counter,
-    policy_reban_cooldown_decisions_total: Counter,
-    policy_duplicate_suppressed_decisions_total: Counter,
-    score_policy_bans_applied_total: Counter,
-    prune_runs_total: Counter,
-    prune_failures_total: Counter,
-    pruned_peer_sessions_total: Counter,
-    pruned_peer_offences_total: Counter,
-    pruned_active_bans_total: Counter,
-    pruned_pending_ban_intents_total: Counter,
-    pruned_vacuum_pages_total: Counter,
-    bans_applied_total: Counter,
-    bans_expired_total: Counter,
-    ban_failures_total: Counter,
+    policy_decisions_total: Family<PolicyDecisionLabels, Counter>,
+    ban_results_total: Family<BanResultLabels, Counter>,
+    ban_applied_reasons_total: Family<BanAppliedReasonLabels, Counter>,
+    prune_runs_total: Family<PruneRunLabels, Counter>,
+    pruned_rows_total: Family<PrunedRowsLabels, Counter>,
+    sqlite_pages_freed_total: Counter,
     qbittorrent_api_errors_total: Counter,
     metrics_encode_errors_total: Counter,
     active_tracked_peers: Gauge,
@@ -57,18 +77,11 @@ impl AppMetrics {
     pub fn new() -> Self {
         let mut registry = Registry::default();
 
-        let peers_evaluated_total = Counter::default();
+        let peer_samples_total = Family::<PeerSampleLabels, Counter>::default();
         registry.register(
-            "brrpolice_peers_evaluated",
-            "Total peers evaluated by the policy engine.",
-            peers_evaluated_total.clone(),
-        );
-
-        let bad_peers_total = Counter::default();
-        registry.register(
-            "brrpolice_bad_peers",
-            "Total peer evaluations classified as bad samples.",
-            bad_peers_total.clone(),
+            "brrpolice_peer_samples",
+            "Total peer evaluations by sample classification.",
+            peer_samples_total.clone(),
         );
 
         let score_policy_evaluations_total = Counter::default();
@@ -85,116 +98,46 @@ impl AppMetrics {
             score_policy_bannable_total.clone(),
         );
 
-        let policy_ban_decisions_total = Counter::default();
+        let policy_decisions_total = Family::<PolicyDecisionLabels, Counter>::default();
         registry.register(
-            "brrpolice_policy_ban_decisions",
-            "Total policy decisions resulting in a ban action.",
-            policy_ban_decisions_total.clone(),
+            "brrpolice_policy_decisions",
+            "Total policy decisions by outcome type.",
+            policy_decisions_total.clone(),
         );
 
-        let policy_not_bannable_decisions_total = Counter::default();
+        let ban_results_total = Family::<BanResultLabels, Counter>::default();
         registry.register(
-            "brrpolice_policy_not_bannable_decisions",
-            "Total policy decisions that remained not bannable.",
-            policy_not_bannable_decisions_total.clone(),
+            "brrpolice_bans",
+            "Total ban lifecycle outcomes by result.",
+            ban_results_total.clone(),
         );
 
-        let policy_exemption_decisions_total = Counter::default();
+        let ban_applied_reasons_total = Family::<BanAppliedReasonLabels, Counter>::default();
         registry.register(
-            "brrpolice_policy_exemption_decisions",
-            "Total policy decisions that resulted in an exemption.",
-            policy_exemption_decisions_total.clone(),
+            "brrpolice_ban_applied_reasons",
+            "Total successfully applied bans by bounded reason code.",
+            ban_applied_reasons_total.clone(),
         );
 
-        let policy_reban_cooldown_decisions_total = Counter::default();
-        registry.register(
-            "brrpolice_policy_reban_cooldown_decisions",
-            "Total policy decisions blocked by reban cooldown.",
-            policy_reban_cooldown_decisions_total.clone(),
-        );
-
-        let policy_duplicate_suppressed_decisions_total = Counter::default();
-        registry.register(
-            "brrpolice_policy_duplicate_suppressed_decisions",
-            "Total policy decisions suppressed as duplicates for the same bannable episode.",
-            policy_duplicate_suppressed_decisions_total.clone(),
-        );
-
-        let score_policy_bans_applied_total = Counter::default();
-        registry.register(
-            "brrpolice_score_policy_bans_applied",
-            "Total bans applied with score-based reason code.",
-            score_policy_bans_applied_total.clone(),
-        );
-
-        let prune_runs_total = Counter::default();
+        let prune_runs_total = Family::<PruneRunLabels, Counter>::default();
         registry.register(
             "brrpolice_prune_runs",
-            "Total retention prune runs attempted.",
+            "Total retention prune runs by result.",
             prune_runs_total.clone(),
         );
 
-        let prune_failures_total = Counter::default();
+        let pruned_rows_total = Family::<PrunedRowsLabels, Counter>::default();
         registry.register(
-            "brrpolice_prune_failures",
-            "Total retention prune runs that failed.",
-            prune_failures_total.clone(),
+            "brrpolice_pruned_rows",
+            "Total rows deleted by retention pruning by table.",
+            pruned_rows_total.clone(),
         );
 
-        let pruned_peer_sessions_total = Counter::default();
+        let sqlite_pages_freed_total = Counter::default();
         registry.register(
-            "brrpolice_pruned_peer_sessions",
-            "Total peer_sessions rows deleted by retention pruning.",
-            pruned_peer_sessions_total.clone(),
-        );
-
-        let pruned_peer_offences_total = Counter::default();
-        registry.register(
-            "brrpolice_pruned_peer_offences",
-            "Total peer_offences rows deleted by retention pruning.",
-            pruned_peer_offences_total.clone(),
-        );
-
-        let pruned_active_bans_total = Counter::default();
-        registry.register(
-            "brrpolice_pruned_active_bans",
-            "Total active_bans rows deleted by retention pruning.",
-            pruned_active_bans_total.clone(),
-        );
-
-        let pruned_pending_ban_intents_total = Counter::default();
-        registry.register(
-            "brrpolice_pruned_pending_ban_intents",
-            "Total pending_ban_intents rows deleted by retention pruning.",
-            pruned_pending_ban_intents_total.clone(),
-        );
-
-        let pruned_vacuum_pages_total = Counter::default();
-        registry.register(
-            "brrpolice_pruned_vacuum_pages",
-            "Total SQLite pages requested via incremental vacuum during retention pruning.",
-            pruned_vacuum_pages_total.clone(),
-        );
-
-        let bans_applied_total = Counter::default();
-        registry.register(
-            "brrpolice_bans_applied",
-            "Total bans successfully applied.",
-            bans_applied_total.clone(),
-        );
-
-        let bans_expired_total = Counter::default();
-        registry.register(
-            "brrpolice_bans_expired",
-            "Total bans reconciled after expiry.",
-            bans_expired_total.clone(),
-        );
-
-        let ban_failures_total = Counter::default();
-        registry.register(
-            "brrpolice_ban_failures",
-            "Total enforcement failures while applying bans.",
-            ban_failures_total.clone(),
+            "brrpolice_sqlite_pages_freed",
+            "Total SQLite pages requested to be reclaimed during retention pruning.",
+            sqlite_pages_freed_total.clone(),
         );
 
         let qbittorrent_api_errors_total = Counter::default();
@@ -298,26 +241,15 @@ impl AppMetrics {
 
         Self {
             registry: Arc::new(registry),
-            peers_evaluated_total,
-            bad_peers_total,
+            peer_samples_total,
             score_policy_evaluations_total,
             score_policy_bannable_total,
-            policy_ban_decisions_total,
-            policy_not_bannable_decisions_total,
-            policy_exemption_decisions_total,
-            policy_reban_cooldown_decisions_total,
-            policy_duplicate_suppressed_decisions_total,
-            score_policy_bans_applied_total,
+            policy_decisions_total,
+            ban_results_total,
+            ban_applied_reasons_total,
             prune_runs_total,
-            prune_failures_total,
-            pruned_peer_sessions_total,
-            pruned_peer_offences_total,
-            pruned_active_bans_total,
-            pruned_pending_ban_intents_total,
-            pruned_vacuum_pages_total,
-            bans_applied_total,
-            bans_expired_total,
-            ban_failures_total,
+            pruned_rows_total,
+            sqlite_pages_freed_total,
             qbittorrent_api_errors_total,
             metrics_encode_errors_total,
             active_tracked_peers,
@@ -342,19 +274,29 @@ impl AppMetrics {
     }
 
     pub fn record_peer_evaluated(&self, is_bad_sample: bool) {
-        self.peers_evaluated_total.inc();
+        self.peer_samples_total
+            .get_or_create(&PeerSampleLabels { sample: "all" })
+            .inc();
         if is_bad_sample {
-            self.bad_peers_total.inc();
+            self.peer_samples_total
+                .get_or_create(&PeerSampleLabels { sample: "bad" })
+                .inc();
         }
     }
 
     pub fn record_ban_applied(&self, bad_duration: Duration, reason_code: &str) {
-        self.bans_applied_total.inc();
+        self.ban_results_total
+            .get_or_create(&BanResultLabels { result: "applied" })
+            .inc();
         self.bad_time_before_ban_seconds
             .observe(bad_duration.as_secs_f64());
-        if reason_code == "score_based" {
-            self.score_policy_bans_applied_total.inc();
-        }
+        let reason_code = match reason_code {
+            "score_based" => "score_based",
+            _ => "other",
+        };
+        self.ban_applied_reasons_total
+            .get_or_create(&BanAppliedReasonLabels { reason_code })
+            .inc();
     }
 
     pub fn record_score_evaluation(
@@ -375,33 +317,53 @@ impl AppMetrics {
     }
 
     pub fn record_policy_ban_decision(&self) {
-        self.policy_ban_decisions_total.inc();
+        self.policy_decisions_total
+            .get_or_create(&PolicyDecisionLabels { decision: "ban" })
+            .inc();
     }
 
     pub fn record_policy_not_bannable_decision(&self) {
-        self.policy_not_bannable_decisions_total.inc();
+        self.policy_decisions_total
+            .get_or_create(&PolicyDecisionLabels {
+                decision: "not_bannable",
+            })
+            .inc();
     }
 
     pub fn record_policy_exemption_decision(&self) {
-        self.policy_exemption_decisions_total.inc();
+        self.policy_decisions_total
+            .get_or_create(&PolicyDecisionLabels {
+                decision: "exemption",
+            })
+            .inc();
     }
 
     pub fn record_policy_reban_cooldown_decision(&self) {
-        self.policy_reban_cooldown_decisions_total.inc();
+        self.policy_decisions_total
+            .get_or_create(&PolicyDecisionLabels {
+                decision: "reban_cooldown",
+            })
+            .inc();
     }
 
     pub fn record_policy_duplicate_suppressed_decision(&self) {
-        self.policy_duplicate_suppressed_decisions_total.inc();
+        self.policy_decisions_total
+            .get_or_create(&PolicyDecisionLabels {
+                decision: "duplicate_suppressed",
+            })
+            .inc();
     }
 
     pub fn record_bans_expired(&self, count: usize) {
-        for _ in 0..count {
-            self.bans_expired_total.inc();
-        }
+        self.ban_results_total
+            .get_or_create(&BanResultLabels { result: "expired" })
+            .inc_by(count as u64);
     }
 
     pub fn record_ban_failure(&self) {
-        self.ban_failures_total.inc();
+        self.ban_results_total
+            .get_or_create(&BanResultLabels { result: "failed" })
+            .inc();
     }
 
     pub fn record_qbittorrent_request(&self, duration: Duration) {
@@ -431,23 +393,39 @@ impl AppMetrics {
         pending_ban_intents_deleted: u64,
         incremental_vacuum_pages: Option<u32>,
     ) {
-        self.prune_runs_total.inc();
+        self.prune_runs_total
+            .get_or_create(&PruneRunLabels { result: "success" })
+            .inc();
         self.prune_duration_seconds.observe(duration.as_secs_f64());
-        self.pruned_peer_sessions_total
+        self.pruned_rows_total
+            .get_or_create(&PrunedRowsLabels {
+                table: "peer_sessions",
+            })
             .inc_by(peer_sessions_deleted);
-        self.pruned_peer_offences_total
+        self.pruned_rows_total
+            .get_or_create(&PrunedRowsLabels {
+                table: "peer_offences",
+            })
             .inc_by(peer_offences_deleted);
-        self.pruned_active_bans_total.inc_by(active_bans_deleted);
-        self.pruned_pending_ban_intents_total
+        self.pruned_rows_total
+            .get_or_create(&PrunedRowsLabels {
+                table: "active_bans",
+            })
+            .inc_by(active_bans_deleted);
+        self.pruned_rows_total
+            .get_or_create(&PrunedRowsLabels {
+                table: "pending_ban_intents",
+            })
             .inc_by(pending_ban_intents_deleted);
         if let Some(pages) = incremental_vacuum_pages {
-            self.pruned_vacuum_pages_total.inc_by(u64::from(pages));
+            self.sqlite_pages_freed_total.inc_by(u64::from(pages));
         }
     }
 
     pub fn record_prune_failure(&self, duration: Duration) {
-        self.prune_runs_total.inc();
-        self.prune_failures_total.inc();
+        self.prune_runs_total
+            .get_or_create(&PruneRunLabels { result: "failure" })
+            .inc();
         self.prune_duration_seconds.observe(duration.as_secs_f64());
     }
 
@@ -479,5 +457,50 @@ impl AppMetrics {
 impl Default for AppMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppMetrics;
+    use std::time::Duration;
+
+    #[test]
+    fn prune_metrics_render_with_label_families() {
+        let metrics = AppMetrics::new();
+        metrics.record_prune_success(Duration::from_millis(25), 3, 2, 1, 4, Some(7));
+        metrics.record_prune_failure(Duration::from_millis(10));
+
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("brrpolice_prune_runs_total{result=\"success\"} 1"));
+        assert!(rendered.contains("brrpolice_prune_runs_total{result=\"failure\"} 1"));
+        assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"peer_sessions\"} 3"));
+        assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"peer_offences\"} 2"));
+        assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"active_bans\"} 1"));
+        assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"pending_ban_intents\"} 4"));
+        assert!(rendered.contains("brrpolice_sqlite_pages_freed_total 7"));
+    }
+
+    #[test]
+    fn collapsed_counters_render_expected_labels() {
+        let metrics = AppMetrics::new();
+        metrics.record_peer_evaluated(true);
+        metrics.record_policy_ban_decision();
+        metrics.record_policy_exemption_decision();
+        metrics.record_ban_applied(Duration::from_secs(3), "score_based");
+        metrics.record_ban_failure();
+        metrics.record_bans_expired(2);
+
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("brrpolice_peer_samples_total{sample=\"all\"} 1"));
+        assert!(rendered.contains("brrpolice_peer_samples_total{sample=\"bad\"} 1"));
+        assert!(rendered.contains("brrpolice_policy_decisions_total{decision=\"ban\"} 1"));
+        assert!(rendered.contains("brrpolice_policy_decisions_total{decision=\"exemption\"} 1"));
+        assert!(rendered.contains("brrpolice_bans_total{result=\"applied\"} 1"));
+        assert!(rendered.contains("brrpolice_bans_total{result=\"failed\"} 1"));
+        assert!(rendered.contains("brrpolice_bans_total{result=\"expired\"} 2"));
+        assert!(
+            rendered.contains("brrpolice_ban_applied_reasons_total{reason_code=\"score_based\"} 1")
+        );
     }
 }
