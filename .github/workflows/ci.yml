@@ -9,7 +9,7 @@ on:
       - "v*"
 
 jobs:
-  cargo-gates:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -47,9 +47,9 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  docker-image-goss:
+  publish:
     needs:
-      - cargo-gates
+      - test
     runs-on: ubuntu-latest
     permissions:
       contents: read
