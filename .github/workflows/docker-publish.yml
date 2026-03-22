@@ -9,6 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   packages: write
 
@@ -18,6 +19,51 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+
+      - name: Wait for CI workflow success
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const sha = context.sha;
+            const timeoutMs = 20 * 60 * 1000;
+            const pollIntervalMs = 15 * 1000;
+            const startedAt = Date.now();
+
+            while (Date.now() - startedAt < timeoutMs) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: "ci.yml",
+                head_sha: sha,
+                event: "push",
+                per_page: 20,
+              });
+
+              const matchingRuns = runs.data.workflow_runs
+                .filter((run) => run.head_sha === sha)
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+              if (matchingRuns.length === 0) {
+                core.info(`No CI run found for ${sha} yet; waiting...`);
+                await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                continue;
+              }
+
+              const run = matchingRuns[0];
+              core.info(`CI run ${run.id} status=${run.status} conclusion=${run.conclusion ?? "n/a"}`);
+
+              if (run.status !== "completed") {
+                await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                continue;
+              }
+
+              if (run.conclusion !== "success") {
+                core.setFailed(`CI run ${run.id} concluded with '${run.conclusion}', blocking image publish.`);
+              }
+              return;
+            }
+
+            core.setFailed(`Timed out waiting for CI success for commit ${sha}.`);
 
       - name: Resolve image name
         id: image
