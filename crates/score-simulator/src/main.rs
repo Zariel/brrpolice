@@ -85,6 +85,7 @@ struct LogFields {
     torrent_hash: String,
     torrent_name: Option<String>,
     torrent_tracker: Option<String>,
+    torrent_size_bytes: Option<u64>,
     observed_at: String,
     progress_delta: f64,
     average_upload_rate_bps: u64,
@@ -262,6 +263,7 @@ fn process_fields(
                 .clone()
                 .unwrap_or_else(|| fields.torrent_hash.clone()),
             tracker: fields.torrent_tracker.clone(),
+            total_size_bytes: fields.torrent_size_bytes.unwrap_or(0),
             category: None,
             tags: Vec::new(),
             total_seeders: config.policy.min_total_seeders.max(1),
@@ -407,6 +409,7 @@ fn extract_log_fields(
         .get("torrent_tracker")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let torrent_size_bytes = fields.get("torrent_size_bytes").and_then(Value::as_u64);
     let observed_at = fields
         .get("observed_at")
         .and_then(Value::as_str)
@@ -431,6 +434,7 @@ fn extract_log_fields(
         torrent_hash,
         torrent_name,
         torrent_tracker,
+        torrent_size_bytes,
         observed_at,
         progress_delta,
         average_upload_rate_bps,
@@ -484,12 +488,15 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
             .join(",")
     );
     println!(
-        "config: target_rate_bps={} required_progress_delta={:.6} progress_rate_scale(start={:.3},end={:.3},min={:.3}) weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_amplifier={:.3},decay_per_second={:.6})",
+        "config: target_rate_bps={} required_progress_delta={:.6} progress_rate_scale(start={:.3},end={:.3},min={:.3}) progress_size_scale(reference_bytes={},min={:.3},max={:.3}) weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_amplifier={:.3},decay_per_second={:.6})",
         config.policy.score.target_rate_bps,
         config.policy.score.required_progress_delta,
         config.policy.score.progress_rate_scale_start,
         config.policy.score.progress_rate_scale_end,
         config.policy.score.progress_rate_min_scale,
+        config.policy.score.progress_size_reference_bytes,
+        config.policy.score.progress_size_scale_min,
+        config.policy.score.progress_size_scale_max,
         config.policy.score.weight_rate,
         config.policy.score.weight_progress,
         config.policy.score.rate_risk_floor,
@@ -584,6 +591,18 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                 config.policy.score.progress_rate_min_scale =
                     parse_f64_arg(&mut iter, "--progress-rate-min-scale")?;
             }
+            "--progress-size-reference-bytes" => {
+                config.policy.score.progress_size_reference_bytes =
+                    parse_u64_arg(&mut iter, "--progress-size-reference-bytes")?;
+            }
+            "--progress-size-scale-min" => {
+                config.policy.score.progress_size_scale_min =
+                    parse_f64_arg(&mut iter, "--progress-size-scale-min")?;
+            }
+            "--progress-size-scale-max" => {
+                config.policy.score.progress_size_scale_max =
+                    parse_f64_arg(&mut iter, "--progress-size-scale-max")?;
+            }
             "--weight-rate" => {
                 config.policy.score.weight_rate = parse_f64_arg(&mut iter, "--weight-rate")?;
             }
@@ -676,6 +695,12 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
     if !(0.0..=1.0).contains(&config.policy.score.progress_rate_min_scale) {
         bail!("--progress-rate-min-scale must be between 0.0 and 1.0");
     }
+    if config.policy.score.progress_size_scale_min <= 0.0 {
+        bail!("--progress-size-scale-min must be > 0.0");
+    }
+    if config.policy.score.progress_size_scale_max < config.policy.score.progress_size_scale_min {
+        bail!("--progress-size-scale-max must be >= --progress-size-scale-min");
+    }
     if config.policy.score.weight_rate < 0.0 || config.policy.score.weight_progress < 0.0 {
         bail!("weights must be non-negative");
     }
@@ -735,6 +760,9 @@ fn print_help() {
     println!("  --progress-rate-scale-start <f>  Rate multiple where progress scaling begins");
     println!("  --progress-rate-scale-end <f>    Rate multiple where progress scaling reaches min");
     println!("  --progress-rate-min-scale <f>    Minimum scale applied to required progress");
+    println!("  --progress-size-reference-bytes <n>  Reference torrent size for progress scaling");
+    println!("  --progress-size-scale-min <f>    Minimum torrent-size scale on required progress");
+    println!("  --progress-size-scale-max <f>    Maximum torrent-size scale on required progress");
     println!("  --weight-rate <f>                Weight for rate-risk feature");
     println!("  --weight-progress <f>            Weight for progress-risk feature");
     println!("  --rate-risk-floor <f>            Non-compensatory floor multiplier for rate risk");

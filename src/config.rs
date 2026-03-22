@@ -65,6 +65,9 @@ impl AppConfig {
             .set_default("policy.score.progress_rate_scale_start", 2.0_f64)?
             .set_default("policy.score.progress_rate_scale_end", 16.0_f64)?
             .set_default("policy.score.progress_rate_min_scale", 0.25_f64)?
+            .set_default("policy.score.progress_size_reference_bytes", 0_u64)?
+            .set_default("policy.score.progress_size_scale_min", 1.0_f64)?
+            .set_default("policy.score.progress_size_scale_max", 1.0_f64)?
             .set_default("policy.score.weight_rate", 0.35_f64)?
             .set_default("policy.score.weight_progress", 0.65_f64)?
             .set_default("policy.score.rate_risk_floor", 0.4_f64)?
@@ -147,6 +150,9 @@ impl AppConfig {
                 "policy.score.progress_rate_scale_start={:.6}\n",
                 "policy.score.progress_rate_scale_end={:.6}\n",
                 "policy.score.progress_rate_min_scale={:.6}\n",
+                "policy.score.progress_size_reference_bytes={}\n",
+                "policy.score.progress_size_scale_min={:.6}\n",
+                "policy.score.progress_size_scale_max={:.6}\n",
                 "policy.score.weight_rate={:.6}\n",
                 "policy.score.weight_progress={:.6}\n",
                 "policy.score.rate_risk_floor={:.6}\n",
@@ -201,6 +207,9 @@ impl AppConfig {
             self.policy.score.progress_rate_scale_start,
             self.policy.score.progress_rate_scale_end,
             self.policy.score.progress_rate_min_scale,
+            self.policy.score.progress_size_reference_bytes,
+            self.policy.score.progress_size_scale_min,
+            self.policy.score.progress_size_scale_max,
             self.policy.score.weight_rate,
             self.policy.score.weight_progress,
             self.policy.score.rate_risk_floor,
@@ -327,6 +336,14 @@ impl AppConfig {
         }
         if !(0.0..=1.0).contains(&self.policy.score.progress_rate_min_scale) {
             bail!("policy.score.progress_rate_min_scale must be between 0.0 and 1.0");
+        }
+        if self.policy.score.progress_size_scale_min <= 0.0 {
+            bail!("policy.score.progress_size_scale_min must be > 0.0");
+        }
+        if self.policy.score.progress_size_scale_max < self.policy.score.progress_size_scale_min {
+            bail!(
+                "policy.score.progress_size_scale_max must be >= policy.score.progress_size_scale_min"
+            );
         }
         if self.policy.score.weight_rate < 0.0 || self.policy.score.weight_progress < 0.0 {
             bail!("policy.score weights must be >= 0.0");
@@ -478,6 +495,9 @@ pub struct ScorePolicyConfig {
     pub progress_rate_scale_start: f64,
     pub progress_rate_scale_end: f64,
     pub progress_rate_min_scale: f64,
+    pub progress_size_reference_bytes: u64,
+    pub progress_size_scale_min: f64,
+    pub progress_size_scale_max: f64,
     pub weight_rate: f64,
     pub weight_progress: f64,
     pub rate_risk_floor: f64,
@@ -501,6 +521,9 @@ impl Default for ScorePolicyConfig {
             progress_rate_scale_start: 2.0,
             progress_rate_scale_end: 16.0,
             progress_rate_min_scale: 0.25,
+            progress_size_reference_bytes: 0,
+            progress_size_scale_min: 1.0,
+            progress_size_scale_max: 1.0,
             weight_rate: 0.35,
             weight_progress: 0.65,
             rate_risk_floor: 0.4,

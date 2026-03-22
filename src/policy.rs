@@ -200,8 +200,11 @@ impl PolicyEngine {
                 .unwrap_or_default();
             let observed_duration = session.observed_duration;
             let progress_delta = (peer.peer.progress - session.baseline_progress).max(0.0);
-            let required_progress_delta =
-                self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
+            let required_progress_delta = self.required_progress_delta(
+                observed_duration,
+                peer.peer.up_rate_bps,
+                peer.torrent.total_size_bytes,
+            );
             let exemption = session.last_exemption_reason.clone();
             let is_bad_sample = exemption.is_none()
                 && peer.peer.up_rate_bps < self.config.score.target_rate_bps
@@ -263,8 +266,11 @@ impl PolicyEngine {
             sample_duration,
         );
         let progress_delta = (peer.peer.progress - baseline_progress).max(0.0);
-        let required_progress_delta =
-            self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
+        let required_progress_delta = self.required_progress_delta(
+            observed_duration,
+            peer.peer.up_rate_bps,
+            peer.torrent.total_size_bytes,
+        );
         let exemption = self.classify_exemption(peer);
         let is_bad_sample = exemption.is_none()
             && peer.peer.up_rate_bps < self.config.score.target_rate_bps
@@ -398,6 +404,7 @@ impl PolicyEngine {
         let required_progress_delta = self.required_progress_delta(
             evaluation.session.observed_duration,
             evaluation.session.rolling_avg_up_rate_bps,
+            peer.torrent.total_size_bytes,
         );
         let rate_risk = normalized_rate_risk(
             evaluation.sample_up_rate_bps,
@@ -564,7 +571,12 @@ impl PolicyEngine {
         (reconnect_count, window_started_at, amplifier)
     }
 
-    fn required_progress_delta(&self, observed_duration: Duration, up_rate_bps: u64) -> f64 {
+    fn required_progress_delta(
+        &self,
+        observed_duration: Duration,
+        up_rate_bps: u64,
+        torrent_size_bytes: u64,
+    ) -> f64 {
         if observed_duration.is_zero() || self.config.score.required_progress_delta <= 0.0 {
             return 0.0;
         }
@@ -572,12 +584,29 @@ impl PolicyEngine {
         let sustain_secs = self.config.score.sustain_duration.as_secs_f64();
         if sustain_secs <= 0.0 {
             return self.config.score.required_progress_delta
-                * self.progress_rate_scale(up_rate_bps);
+                * self.progress_rate_scale(up_rate_bps)
+                * self.progress_size_scale(torrent_size_bytes);
         }
 
         let observed_secs = observed_duration.as_secs_f64();
         let ramp = (observed_secs / sustain_secs).clamp(0.0, 1.0);
-        self.config.score.required_progress_delta * ramp * self.progress_rate_scale(up_rate_bps)
+        self.config.score.required_progress_delta
+            * ramp
+            * self.progress_rate_scale(up_rate_bps)
+            * self.progress_size_scale(torrent_size_bytes)
+    }
+
+    fn progress_size_scale(&self, torrent_size_bytes: u64) -> f64 {
+        let reference = self.config.score.progress_size_reference_bytes;
+        if reference == 0 || torrent_size_bytes == 0 {
+            return 1.0;
+        }
+
+        let raw = reference as f64 / torrent_size_bytes as f64;
+        raw.clamp(
+            self.config.score.progress_size_scale_min,
+            self.config.score.progress_size_scale_max,
+        )
     }
 
     fn progress_rate_scale(&self, up_rate_bps: u64) -> f64 {
@@ -978,11 +1007,57 @@ mod tests {
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
 
-        let baseline = engine.required_progress_delta(Duration::from_secs(120), 1_000);
-        let scaled = engine.required_progress_delta(Duration::from_secs(120), 4_000);
+        let baseline = engine.required_progress_delta(Duration::from_secs(120), 1_000, 0);
+        let scaled = engine.required_progress_delta(Duration::from_secs(120), 4_000, 0);
 
         assert_eq!(baseline, 0.02);
         assert_eq!(scaled, 0.005);
+    }
+
+    #[test]
+    fn progress_size_scale_relaxes_required_progress_for_large_torrents() {
+        let config = PolicyConfig {
+            score: ScorePolicyConfig {
+                target_rate_bps: 1_000,
+                required_progress_delta: 0.02,
+                progress_size_reference_bytes: 100,
+                progress_size_scale_min: 0.25,
+                progress_size_scale_max: 1.0,
+                ..ScorePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let large = engine.required_progress_delta(Duration::from_secs(120), 1_000, 400);
+        let reference = engine.required_progress_delta(Duration::from_secs(120), 1_000, 100);
+        let small = engine.required_progress_delta(Duration::from_secs(120), 1_000, 25);
+
+        assert_eq!(large, 0.005);
+        assert_eq!(reference, 0.02);
+        assert_eq!(small, 0.02);
+    }
+
+    #[test]
+    fn progress_size_scale_can_normalize_both_large_and_small_torrents() {
+        let config = PolicyConfig {
+            score: ScorePolicyConfig {
+                target_rate_bps: 1_000,
+                required_progress_delta: 0.02,
+                progress_size_reference_bytes: 100,
+                progress_size_scale_min: 0.25,
+                progress_size_scale_max: 4.0,
+                ..ScorePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let large = engine.required_progress_delta(Duration::from_secs(120), 1_000, 400);
+        let small = engine.required_progress_delta(Duration::from_secs(120), 1_000, 25);
+
+        assert_eq!(large, 0.005);
+        assert_eq!(small, 0.08);
     }
 
     #[test]
@@ -1722,6 +1797,7 @@ mod tests {
                 hash: "abc123".to_string(),
                 name: "torrent-abc123".to_string(),
                 tracker: None,
+                total_size_bytes: 0,
                 category: Some("tv".to_string()),
                 tags: vec!["seed".to_string()],
                 total_seeders: 5,
