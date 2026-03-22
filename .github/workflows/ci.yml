@@ -68,3 +68,75 @@ jobs:
 
       - name: Validate image with goss
         run: goss -g ci/goss/docker-image.yaml validate
+
+  docker-publish:
+    if: github.event_name == 'push'
+    needs:
+      - cargo-gates
+      - docker-image-goss
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Validate publish tag contract
+        env:
+          RESOLVED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          expected_tag="${GITHUB_REF_NAME//\//-}"
+          mapfile -t tags < <(printf "%s\n" "$RESOLVED_TAGS" | sed '/^$/d')
+          if [ "${#tags[@]}" -ne 1 ]; then
+            echo "expected exactly one publish tag, got ${#tags[@]}: ${tags[*]}" >&2
+            exit 1
+          fi
+          actual_ref="${tags[0]}"
+          actual_tag="${actual_ref##*:}"
+          if [ "$actual_tag" != "$expected_tag" ]; then
+            echo "expected publish tag '$expected_tag' but got '$actual_tag'" >&2
+            exit 1
+          fi
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=${{ github.workflow }}-${{ github.ref_name }}
+            type=gha,scope=${{ github.workflow }}-main
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ github.ref_name }}
