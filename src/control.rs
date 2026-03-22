@@ -203,7 +203,7 @@ impl ControlLoop {
             .await?;
         self.mark_expired_bans_reconciled(&expired_bans, now)
             .await?;
-        let (replayed_pending_count, dropped_stale_pending_count, failed_pending_count) = self
+        let (replayed_pending_count, failed_pending_count) = self
             .replay_pending_ban_intents(&snapshot.pending_ban_intents, &mut active_bans, now)
             .await?;
         self.refresh_gauges().await?;
@@ -215,7 +215,6 @@ impl ControlLoop {
             expired_ban_count = expired_bans.len(),
             pending_ban_intent_count = snapshot.pending_ban_intents.len(),
             replayed_pending_ban_count = replayed_pending_count,
-            dropped_stale_pending_ban_count = dropped_stale_pending_count,
             failed_pending_ban_replay_count = failed_pending_count,
             "startup recovery completed"
         );
@@ -888,30 +887,20 @@ impl ControlLoop {
         pending_ban_intents: &[PendingBanIntentRecord],
         active_bans: &mut Vec<ActiveBanRecord>,
         recovered_at: std::time::SystemTime,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<(usize, usize)> {
         let mut replayed = 0;
-        let mut stale_dropped = 0;
         let mut failed = 0;
 
         let mut shutdown = self.shutdown.clone();
         for intent in pending_ban_intents {
             if intent.ban_expires_at <= recovered_at {
-                self.persistence
-                    .delete_pending_ban_intent(
-                        &intent.torrent_hash,
-                        intent.peer_ip,
-                        intent.peer_port,
-                        intent.offence_number,
-                    )
-                    .await?;
-                stale_dropped += 1;
-                info!(
+                debug!(
                     torrent_hash = %intent.torrent_hash,
                     peer_ip = %intent.peer_ip,
                     peer_port = intent.peer_port,
                     offence_number = intent.offence_number,
                     ban_expires_at = %format_timestamp(intent.ban_expires_at),
-                    "dropped stale pending ban intent during startup recovery"
+                    "skipping expired pending ban intent during startup recovery; periodic retention prune will clean it up"
                 );
                 continue;
             }
@@ -946,7 +935,7 @@ impl ControlLoop {
                         tokio::select! {
                             _ = time::sleep(delay) => {}
                             _ = wait_for_shutdown_signal(&mut shutdown) => {
-                                return Ok((replayed, stale_dropped, failed));
+                                return Ok((replayed, failed));
                             }
                         }
                         attempt += 1;
@@ -968,7 +957,7 @@ impl ControlLoop {
             }
         }
 
-        Ok((replayed, stale_dropped, failed))
+        Ok((replayed, failed))
     }
 
     async fn replay_pending_ban_intent(
@@ -1644,7 +1633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_drops_stale_pending_ban_intents() {
+    async fn startup_recovery_retains_expired_pending_ban_intents_for_periodic_prune() {
         let persistence = Arc::new(test_persistence().await);
         persistence.run_migrations().await.unwrap();
         let metrics = Arc::new(AppMetrics::new());
@@ -1706,12 +1695,9 @@ mod tests {
         );
 
         control.recover_startup_state().await.unwrap();
-        assert!(
-            persistence
-                .load_pending_ban_intents()
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            persistence.load_pending_ban_intents().await.unwrap().len(),
+            1
         );
 
         server.await.unwrap();
