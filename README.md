@@ -214,6 +214,10 @@ curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
 
+## Grafana Dashboard
+
+Import [`dashboards/grafana/brrpolice-overview.json`](dashboards/grafana/brrpolice-overview.json) into Grafana to get a starter operational dashboard for brrpolice metrics.
+
 ## License
 
 This project is licensed under the terms in [`LICENSE`](LICENSE).
