@@ -155,9 +155,9 @@ qBittorrent auth rule:
 | `retention.enabled` | `BRRPOLICE_RETENTION__ENABLED` | `true` | Enables periodic SQLite retention pruning. |
 | `retention.prune_interval` | `BRRPOLICE_RETENTION__PRUNE_INTERVAL` | `1h` | Minimum time between prune runs. |
 | `retention.peer_session_max_age` | `BRRPOLICE_RETENTION__PEER_SESSION_MAX_AGE` | `7d` | Maximum age of peer session rows before they become prune-eligible. |
-| `retention.peer_offence_max_age` | `BRRPOLICE_RETENTION__PEER_OFFENCE_MAX_AGE` | `90d` | Maximum age of offence history rows before they become prune-eligible. |
+| `retention.peer_offence_max_age` | `BRRPOLICE_RETENTION__PEER_OFFENCE_MAX_AGE` | `90d` | Maximum age of offence history rows before they become prune-eligible while preserving ban-ladder continuity. |
 | `retention.reconciled_ban_max_age` | `BRRPOLICE_RETENTION__RECONCILED_BAN_MAX_AGE` | `30d` | Maximum age of reconciled active ban rows before cleanup. |
-| `retention.pending_intent_max_age` | `BRRPOLICE_RETENTION__PENDING_INTENT_MAX_AGE` | `24h` | Maximum age for failed pending ban intents once expired. Replayable intents are retained. |
+| `retention.pending_intent_max_age` | `BRRPOLICE_RETENTION__PENDING_INTENT_MAX_AGE` | `24h` | Maximum time expired failed pending ban intents are retained before periodic cleanup. Replayable intents are retained. |
 | `retention.max_rows_per_run` | `BRRPOLICE_RETENTION__MAX_ROWS_PER_RUN` | `5000` | Per-table delete cap per prune run to bound write pressure. |
 | `retention.vacuum.mode` | `BRRPOLICE_RETENTION__VACUUM__MODE` | `incremental` | SQLite reclaim mode after prune runs (`incremental` or `off`). |
 | `retention.vacuum.incremental_pages` | `BRRPOLICE_RETENTION__VACUUM__INCREMENTAL_PAGES` | `200` | Number of SQLite pages requested per incremental vacuum run. |
