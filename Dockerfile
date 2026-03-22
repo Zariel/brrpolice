@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:slim-bookworm AS chef
+FROM ghcr.io/rust-lang/rust:slim-bookworm AS chef
 
 WORKDIR /workspace
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target,target=/workspace/target \
     cargo install cargo-chef --locked --version 0.1.74
 
 FROM chef AS planner
@@ -25,25 +26,27 @@ COPY crates/score-simulator/Cargo.toml crates/score-simulator/Cargo.toml
 COPY --from=planner /workspace/recipe.json recipe.json
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target,target=/workspace/target \
     cargo chef cook --release --locked --recipe-path recipe.json
 
-COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
-COPY crates/score-simulator/Cargo.toml crates/score-simulator/Cargo.toml
 COPY migrations ./migrations
 COPY src ./src
 COPY crates/score-simulator/src crates/score-simulator/src
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target,target=/workspace/target \
     rm -f /workspace/target/release/brrpolice /workspace/target/release/deps/brrpolice* \
     && cargo build --release --locked -p brrpolice --bin brrpolice \
+    && mkdir -p /workspace/artifacts \
+    && cp /workspace/target/release/brrpolice /workspace/artifacts/brrpolice \
     && mkdir -p /workspace/data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 WORKDIR /app
 
-COPY --from=builder /workspace/target/release/brrpolice /app/brrpolice
+COPY --from=builder /workspace/artifacts/brrpolice /app/brrpolice
 COPY --from=builder --chown=nonroot:nonroot /workspace/data /data
 COPY --from=builder /workspace/migrations /app/migrations
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
