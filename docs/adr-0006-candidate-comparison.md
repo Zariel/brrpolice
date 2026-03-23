@@ -10,6 +10,10 @@ This document records the first replay comparison required by
 [`adr-0006-evaluation-spec.md`](./adr-0006-evaluation-spec.md). It compares the current shipped
 score model with replay-only ADR-0006 candidates on local corpora under `samples/logs`.
 
+Throughout this document, `current_composite` is the replay stand-in for the behavior currently on
+`main` and is the primary evaluation baseline. Candidate-to-candidate comparisons are included only
+as secondary search guidance.
+
 The corpus files are intentionally gitignored and are not part of this document. This report keeps
 only aggregated outcomes and representative peer examples.
 
@@ -29,7 +33,8 @@ hydrate the logged current-policy scores.
 
 ### `current_composite`
 
-Current weighted composite score model using the existing rate and progress weighting.
+Current weighted composite score model using the existing rate and progress weighting. This is the
+replay representation of the policy currently on `main`.
 
 ### `rate_primary_amplified`
 
@@ -176,17 +181,17 @@ production formula.
 
 Current conclusion:
 
-- `rate_primary_amplified` is directionally closer to the ADR than the current composite model
-  because it rescues several clearly healthy large-torrent peers while preserving clearly-bad ban
-  status on these corpora
+- against `main`, `rate_primary_amplified` is directionally closer to the ADR because it rescues
+  several clearly healthy large-torrent peers while preserving clearly-bad ban status on these
+  corpora
 - `rate_primary_residency_shoulder` better matches the clarified product intuition for
-  slightly-above-target, low-completion peers, but on replay it overcorrects and becomes more
-  ban-heavy than the simpler amplified candidate
+  slightly-above-target, low-completion peers, but against `main` it overcorrects and becomes too
+  ban-heavy on the noisier corpus
 - `rate_primary_gated_residency_shoulder` fixes that over-banning by narrowing the shoulder to an
-  above-target-only, low-completion gate, but on these corpora it collapses to the same aggregate
-  behavior as `rate_primary_amplified`
-- `rate_primary_amplified` still fails the healthy-rate hard gate and remains too permissive in
-  marginal and high-side-gray cases
+  above-target-only, low-completion gate, but against `main` it does not improve aggregate
+  outcomes beyond the existing `rate_primary_amplified` candidate
+- even the best current candidate against `main`, `rate_primary_amplified`, still fails the
+  healthy-rate hard gate and remains too permissive in marginal and high-side-gray cases
 - `marginal_band_bounded` is not acceptable in its current form because it weakens clearly-bad
   low-rate safety while still leaving healthy-rate bans behind
 
@@ -210,9 +215,10 @@ Results:
 
 - the stricter taper did not materially change aggregate outcomes for `rate_primary_amplified`
 - the broad residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
-  but regressed badly on `logs-2026-03-23`, increasing total simulated bans from `16` to `23`
-- the gated residency-shoulder candidate removed that regression, but it also produced the same
-  aggregate outcomes as `rate_primary_amplified` on both corpora
+  relative to `main`, but regressed badly on `logs-2026-03-23`, increasing total simulated bans
+  from `22` on `main` to `23`
+- the gated residency-shoulder candidate removed that regression relative to `main`, but it also
+  failed to improve aggregate outcomes beyond `rate_primary_amplified`
 
 Current interpretation:
 
@@ -230,4 +236,5 @@ iteration is required before a production ADR-0006 model can be selected, but fu
 should start from the `rate_primary_amplified` family rather than the bounded marginal-band
 variant, should treat `rate_primary_residency_shoulder` as an informative failed branch rather
 than the new baseline, and should treat `rate_primary_gated_residency_shoulder` as evidence that
-conservative shoulder/taper tuning can quickly collapse back to amplified-equivalent behavior.
+conservative shoulder/taper tuning can quickly collapse back to the same outcomes as the current
+best candidate without materially improving on `main`.
