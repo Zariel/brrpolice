@@ -74,6 +74,17 @@ amplified model lacks:
 This candidate was added after clarifying that "slightly above target" peers can still be strong
 ban candidates when expected residency is long.
 
+### `rate_primary_gated_residency_shoulder`
+
+Replay-only follow-up that keeps the same intuition but applies it more conservatively:
+
+- the shoulder only applies above target, not below it
+- the shoulder narrows to `1.0x..1.15x` target rate
+- the extra pressure only applies while completion is still low
+
+On the current corpora this avoids the broad shoulder regression, but it ends up behaving
+identically to `rate_primary_amplified` in aggregate.
+
 ## Summary
 
 ### Corpus: `prod-fixed`
@@ -83,6 +94,7 @@ ban candidates when expected residency is long.
 | `current_composite` | 188 | 23 | 22 |
 | `rate_primary_amplified` | 188 | 23 | 22 |
 | `rate_primary_residency_shoulder` | 188 | 24 | 22 |
+| `rate_primary_gated_residency_shoulder` | 188 | 23 | 22 |
 | `marginal_band_bounded` | 188 | 22 | 22 |
 
 Key band outcomes versus current:
@@ -91,6 +103,7 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_residency_shoulder` | 0 | 3 | 1 | 3 | 1 |
+| `rate_primary_gated_residency_shoulder` | 0 | 3 | 2 | 3 | 1 |
 | `marginal_band_bounded` | 2 | 3 | 1 | 3 | 1 |
 
 ### Corpus: `logs-2026-03-23`
@@ -100,6 +113,7 @@ Key band outcomes versus current:
 | `current_composite` | 176 | 22 | 21 |
 | `rate_primary_amplified` | 176 | 16 | 21 |
 | `rate_primary_residency_shoulder` | 176 | 23 | 21 |
+| `rate_primary_gated_residency_shoulder` | 176 | 16 | 21 |
 | `marginal_band_bounded` | 176 | 16 | 21 |
 
 Key band outcomes versus current:
@@ -108,6 +122,7 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_residency_shoulder` | 0 | 2 | 1 | 1 | 3 | 6 |
+| `rate_primary_gated_residency_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `marginal_band_bounded` | 1 | 1 | 1 | 1 | 4 | 4 |
 
 ## Representative Peer Examples
@@ -121,17 +136,17 @@ These peers were banned by the current model despite clearly healthy rate bands 
 byte-domain progress deficits that appear to be percentage-driven artefacts:
 
 - `prod-fixed healthy-case-a`:
-  baseline banned, both candidates keep; rate ratio `6.32`, progress deficit `2.33 GB`
+  baseline banned, all rate-primary candidates keep; rate ratio `6.32`, progress deficit `2.33 GB`
 - `prod-fixed healthy-case-b`:
-  baseline banned, both candidates keep; rate ratio `4.29`, progress deficit `2.67 GB`
+  baseline banned, all rate-primary candidates keep; rate ratio `4.29`, progress deficit `2.67 GB`
 - `logs-2026-03-23 healthy-case-c`:
-  baseline banned, both candidates keep; rate ratio `2.28`, progress deficit `1.60 GB`
+  baseline banned, all rate-primary candidates keep; rate ratio `2.28`, progress deficit `1.60 GB`
 
 ### Healthy-rate regressions that remain unacceptable
 
-Neither candidate cleared the healthy-rate hard gate:
+No replay-only candidate cleared the healthy-rate hard gate:
 
-- `prod-fixed` still ends with `1` clearly healthy simulated ban under both candidates
+- `prod-fixed` still ends with `1` clearly healthy simulated ban under all rate-primary candidates
 - `logs-2026-03-23` still ends with `5` clearly healthy bans under `rate_primary_amplified`
   and `4` under `marginal_band_bounded`
 - `logs-2026-03-23 healthy-regression-a` flips from keep to ban under
@@ -167,6 +182,9 @@ Current conclusion:
 - `rate_primary_residency_shoulder` better matches the clarified product intuition for
   slightly-above-target, low-completion peers, but on replay it overcorrects and becomes more
   ban-heavy than the simpler amplified candidate
+- `rate_primary_gated_residency_shoulder` fixes that over-banning by narrowing the shoulder to an
+  above-target-only, low-completion gate, but on these corpora it collapses to the same aggregate
+  behavior as `rate_primary_amplified`
 - `rate_primary_amplified` still fails the healthy-rate hard gate and remains too permissive in
   marginal and high-side-gray cases
 - `marginal_band_bounded` is not acceptable in its current form because it weakens clearly-bad
@@ -174,7 +192,7 @@ Current conclusion:
 
 ## Follow-up Iteration
 
-The next refinement passes tested two ideas:
+The next refinement passes tested three ideas:
 
 1. A stricter taper for `rate_primary_amplified`:
    - full progress influence at or below `1.0x` target rate
@@ -183,28 +201,33 @@ The next refinement passes tested two ideas:
 2. A separate `rate_primary_residency_shoulder` candidate:
    - small above-target base-risk shoulder through `1.5x`
    - residency pressure from low completion plus progress inefficiency
+3. A narrower `rate_primary_gated_residency_shoulder` follow-up:
+   - shoulder only above target, never below it
+   - shoulder narrowed to `1.0x..1.15x`
+   - extra pressure only while completion remains low
 
 Results:
 
 - the stricter taper did not materially change aggregate outcomes for `rate_primary_amplified`
-- the residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
-- the residency-shoulder candidate regressed badly on `logs-2026-03-23`, increasing total
-  simulated bans from `16` to `23` versus the simpler amplified candidate and increasing low-side
-  and clearly healthy gained bans
+- the broad residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
+  but regressed badly on `logs-2026-03-23`, increasing total simulated bans from `16` to `23`
+- the gated residency-shoulder candidate removed that regression, but it also produced the same
+  aggregate outcomes as `rate_primary_amplified` on both corpora
 
 Current interpretation:
 
 - the rate-primary tapered-amplification family is still the most credible ADR-0006 direction to
   keep iterating on
 - the specific taper refinement is not enough to unblock production work
-- the first residency-shoulder attempt is not good enough to replace the simpler amplified model
-- the remaining errors are still around how near-target and slightly-above-target peers accumulate
-  risk, but the next attempt needs to be more conservative than the current shoulder variant
+- a broad above-target shoulder over-bans, while a tightly gated shoulder becomes too weak to move
+  replay outcomes on the current corpora
+- shoulder and taper tuning alone still appear insufficient to select a production winner
 
 ## Consequence For Backlog
 
 `brrpolice-d6br.4` should not start from either candidate in this document. More candidate
 iteration is required before a production ADR-0006 model can be selected, but future refinement
 should start from the `rate_primary_amplified` family rather than the bounded marginal-band
-variant, and should treat `rate_primary_residency_shoulder` as an informative failed branch rather
-than the new baseline.
+variant, should treat `rate_primary_residency_shoulder` as an informative failed branch rather
+than the new baseline, and should treat `rate_primary_gated_residency_shoulder` as evidence that
+conservative shoulder/taper tuning can quickly collapse back to amplified-equivalent behavior.

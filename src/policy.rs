@@ -31,6 +31,7 @@ pub enum ReplayScoreModel {
     CurrentComposite,
     RatePrimaryAmplified,
     RatePrimaryResidencyShoulder,
+    RatePrimaryGatedResidencyShoulder,
     MarginalBandBounded,
 }
 
@@ -40,6 +41,7 @@ impl ReplayScoreModel {
             Self::CurrentComposite => "current_composite",
             Self::RatePrimaryAmplified => "rate_primary_amplified",
             Self::RatePrimaryResidencyShoulder => "rate_primary_residency_shoulder",
+            Self::RatePrimaryGatedResidencyShoulder => "rate_primary_gated_residency_shoulder",
             Self::MarginalBandBounded => "marginal_band_bounded",
         }
     }
@@ -52,6 +54,9 @@ impl ReplayScoreModel {
             }
             Self::RatePrimaryResidencyShoulder => {
                 "Rate-primary risk with an above-target shoulder and residency pressure for long-lived peers."
+            }
+            Self::RatePrimaryGatedResidencyShoulder => {
+                "Rate-primary risk with a narrow above-target shoulder gated to low-completion peers."
             }
             Self::MarginalBandBounded => {
                 "Rate-primary model where progress inefficiency only contributes inside the marginal rate band."
@@ -806,6 +811,9 @@ impl PolicyEngine {
             ReplayScoreModel::RatePrimaryResidencyShoulder => {
                 replay_rate_primary_base_risk(rate_ratio, 1.0, 1.5, 0.15)
             }
+            ReplayScoreModel::RatePrimaryGatedResidencyShoulder => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
             ReplayScoreModel::MarginalBandBounded => {
                 normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
             }
@@ -836,6 +844,18 @@ impl PolicyEngine {
                 let residency_pressure = replay_residency_pressure(current_progress, progress_risk);
                 let amplification = 1.0 + (1.4 * residency_pressure * healthy_taper);
                 (rate_risk * amplification).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryGatedResidencyShoulder => {
+                let below_target_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
+                let base_amplified =
+                    rate_risk * (1.0 + (0.75 * progress_risk * below_target_taper));
+                let above_target_taper = above_target_shoulder_taper(rate_ratio, 1.0, 1.15);
+                let low_completion_gate = smooth_rolloff(current_progress, 0.20, 0.60);
+                let residency_pressure = replay_residency_pressure(current_progress, progress_risk);
+                let shoulder_risk =
+                    0.18 * above_target_taper * low_completion_gate * residency_pressure;
+
+                (base_amplified + shoulder_risk).clamp(0.0, 1.0)
             }
             ReplayScoreModel::MarginalBandBounded => {
                 if !(0.75..=1.25).contains(&rate_ratio) {
@@ -950,6 +970,14 @@ fn replay_residency_pressure(current_progress: f64, progress_risk: f64) -> f64 {
     let remaining_fraction = 1.0 - current_progress;
     let weighted = (0.55 * progress_risk) + (0.75 * remaining_fraction);
     weighted.clamp(0.0, 1.0)
+}
+
+fn above_target_shoulder_taper(value: f64, start: f64, end: f64) -> f64 {
+    if !value.is_finite() || value <= start {
+        return 0.0;
+    }
+
+    smooth_rolloff(value, start, end)
 }
 
 fn smooth_rolloff(value: f64, start: f64, end: f64) -> f64 {
@@ -1234,6 +1262,25 @@ mod tests {
         assert!(near_done < early);
         assert!(inefficient_early > early);
         assert!(inefficient_early <= 1.0);
+    }
+
+    #[test]
+    fn gated_residency_shoulder_only_activates_for_low_completion_peers() {
+        let low_completion_gate = super::smooth_rolloff(0.10, 0.20, 0.60);
+        let mid_completion_gate = super::smooth_rolloff(0.40, 0.20, 0.60);
+        let high_completion_gate = super::smooth_rolloff(0.75, 0.20, 0.60);
+
+        assert!(low_completion_gate > mid_completion_gate);
+        assert!(mid_completion_gate > 0.0);
+        assert_eq!(high_completion_gate, 0.0);
+    }
+
+    #[test]
+    fn above_target_shoulder_taper_is_zero_until_rate_exceeds_target() {
+        assert_eq!(super::above_target_shoulder_taper(0.95, 1.0, 1.15), 0.0);
+        assert_eq!(super::above_target_shoulder_taper(1.0, 1.0, 1.15), 0.0);
+        assert!(super::above_target_shoulder_taper(1.05, 1.0, 1.15) > 0.0);
+        assert_eq!(super::above_target_shoulder_taper(1.2, 1.0, 1.15), 0.0);
     }
 
     #[test]
