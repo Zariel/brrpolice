@@ -31,6 +31,8 @@ pub enum ReplayScoreModel {
     CurrentComposite,
     RatePrimaryAmplified,
     RatePrimaryCurvedShoulder,
+    RatePrimaryThresholdedAccumulation,
+    RatePrimaryPersistentWatch,
     RatePrimaryResidencyShoulder,
     RatePrimaryGatedResidencyShoulder,
     RatePrimaryGatedLongResidency,
@@ -43,6 +45,8 @@ impl ReplayScoreModel {
             Self::CurrentComposite => "current_composite",
             Self::RatePrimaryAmplified => "rate_primary_amplified",
             Self::RatePrimaryCurvedShoulder => "rate_primary_curved_shoulder",
+            Self::RatePrimaryThresholdedAccumulation => "rate_primary_thresholded_accumulation",
+            Self::RatePrimaryPersistentWatch => "rate_primary_persistent_watch",
             Self::RatePrimaryResidencyShoulder => "rate_primary_residency_shoulder",
             Self::RatePrimaryGatedResidencyShoulder => "rate_primary_gated_residency_shoulder",
             Self::RatePrimaryGatedLongResidency => "rate_primary_gated_long_residency",
@@ -58,6 +62,12 @@ impl ReplayScoreModel {
             }
             Self::RatePrimaryCurvedShoulder => {
                 "Rate-primary risk with curved progress pressure and a steeper above-target shoulder for marginal tuning."
+            }
+            Self::RatePrimaryThresholdedAccumulation => {
+                "Rate-primary amplification with thresholded score accumulation so only stronger risks add materially."
+            }
+            Self::RatePrimaryPersistentWatch => {
+                "Rate-primary amplification with a separate above-target watch signal that only accumulates after persistence."
             }
             Self::RatePrimaryResidencyShoulder => {
                 "Rate-primary risk with an above-target shoulder and residency pressure for long-lived peers."
@@ -296,10 +306,23 @@ impl PolicyEngine {
             };
             let effective_sample_score_risk =
                 self.effective_sample_score_risk(sample_score_risk, session.churn_amplifier);
+            let rate_ratio = Self::rate_reference_ratio(
+                session.rolling_avg_up_rate_bps,
+                self.config.score.target_rate_bps,
+            );
+            let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
             if exemption.is_some() {
                 session.ban_score_above_threshold_duration = Duration::ZERO;
             } else {
-                session.ban_score = (session.ban_score + effective_sample_score_risk)
+                let accumulation_delta = self.replay_accumulation_delta(
+                    model,
+                    effective_sample_score_risk,
+                    rate_ratio,
+                    progress_risk,
+                    peer.peer.progress,
+                    0,
+                );
+                session.ban_score = (session.ban_score + accumulation_delta)
                     .clamp(0.0, self.config.score.max_score);
                 if session.ban_score >= self.config.score.ban_threshold {
                     session.ban_score_above_threshold_duration = sample_duration;
@@ -382,11 +405,21 @@ impl PolicyEngine {
             );
         let effective_sample_score_risk =
             self.effective_sample_score_risk(sample_score_risk, churn_amplifier);
+        let rate_ratio =
+            Self::rate_reference_ratio(rolling_avg_up_rate_bps, self.config.score.target_rate_bps);
+        let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
         if exemption.is_some() {
             ban_score_above_threshold_duration = Duration::ZERO;
         } else {
-            ban_score =
-                (ban_score + effective_sample_score_risk).clamp(0.0, self.config.score.max_score);
+            let accumulation_delta = self.replay_accumulation_delta(
+                model,
+                effective_sample_score_risk,
+                rate_ratio,
+                progress_risk,
+                peer.peer.progress,
+                previous.sample_count,
+            );
+            ban_score = (ban_score + accumulation_delta).clamp(0.0, self.config.score.max_score);
             if ban_score >= self.config.score.ban_threshold {
                 ban_score_above_threshold_duration += sample_duration;
             } else if ban_score <= self.config.score.clear_threshold {
@@ -821,6 +854,12 @@ impl PolicyEngine {
             ReplayScoreModel::RatePrimaryCurvedShoulder => {
                 normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
             }
+            ReplayScoreModel::RatePrimaryThresholdedAccumulation => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
+            ReplayScoreModel::RatePrimaryPersistentWatch => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
             ReplayScoreModel::RatePrimaryResidencyShoulder => {
                 replay_rate_primary_base_risk(rate_ratio, 1.0, 1.5, 0.15)
             }
@@ -866,6 +905,17 @@ impl PolicyEngine {
 
                 (base_amplified + above_target_pressure).clamp(0.0, 1.0)
             }
+            ReplayScoreModel::RatePrimaryThresholdedAccumulation => {
+                let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
+                let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
+                (rate_risk * amplification).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryPersistentWatch => {
+                let base = replay_rate_primary_amplified_risk(rate_risk, rate_ratio, progress_risk);
+                let watch_signal =
+                    replay_above_target_watch_signal(rate_ratio, current_progress, progress_risk);
+                (base + watch_signal).clamp(0.0, 1.0)
+            }
             ReplayScoreModel::RatePrimaryResidencyShoulder => {
                 let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.5);
                 let residency_pressure = replay_residency_pressure(current_progress, progress_risk);
@@ -909,6 +959,36 @@ impl PolicyEngine {
         }
 
         sample_score_risk * (1.0 + churn_amplifier.max(0.0))
+    }
+
+    fn replay_accumulation_delta(
+        &self,
+        model: ReplayScoreModel,
+        effective_sample_score_risk: f64,
+        rate_ratio: f64,
+        progress_risk: f64,
+        current_progress: f64,
+        prior_sample_count: u32,
+    ) -> f64 {
+        match model {
+            ReplayScoreModel::RatePrimaryThresholdedAccumulation => {
+                let entry_floor = if rate_ratio <= 1.0 { 0.30 } else { 0.45 };
+                let gain = if rate_ratio <= 1.0 { 1.45 } else { 0.90 };
+                ((effective_sample_score_risk - entry_floor).max(0.0) * gain).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryPersistentWatch => {
+                if rate_ratio <= 1.0 {
+                    return effective_sample_score_risk;
+                }
+
+                if prior_sample_count < 3 || current_progress > 0.20 || progress_risk < 0.90 {
+                    return 0.0;
+                }
+
+                ((effective_sample_score_risk - 0.55).max(0.0) * 0.75).clamp(0.0, 1.0)
+            }
+            _ => effective_sample_score_risk,
+        }
     }
 
     fn remaining_reban_cooldown(
@@ -984,6 +1064,12 @@ fn progress_fraction_to_bytes(total_size_bytes: u64, progress_fraction: f64) -> 
     ((total_size_bytes as f64) * progress_fraction.clamp(0.0, 1.0)).round() as u64
 }
 
+fn replay_rate_primary_amplified_risk(rate_risk: f64, rate_ratio: f64, progress_risk: f64) -> f64 {
+    let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
+    let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
+    (rate_risk * amplification).clamp(0.0, 1.0)
+}
+
 fn replay_rate_primary_base_risk(
     rate_ratio: f64,
     shoulder_start: f64,
@@ -1018,6 +1104,17 @@ fn above_target_shoulder_taper(value: f64, start: f64, end: f64) -> f64 {
 
 fn curved_progress_penalty(progress_risk: f64, exponent: f64) -> f64 {
     progress_risk.clamp(0.0, 1.0).powf(exponent.max(1.0))
+}
+
+fn replay_above_target_watch_signal(
+    rate_ratio: f64,
+    current_progress: f64,
+    progress_risk: f64,
+) -> f64 {
+    let low_completion_gate = smooth_rolloff(current_progress, 0.10, 0.30);
+    0.28 * above_target_shoulder_taper(rate_ratio, 1.0, 1.12).powf(2.2)
+        * curved_progress_penalty(progress_risk, 2.2)
+        * low_completion_gate
 }
 
 fn replay_long_residency_risk(rate_ratio: f64, current_progress: f64, progress_risk: f64) -> f64 {
@@ -1347,6 +1444,23 @@ mod tests {
         assert!(mild < 0.4);
         assert!(severe > 0.8);
         assert!(mild < severe);
+    }
+
+    #[test]
+    fn above_target_watch_signal_requires_near_target_low_completion_and_high_deficit() {
+        assert_eq!(
+            super::replay_above_target_watch_signal(0.98, 0.05, 1.0),
+            0.0
+        );
+        assert_eq!(
+            super::replay_above_target_watch_signal(1.20, 0.05, 1.0),
+            0.0
+        );
+        assert_eq!(
+            super::replay_above_target_watch_signal(1.05, 0.40, 1.0),
+            0.0
+        );
+        assert!(super::replay_above_target_watch_signal(1.05, 0.05, 1.0) > 0.0);
     }
 
     #[test]

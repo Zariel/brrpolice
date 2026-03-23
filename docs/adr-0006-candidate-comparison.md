@@ -66,6 +66,30 @@ On the current corpora this produces the same aggregate and band outcomes as
 `rate_primary_amplified`, so this class of curved marginal tuning appears too weak to move replay
 results.
 
+### `rate_primary_thresholded_accumulation`
+
+Replay-only follow-up that keeps the `rate_primary_amplified` sample-risk shape but changes how
+score accumulates:
+
+- below target, only the stronger part of sample risk contributes materially
+- above target, accumulation requires an even higher entry floor
+- the goal is to stop moderate repeated risk from drifting across the same thresholds as clearly
+  bad peers
+
+On the current corpora this does move outcomes, but it weakens low-side and clearly-bad safety, so
+it is not production-ready.
+
+### `rate_primary_persistent_watch`
+
+Replay-only follow-up that keeps the amplified base path and adds a separate above-target watch
+signal that only accumulates after persistence:
+
+- above-target watch samples need to persist across several observations
+- the watch path also requires low completion and high progress deficit before it can add score
+
+On the current corpora this ends up behaving the same as `rate_primary_amplified`, so the watch
+signal is too weak in this form.
+
 ### `marginal_band_bounded`
 
 Replay-only candidate using rolling average upload rate as the primary signal and adding progress
@@ -126,6 +150,8 @@ above-target lane is too easy to trigger across whole peer behaviors and floods 
 | `current_composite` | 188 | 23 | 22 |
 | `rate_primary_amplified` | 188 | 23 | 22 |
 | `rate_primary_curved_shoulder` | 188 | 23 | 22 |
+| `rate_primary_thresholded_accumulation` | 188 | 20 | 22 |
+| `rate_primary_persistent_watch` | 188 | 23 | 22 |
 | `rate_primary_residency_shoulder` | 188 | 24 | 22 |
 | `rate_primary_gated_residency_shoulder` | 188 | 23 | 22 |
 | `rate_primary_gated_long_residency` | 188 | 62 | 22 |
@@ -137,6 +163,8 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_curved_shoulder` | 0 | 3 | 2 | 3 | 1 |
+| `rate_primary_thresholded_accumulation` | 1 | 3 | 2 | 3 | 1 |
+| `rate_primary_persistent_watch` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_residency_shoulder` | 0 | 3 | 1 | 3 | 1 |
 | `rate_primary_gated_residency_shoulder` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_gated_long_residency` | 0 | 40 | 2 | 3 | 1 |
@@ -149,6 +177,8 @@ Key band outcomes versus current:
 | `current_composite` | 176 | 22 | 21 |
 | `rate_primary_amplified` | 176 | 16 | 21 |
 | `rate_primary_curved_shoulder` | 176 | 16 | 21 |
+| `rate_primary_thresholded_accumulation` | 176 | 13 | 21 |
+| `rate_primary_persistent_watch` | 176 | 16 | 21 |
 | `rate_primary_residency_shoulder` | 176 | 23 | 21 |
 | `rate_primary_gated_residency_shoulder` | 176 | 16 | 21 |
 | `rate_primary_gated_long_residency` | 176 | 44 | 21 |
@@ -160,6 +190,8 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_curved_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
+| `rate_primary_thresholded_accumulation` | 0 | 1 | 2 | 2 | 4 | 3 |
+| `rate_primary_persistent_watch` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_residency_shoulder` | 0 | 2 | 1 | 1 | 3 | 6 |
 | `rate_primary_gated_residency_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_gated_long_residency` | 0 | 26 | 2 | 2 | 3 | 5 |
@@ -222,6 +254,11 @@ Current conclusion:
 - `rate_primary_curved_shoulder` keeps the same overall behavior against `main`; the curved taper
   and penalty shape are conservative enough that they do not move aggregate or band outcomes on
   the current corpora
+- `rate_primary_thresholded_accumulation` is the first replay-only branch that materially changes
+  accumulation semantics, and it does reduce healthy-rate bans on the noisier corpus, but it also
+  weakens low-side and clearly-bad safety and is therefore not acceptable as-is
+- `rate_primary_persistent_watch` adds persistence semantics for above-target suspicion, but in
+  this form it collapses back to the same outcomes as `rate_primary_amplified`
 - `rate_primary_residency_shoulder` better matches the clarified product intuition for
   slightly-above-target, low-completion peers, but against `main` it overcorrects and becomes too
   ban-heavy on the noisier corpus
@@ -238,7 +275,7 @@ Current conclusion:
 
 ## Follow-up Iteration
 
-The next refinement passes tested five ideas:
+The next refinement passes tested seven ideas:
 
 1. A stricter taper for `rate_primary_amplified`:
    - full progress influence at or below `1.0x` target rate
@@ -248,14 +285,22 @@ The next refinement passes tested five ideas:
    - convex progress penalty to suppress mid-range deficits
    - steeper below-target taper
    - steeper above-target shoulder
-3. A separate `rate_primary_residency_shoulder` candidate:
+3. A `rate_primary_thresholded_accumulation` follow-up:
+   - keep the amplified sample-risk shape
+   - only stronger sample risk contributes materially to score
+   - use stricter accumulation floors above target
+4. A `rate_primary_persistent_watch` follow-up:
+   - keep the amplified base path
+   - add a separate above-target watch signal
+   - only accumulate that signal after persistence
+5. A separate `rate_primary_residency_shoulder` candidate:
    - small above-target base-risk shoulder through `1.5x`
    - residency pressure from low completion plus progress inefficiency
-4. A narrower `rate_primary_gated_residency_shoulder` follow-up:
+6. A narrower `rate_primary_gated_residency_shoulder` follow-up:
    - shoulder only above target, never below it
    - shoulder narrowed to `1.0x..1.15x`
    - extra pressure only while completion remains low
-5. A `rate_primary_gated_long_residency` follow-up:
+7. A `rate_primary_gated_long_residency` follow-up:
    - keep `rate_primary_amplified` as the base path
    - open a second lane only in `1.0x..1.10x`
    - require `<=10%` completion and `>=0.95` progress risk
@@ -266,6 +311,12 @@ Results:
 - the stricter taper did not materially change aggregate outcomes for `rate_primary_amplified`
 - the curved shoulder candidate also did not materially change aggregate or band outcomes relative
   to `rate_primary_amplified`
+- the thresholded accumulation candidate is the first branch that materially changes replay
+  outcomes without exploding, but it buys that by dropping to `20` simulated bans on `prod-fixed`
+  and `13` on `logs-2026-03-23`, including a clearly-bad loss on `prod-fixed` and a low-side-gray
+  loss on `logs-2026-03-23`
+- the persistent watch candidate did not materially change outcomes relative to
+  `rate_primary_amplified`
 - the broad residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
   relative to `main`, but regressed badly on `logs-2026-03-23`, increasing total simulated bans
   from `22` on `main` to `23`
@@ -281,6 +332,11 @@ Current interpretation:
 - the specific taper refinement is not enough to unblock production work
 - conservative curved tapering and progress weighting were also too weak to move outcomes on the
   current corpora
+- changing accumulation semantics does move outcomes, which means the search should keep focusing
+  there rather than on more taper tuning, but the first thresholded version is too permissive to
+  preserve poor-peer safety
+- persistence semantics for above-target watch signals are plausible, but the first version is too
+  weak to move the replay results
 - a broad above-target shoulder over-bans, while a tightly gated shoulder becomes too weak to move
   replay outcomes on the current corpora
 - a single-sample long-residency lane also over-bans, which suggests any above-target residency
@@ -297,4 +353,5 @@ than the new baseline, and should treat `rate_primary_gated_residency_shoulder` 
 conservative shoulder/taper tuning can quickly collapse back to the same outcomes as the current
 best candidate without materially improving on `main`, and should treat
 `rate_primary_gated_long_residency` as evidence that sample-local conjunctive gating is still too
-coarse for the above-target residency problem.
+coarse for the above-target residency problem. Future search should favor accumulation and
+threshold semantics over additional shoulder/taper micro-tuning.

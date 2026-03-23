@@ -858,6 +858,12 @@ fn adr_0006_candidate_profiles() -> Vec<CandidateProfile> {
             model: ReplayScoreModel::RatePrimaryCurvedShoulder,
         },
         CandidateProfile {
+            model: ReplayScoreModel::RatePrimaryThresholdedAccumulation,
+        },
+        CandidateProfile {
+            model: ReplayScoreModel::RatePrimaryPersistentWatch,
+        },
+        CandidateProfile {
             model: ReplayScoreModel::RatePrimaryResidencyShoulder,
         },
         CandidateProfile {
