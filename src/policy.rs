@@ -30,6 +30,7 @@ const RATE_REFERENCE_NAME: &str = "rolling_avg_upload_rate_bps";
 pub enum ReplayScoreModel {
     CurrentComposite,
     RatePrimaryAmplified,
+    RatePrimaryResidencyShoulder,
     MarginalBandBounded,
 }
 
@@ -38,6 +39,7 @@ impl ReplayScoreModel {
         match self {
             Self::CurrentComposite => "current_composite",
             Self::RatePrimaryAmplified => "rate_primary_amplified",
+            Self::RatePrimaryResidencyShoulder => "rate_primary_residency_shoulder",
             Self::MarginalBandBounded => "marginal_band_bounded",
         }
     }
@@ -47,6 +49,9 @@ impl ReplayScoreModel {
             Self::CurrentComposite => "Current weighted composite score model.",
             Self::RatePrimaryAmplified => {
                 "Rate-primary risk with bounded progress amplification that cannot create bans on its own."
+            }
+            Self::RatePrimaryResidencyShoulder => {
+                "Rate-primary risk with an above-target shoulder and residency pressure for long-lived peers."
             }
             Self::MarginalBandBounded => {
                 "Rate-primary model where progress inefficiency only contributes inside the marginal rate band."
@@ -269,6 +274,7 @@ impl PolicyEngine {
                     model,
                     session.rolling_avg_up_rate_bps,
                     peer.peer.up_rate_bps,
+                    peer.peer.progress,
                     progress_delta,
                     required_progress_delta,
                 )
@@ -343,6 +349,7 @@ impl PolicyEngine {
                 model,
                 rolling_avg_up_rate_bps,
                 peer.peer.up_rate_bps,
+                peer.peer.progress,
                 progress_delta,
                 required_progress_delta,
             )
@@ -782,21 +789,27 @@ impl PolicyEngine {
         model: ReplayScoreModel,
         rate_reference_bps: u64,
         sample_up_rate_bps: u64,
+        current_progress: f64,
         progress_delta: f64,
         required_progress_delta: f64,
     ) -> f64 {
-        let rate_risk = normalized_rate_risk(
-            match model {
-                ReplayScoreModel::CurrentComposite => sample_up_rate_bps,
-                ReplayScoreModel::RatePrimaryAmplified | ReplayScoreModel::MarginalBandBounded => {
-                    rate_reference_bps
-                }
-            },
-            self.config.score.target_rate_bps,
-        );
-        let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
         let rate_ratio =
             Self::rate_reference_ratio(rate_reference_bps, self.config.score.target_rate_bps);
+        let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
+        let rate_risk = match model {
+            ReplayScoreModel::CurrentComposite => {
+                normalized_rate_risk(sample_up_rate_bps, self.config.score.target_rate_bps)
+            }
+            ReplayScoreModel::RatePrimaryAmplified => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
+            ReplayScoreModel::RatePrimaryResidencyShoulder => {
+                replay_rate_primary_base_risk(rate_ratio, 1.0, 1.5, 0.15)
+            }
+            ReplayScoreModel::MarginalBandBounded => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
+        };
 
         match model {
             ReplayScoreModel::CurrentComposite => {
@@ -816,6 +829,12 @@ impl PolicyEngine {
             ReplayScoreModel::RatePrimaryAmplified => {
                 let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
                 let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
+                (rate_risk * amplification).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryResidencyShoulder => {
+                let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.5);
+                let residency_pressure = replay_residency_pressure(current_progress, progress_risk);
+                let amplification = 1.0 + (1.4 * residency_pressure * healthy_taper);
                 (rate_risk * amplification).clamp(0.0, 1.0)
             }
             ReplayScoreModel::MarginalBandBounded => {
@@ -907,6 +926,30 @@ fn progress_fraction_to_bytes(total_size_bytes: u64, progress_fraction: f64) -> 
     }
 
     ((total_size_bytes as f64) * progress_fraction.clamp(0.0, 1.0)).round() as u64
+}
+
+fn replay_rate_primary_base_risk(
+    rate_ratio: f64,
+    shoulder_start: f64,
+    shoulder_end: f64,
+    shoulder_floor: f64,
+) -> f64 {
+    if !rate_ratio.is_finite() {
+        return 0.0;
+    }
+    if rate_ratio <= shoulder_start {
+        let below_target_risk = (1.0 - rate_ratio).clamp(0.0, 1.0);
+        return (shoulder_floor + ((1.0 - shoulder_floor) * below_target_risk)).clamp(0.0, 1.0);
+    }
+
+    (shoulder_floor * smooth_rolloff(rate_ratio, shoulder_start, shoulder_end)).clamp(0.0, 1.0)
+}
+
+fn replay_residency_pressure(current_progress: f64, progress_risk: f64) -> f64 {
+    let current_progress = current_progress.clamp(0.0, 1.0);
+    let remaining_fraction = 1.0 - current_progress;
+    let weighted = (0.55 * progress_risk) + (0.75 * remaining_fraction);
+    weighted.clamp(0.0, 1.0)
 }
 
 fn smooth_rolloff(value: f64, start: f64, end: f64) -> f64 {
@@ -1167,6 +1210,30 @@ mod tests {
         assert!(early < 1.0 && early > mid);
         assert!((mid - 0.5).abs() < 0.0001);
         assert!(late < mid && late > 0.0);
+    }
+
+    #[test]
+    fn replay_rate_primary_base_risk_keeps_a_small_above_target_shoulder() {
+        let below = super::replay_rate_primary_base_risk(0.9, 1.0, 1.5, 0.15);
+        let at_target = super::replay_rate_primary_base_risk(1.0, 1.0, 1.5, 0.15);
+        let slightly_above = super::replay_rate_primary_base_risk(1.1, 1.0, 1.5, 0.15);
+        let clearly_healthy = super::replay_rate_primary_base_risk(1.6, 1.0, 1.5, 0.15);
+
+        assert!(below > at_target);
+        assert!(at_target > slightly_above);
+        assert!(slightly_above > 0.0);
+        assert_eq!(clearly_healthy, 0.0);
+    }
+
+    #[test]
+    fn replay_residency_pressure_rewards_high_completion_and_penalizes_low_completion() {
+        let near_done = super::replay_residency_pressure(0.92, 0.2);
+        let early = super::replay_residency_pressure(0.08, 0.2);
+        let inefficient_early = super::replay_residency_pressure(0.08, 1.0);
+
+        assert!(near_done < early);
+        assert!(inefficient_early > early);
+        assert!(inefficient_early <= 1.0);
     }
 
     #[test]

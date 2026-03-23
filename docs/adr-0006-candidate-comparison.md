@@ -8,7 +8,7 @@ Accepted
 
 This document records the first replay comparison required by
 [`adr-0006-evaluation-spec.md`](./adr-0006-evaluation-spec.md). It compares the current shipped
-score model with two replay-only ADR-0006 candidates on local corpora under `samples/logs`.
+score model with replay-only ADR-0006 candidates on local corpora under `samples/logs`.
 
 The corpus files are intentionally gitignored and are not part of this document. This report keeps
 only aggregated outcomes and representative peer examples.
@@ -62,6 +62,18 @@ sample_risk = rate_risk                         when rate_ratio outside 0.75..=1
 sample_risk = clamp(rate_risk + 0.6 * progress_risk, 0, 1) otherwise
 ```
 
+### `rate_primary_residency_shoulder`
+
+Replay-only candidate that keeps the rate-primary shape but adds two mechanisms that the simpler
+amplified model lacks:
+
+- a small above-target rate shoulder so peers slightly above target are not automatically safe
+- a residency-pressure term that combines progress inefficiency with remaining completion so
+  high-completion peers are protected and low-completion peers stay risky
+
+This candidate was added after clarifying that "slightly above target" peers can still be strong
+ban candidates when expected residency is long.
+
 ## Summary
 
 ### Corpus: `prod-fixed`
@@ -70,6 +82,7 @@ sample_risk = clamp(rate_risk + 0.6 * progress_risk, 0, 1) otherwise
 | --- | ---: | ---: | ---: |
 | `current_composite` | 188 | 23 | 22 |
 | `rate_primary_amplified` | 188 | 23 | 22 |
+| `rate_primary_residency_shoulder` | 188 | 24 | 22 |
 | `marginal_band_bounded` | 188 | 22 | 22 |
 
 Key band outcomes versus current:
@@ -77,6 +90,7 @@ Key band outcomes versus current:
 | candidate | clearly bad bans lost | clearly bad bans gained | marginal bans lost | clearly healthy bans lost | clearly healthy bans kept |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 3 | 2 | 3 | 1 |
+| `rate_primary_residency_shoulder` | 0 | 3 | 1 | 3 | 1 |
 | `marginal_band_bounded` | 2 | 3 | 1 | 3 | 1 |
 
 ### Corpus: `logs-2026-03-23`
@@ -85,6 +99,7 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: |
 | `current_composite` | 176 | 22 | 21 |
 | `rate_primary_amplified` | 176 | 16 | 21 |
+| `rate_primary_residency_shoulder` | 176 | 23 | 21 |
 | `marginal_band_bounded` | 176 | 16 | 21 |
 
 Key band outcomes versus current:
@@ -92,6 +107,7 @@ Key band outcomes versus current:
 | candidate | clearly bad bans lost | clearly bad bans gained | marginal bans lost | high-side gray bans lost | clearly healthy bans lost | clearly healthy bans kept |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 1 | 2 | 2 | 3 | 5 |
+| `rate_primary_residency_shoulder` | 0 | 2 | 1 | 1 | 3 | 6 |
 | `marginal_band_bounded` | 1 | 1 | 1 | 1 | 4 | 4 |
 
 ## Representative Peer Examples
@@ -148,6 +164,9 @@ Current conclusion:
 - `rate_primary_amplified` is directionally closer to the ADR than the current composite model
   because it rescues several clearly healthy large-torrent peers while preserving clearly-bad ban
   status on these corpora
+- `rate_primary_residency_shoulder` better matches the clarified product intuition for
+  slightly-above-target, low-completion peers, but on replay it overcorrects and becomes more
+  ban-heavy than the simpler amplified candidate
 - `rate_primary_amplified` still fails the healthy-rate hard gate and remains too permissive in
   marginal and high-side-gray cases
 - `marginal_band_bounded` is not acceptable in its current form because it weakens clearly-bad
@@ -155,32 +174,37 @@ Current conclusion:
 
 ## Follow-up Iteration
 
-The next refinement pass tightened the `rate_primary_amplified` taper to the more protective end
-of the ADR-0006 range:
+The next refinement passes tested two ideas:
 
-- full progress influence at or below `1.0x` target rate
-- smooth rolloff between `1.0x` and `1.25x`
-- zero progress influence above `1.25x`
+1. A stricter taper for `rate_primary_amplified`:
+   - full progress influence at or below `1.0x` target rate
+   - smooth rolloff between `1.0x` and `1.25x`
+   - zero progress influence above `1.25x`
+2. A separate `rate_primary_residency_shoulder` candidate:
+   - small above-target base-risk shoulder through `1.5x`
+   - residency pressure from low completion plus progress inefficiency
 
-That stricter taper did not materially change the aggregate outcomes on either local corpus. The
-same hard-gate failures remained:
+Results:
 
-- `prod-fixed` still had `1` clearly healthy simulated ban under `rate_primary_amplified`
-- `logs-2026-03-23` still had `5` clearly healthy simulated bans under `rate_primary_amplified`
-- marginal and high-side-gray bans lost relative to current were unchanged on `logs-2026-03-23`
+- the stricter taper did not materially change aggregate outcomes for `rate_primary_amplified`
+- the residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
+- the residency-shoulder candidate regressed badly on `logs-2026-03-23`, increasing total
+  simulated bans from `16` to `23` versus the simpler amplified candidate and increasing low-side
+  and clearly healthy gained bans
 
 Current interpretation:
 
 - the rate-primary tapered-amplification family is still the most credible ADR-0006 direction to
   keep iterating on
-- this specific taper refinement is not enough to unblock production work
-- the remaining errors are not solved by taper shape alone; the next iteration needs to adjust how
-  near-target and slightly-above-target peers accumulate risk, not only how clearly healthy peers
-  are protected
+- the specific taper refinement is not enough to unblock production work
+- the first residency-shoulder attempt is not good enough to replace the simpler amplified model
+- the remaining errors are still around how near-target and slightly-above-target peers accumulate
+  risk, but the next attempt needs to be more conservative than the current shoulder variant
 
 ## Consequence For Backlog
 
 `brrpolice-d6br.4` should not start from either candidate in this document. More candidate
 iteration is required before a production ADR-0006 model can be selected, but future refinement
 should start from the `rate_primary_amplified` family rather than the bounded marginal-band
-variant.
+variant, and should treat `rate_primary_residency_shoulder` as an informative failed branch rather
+than the new baseline.
