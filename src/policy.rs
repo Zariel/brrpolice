@@ -32,6 +32,7 @@ pub enum ReplayScoreModel {
     RatePrimaryAmplified,
     RatePrimaryResidencyShoulder,
     RatePrimaryGatedResidencyShoulder,
+    RatePrimaryGatedLongResidency,
     MarginalBandBounded,
 }
 
@@ -42,6 +43,7 @@ impl ReplayScoreModel {
             Self::RatePrimaryAmplified => "rate_primary_amplified",
             Self::RatePrimaryResidencyShoulder => "rate_primary_residency_shoulder",
             Self::RatePrimaryGatedResidencyShoulder => "rate_primary_gated_residency_shoulder",
+            Self::RatePrimaryGatedLongResidency => "rate_primary_gated_long_residency",
             Self::MarginalBandBounded => "marginal_band_bounded",
         }
     }
@@ -57,6 +59,9 @@ impl ReplayScoreModel {
             }
             Self::RatePrimaryGatedResidencyShoulder => {
                 "Rate-primary risk with a narrow above-target shoulder gated to low-completion peers."
+            }
+            Self::RatePrimaryGatedLongResidency => {
+                "Rate-primary amplification plus a narrow conjunctive lane for long-residency peers just above target."
             }
             Self::MarginalBandBounded => {
                 "Rate-primary model where progress inefficiency only contributes inside the marginal rate band."
@@ -814,6 +819,9 @@ impl PolicyEngine {
             ReplayScoreModel::RatePrimaryGatedResidencyShoulder => {
                 normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
             }
+            ReplayScoreModel::RatePrimaryGatedLongResidency => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
             ReplayScoreModel::MarginalBandBounded => {
                 normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
             }
@@ -856,6 +864,15 @@ impl PolicyEngine {
                     0.18 * above_target_taper * low_completion_gate * residency_pressure;
 
                 (base_amplified + shoulder_risk).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryGatedLongResidency => {
+                let below_target_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
+                let base_amplified =
+                    rate_risk * (1.0 + (0.75 * progress_risk * below_target_taper));
+                let long_residency_risk =
+                    replay_long_residency_risk(rate_ratio, current_progress, progress_risk);
+
+                base_amplified.max(long_residency_risk)
             }
             ReplayScoreModel::MarginalBandBounded => {
                 if !(0.75..=1.25).contains(&rate_ratio) {
@@ -978,6 +995,22 @@ fn above_target_shoulder_taper(value: f64, start: f64, end: f64) -> f64 {
     }
 
     smooth_rolloff(value, start, end)
+}
+
+fn replay_long_residency_risk(rate_ratio: f64, current_progress: f64, progress_risk: f64) -> f64 {
+    if !rate_ratio.is_finite()
+        || !(1.0 < rate_ratio && rate_ratio <= 1.10)
+        || current_progress > 0.10
+        || progress_risk < 0.95
+    {
+        return 0.0;
+    }
+
+    let remaining_fraction = 1.0 - current_progress.clamp(0.0, 1.0);
+    let rate_band_position = ((1.10 - rate_ratio) / 0.10).clamp(0.0, 1.0);
+
+    (0.20 + (0.15 * progress_risk) + (0.15 * remaining_fraction) + (0.10 * rate_band_position))
+        .clamp(0.0, 1.0)
 }
 
 fn smooth_rolloff(value: f64, start: f64, end: f64) -> f64 {
@@ -1281,6 +1314,15 @@ mod tests {
         assert_eq!(super::above_target_shoulder_taper(1.0, 1.0, 1.15), 0.0);
         assert!(super::above_target_shoulder_taper(1.05, 1.0, 1.15) > 0.0);
         assert_eq!(super::above_target_shoulder_taper(1.2, 1.0, 1.15), 0.0);
+    }
+
+    #[test]
+    fn replay_long_residency_risk_only_opens_for_narrow_above_target_low_completion_cases() {
+        assert_eq!(super::replay_long_residency_risk(0.98, 0.10, 1.0), 0.0);
+        assert_eq!(super::replay_long_residency_risk(1.20, 0.10, 1.0), 0.0);
+        assert_eq!(super::replay_long_residency_risk(1.08, 0.20, 1.0), 0.0);
+        assert_eq!(super::replay_long_residency_risk(1.08, 0.10, 0.70), 0.0);
+        assert!(super::replay_long_residency_risk(1.08, 0.10, 1.0) > 0.0);
     }
 
     #[test]

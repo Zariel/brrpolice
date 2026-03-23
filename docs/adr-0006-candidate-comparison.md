@@ -90,6 +90,19 @@ Replay-only follow-up that keeps the same intuition but applies it more conserva
 On the current corpora this avoids the broad shoulder regression, but it ends up behaving
 identically to `rate_primary_amplified` in aggregate.
 
+### `rate_primary_gated_long_residency`
+
+Replay-only follow-up built directly on `rate_primary_amplified` and intended to capture only the
+specific above-target peers that are still likely to sit on resources for a long time:
+
+- keep `rate_primary_amplified` as the base path
+- add a separate lane only inside `1.0x..1.10x` target rate
+- require very low completion and a very high progress deficit
+- use `max(base_risk, long_residency_risk)` rather than additive scoring
+
+On the current corpora this still over-bans badly against `main`, which suggests a sample-local
+above-target lane is too easy to trigger across whole peer behaviors and floods score accumulation.
+
 ## Summary
 
 ### Corpus: `prod-fixed`
@@ -100,6 +113,7 @@ identically to `rate_primary_amplified` in aggregate.
 | `rate_primary_amplified` | 188 | 23 | 22 |
 | `rate_primary_residency_shoulder` | 188 | 24 | 22 |
 | `rate_primary_gated_residency_shoulder` | 188 | 23 | 22 |
+| `rate_primary_gated_long_residency` | 188 | 62 | 22 |
 | `marginal_band_bounded` | 188 | 22 | 22 |
 
 Key band outcomes versus current:
@@ -109,6 +123,7 @@ Key band outcomes versus current:
 | `rate_primary_amplified` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_residency_shoulder` | 0 | 3 | 1 | 3 | 1 |
 | `rate_primary_gated_residency_shoulder` | 0 | 3 | 2 | 3 | 1 |
+| `rate_primary_gated_long_residency` | 0 | 40 | 2 | 3 | 1 |
 | `marginal_band_bounded` | 2 | 3 | 1 | 3 | 1 |
 
 ### Corpus: `logs-2026-03-23`
@@ -119,6 +134,7 @@ Key band outcomes versus current:
 | `rate_primary_amplified` | 176 | 16 | 21 |
 | `rate_primary_residency_shoulder` | 176 | 23 | 21 |
 | `rate_primary_gated_residency_shoulder` | 176 | 16 | 21 |
+| `rate_primary_gated_long_residency` | 176 | 44 | 21 |
 | `marginal_band_bounded` | 176 | 16 | 21 |
 
 Key band outcomes versus current:
@@ -128,6 +144,7 @@ Key band outcomes versus current:
 | `rate_primary_amplified` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_residency_shoulder` | 0 | 2 | 1 | 1 | 3 | 6 |
 | `rate_primary_gated_residency_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
+| `rate_primary_gated_long_residency` | 0 | 26 | 2 | 2 | 3 | 5 |
 | `marginal_band_bounded` | 1 | 1 | 1 | 1 | 4 | 4 |
 
 ## Representative Peer Examples
@@ -190,6 +207,9 @@ Current conclusion:
 - `rate_primary_gated_residency_shoulder` fixes that over-banning by narrowing the shoulder to an
   above-target-only, low-completion gate, but against `main` it does not improve aggregate
   outcomes beyond the existing `rate_primary_amplified` candidate
+- `rate_primary_gated_long_residency` keeps the base candidate and uses a strict conjunctive lane,
+  but against `main` it still over-bans badly, especially by gaining many bans inside peer
+  behaviors that fall into the clearly-bad cohort overall
 - even the best current candidate against `main`, `rate_primary_amplified`, still fails the
   healthy-rate hard gate and remains too permissive in marginal and high-side-gray cases
 - `marginal_band_bounded` is not acceptable in its current form because it weakens clearly-bad
@@ -197,7 +217,7 @@ Current conclusion:
 
 ## Follow-up Iteration
 
-The next refinement passes tested three ideas:
+The next refinement passes tested four ideas:
 
 1. A stricter taper for `rate_primary_amplified`:
    - full progress influence at or below `1.0x` target rate
@@ -210,6 +230,11 @@ The next refinement passes tested three ideas:
    - shoulder only above target, never below it
    - shoulder narrowed to `1.0x..1.15x`
    - extra pressure only while completion remains low
+4. A `rate_primary_gated_long_residency` follow-up:
+   - keep `rate_primary_amplified` as the base path
+   - open a second lane only in `1.0x..1.10x`
+   - require `<=10%` completion and `>=0.95` progress risk
+   - take `max(base_risk, long_residency_risk)` instead of adding a broad shoulder
 
 Results:
 
@@ -219,6 +244,8 @@ Results:
   from `22` on `main` to `23`
 - the gated residency-shoulder candidate removed that regression relative to `main`, but it also
   failed to improve aggregate outcomes beyond `rate_primary_amplified`
+- the gated long-residency candidate regressed badly on both corpora, jumping from `23` to `62`
+  simulated bans on `prod-fixed` and from `22` to `44` on `logs-2026-03-23`
 
 Current interpretation:
 
@@ -227,6 +254,8 @@ Current interpretation:
 - the specific taper refinement is not enough to unblock production work
 - a broad above-target shoulder over-bans, while a tightly gated shoulder becomes too weak to move
   replay outcomes on the current corpora
+- a single-sample long-residency lane also over-bans, which suggests any above-target residency
+  path probably needs explicit persistence or separate state rather than one-sample gating
 - shoulder and taper tuning alone still appear insufficient to select a production winner
 
 ## Consequence For Backlog
@@ -237,4 +266,6 @@ should start from the `rate_primary_amplified` family rather than the bounded ma
 variant, should treat `rate_primary_residency_shoulder` as an informative failed branch rather
 than the new baseline, and should treat `rate_primary_gated_residency_shoulder` as evidence that
 conservative shoulder/taper tuning can quickly collapse back to the same outcomes as the current
-best candidate without materially improving on `main`.
+best candidate without materially improving on `main`, and should treat
+`rate_primary_gated_long_residency` as evidence that sample-local conjunctive gating is still too
+coarse for the above-target residency problem.
