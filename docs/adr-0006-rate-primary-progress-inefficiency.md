@@ -150,6 +150,7 @@ No production implementation should land until replay and simulator results show
 Reference evaluation spec:
 
 - [`adr-0006-evaluation-spec.md`](./adr-0006-evaluation-spec.md)
+- [`adr-0006-candidate-comparison.md`](./adr-0006-candidate-comparison.md)
 
 1. Define the replay corpus and pass/fail criteria for clearly bad, marginal, and clearly healthy
    rate bands.

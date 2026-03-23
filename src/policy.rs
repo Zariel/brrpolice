@@ -26,6 +26,35 @@ pub struct PolicyEngine {
 const SCORE_BASED_REASON_CODE: &str = "score_based";
 const RATE_REFERENCE_NAME: &str = "rolling_avg_upload_rate_bps";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayScoreModel {
+    CurrentComposite,
+    RatePrimaryAmplified,
+    MarginalBandBounded,
+}
+
+impl ReplayScoreModel {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::CurrentComposite => "current_composite",
+            Self::RatePrimaryAmplified => "rate_primary_amplified",
+            Self::MarginalBandBounded => "marginal_band_bounded",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::CurrentComposite => "Current weighted composite score model.",
+            Self::RatePrimaryAmplified => {
+                "Rate-primary risk with bounded progress amplification that cannot create bans on its own."
+            }
+            Self::MarginalBandBounded => {
+                "Rate-primary model where progress inefficiency only contributes inside the marginal rate band."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluationInsights {
     pub rate_reference_name: &'static str,
@@ -207,6 +236,15 @@ impl PolicyEngine {
         peer: &PeerContext,
         existing: Option<&PeerSessionState>,
     ) -> PeerEvaluation {
+        self.evaluate_peer_with_model(peer, existing, ReplayScoreModel::CurrentComposite)
+    }
+
+    pub fn evaluate_peer_with_model(
+        &self,
+        peer: &PeerContext,
+        existing: Option<&PeerSessionState>,
+        model: ReplayScoreModel,
+    ) -> PeerEvaluation {
         if existing.is_none() {
             let mut session = self.begin_session(peer, None);
             let sample_duration = peer
@@ -216,10 +254,10 @@ impl PolicyEngine {
             let observed_duration = session.observed_duration;
             let progress_delta = (peer.peer.progress - session.baseline_progress).max(0.0);
             let required_progress_delta =
-                self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
+                self.required_progress_delta(observed_duration, session.rolling_avg_up_rate_bps);
             let exemption = session.last_exemption_reason.clone();
             let is_bad_sample = exemption.is_none()
-                && peer.peer.up_rate_bps < self.config.score.target_rate_bps
+                && session.rolling_avg_up_rate_bps < self.config.score.target_rate_bps
                 && progress_delta < required_progress_delta;
             if is_bad_sample {
                 session.bad_duration = sample_duration;
@@ -228,6 +266,8 @@ impl PolicyEngine {
                 0.0
             } else {
                 self.sample_score_risk(
+                    model,
+                    session.rolling_avg_up_rate_bps,
                     peer.peer.up_rate_bps,
                     progress_delta,
                     required_progress_delta,
@@ -272,6 +312,12 @@ impl PolicyEngine {
             .duration_since(previous.last_seen_at)
             .unwrap_or_default();
         let observed_duration = previous.observed_duration + sample_duration;
+        let rolling_avg_up_rate_bps = self.weighted_rate(
+            previous.rolling_avg_up_rate_bps,
+            previous.observed_duration,
+            peer.peer.up_rate_bps,
+            sample_duration,
+        );
         let baseline_progress = self.advance_progress_baseline(
             previous.baseline_progress,
             previous.latest_progress,
@@ -279,10 +325,10 @@ impl PolicyEngine {
         );
         let progress_delta = (peer.peer.progress - baseline_progress).max(0.0);
         let required_progress_delta =
-            self.required_progress_delta(observed_duration, peer.peer.up_rate_bps);
+            self.required_progress_delta(observed_duration, rolling_avg_up_rate_bps);
         let exemption = self.classify_exemption(peer);
         let is_bad_sample = exemption.is_none()
-            && peer.peer.up_rate_bps < self.config.score.target_rate_bps
+            && rolling_avg_up_rate_bps < self.config.score.target_rate_bps
             && progress_delta < required_progress_delta;
         let reconnect = previous.observation_id != self.peer_observation_id(peer);
         let bad_duration = if is_bad_sample {
@@ -294,6 +340,8 @@ impl PolicyEngine {
         let mut ban_score_above_threshold_duration = previous.ban_score_above_threshold_duration;
         let sample_score_risk = if exemption.is_none() {
             self.sample_score_risk(
+                model,
+                rolling_avg_up_rate_bps,
                 peer.peer.up_rate_bps,
                 progress_delta,
                 required_progress_delta,
@@ -347,12 +395,7 @@ impl PolicyEngine {
             last_seen_at: peer.observed_at,
             baseline_progress,
             latest_progress: peer.peer.progress,
-            rolling_avg_up_rate_bps: self.weighted_rate(
-                previous.rolling_avg_up_rate_bps,
-                previous.observed_duration,
-                peer.peer.up_rate_bps,
-                sample_duration,
-            ),
+            rolling_avg_up_rate_bps,
             observed_duration,
             bad_duration,
             ban_score,
@@ -736,23 +779,59 @@ impl PolicyEngine {
 
     fn sample_score_risk(
         &self,
-        up_rate_bps: u64,
+        model: ReplayScoreModel,
+        rate_reference_bps: u64,
+        sample_up_rate_bps: u64,
         progress_delta: f64,
         required_progress_delta: f64,
     ) -> f64 {
-        let rate_risk = normalized_rate_risk(up_rate_bps, self.config.score.target_rate_bps);
+        let rate_risk = normalized_rate_risk(
+            match model {
+                ReplayScoreModel::CurrentComposite => sample_up_rate_bps,
+                ReplayScoreModel::RatePrimaryAmplified | ReplayScoreModel::MarginalBandBounded => {
+                    rate_reference_bps
+                }
+            },
+            self.config.score.target_rate_bps,
+        );
         let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
-        let weight_total = self.config.score.weight_rate + self.config.score.weight_progress;
-        if weight_total <= 0.0 {
-            return 0.0;
+        let rate_ratio =
+            Self::rate_reference_ratio(rate_reference_bps, self.config.score.target_rate_bps);
+
+        match model {
+            ReplayScoreModel::CurrentComposite => {
+                let weight_total =
+                    self.config.score.weight_rate + self.config.score.weight_progress;
+                if weight_total <= 0.0 {
+                    return 0.0;
+                }
+
+                let weighted_risk = ((self.config.score.weight_rate * rate_risk)
+                    + (self.config.score.weight_progress * progress_risk))
+                    / weight_total;
+                let floor_risk = (self.config.score.rate_risk_floor * rate_risk).clamp(0.0, 1.0);
+
+                weighted_risk.max(floor_risk)
+            }
+            ReplayScoreModel::RatePrimaryAmplified => {
+                let healthy_taper = if rate_ratio <= 1.25 {
+                    1.0
+                } else if rate_ratio >= 2.0 {
+                    0.0
+                } else {
+                    ((2.0 - rate_ratio) / 0.75).clamp(0.0, 1.0)
+                };
+                let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
+                (rate_risk * amplification).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::MarginalBandBounded => {
+                if !(0.75..=1.25).contains(&rate_ratio) {
+                    return rate_risk;
+                }
+
+                (rate_risk + (0.6 * progress_risk)).clamp(0.0, 1.0)
+            }
         }
-
-        let weighted_risk = ((self.config.score.weight_rate * rate_risk)
-            + (self.config.score.weight_progress * progress_risk))
-            / weight_total;
-        let floor_risk = (self.config.score.rate_risk_floor * rate_risk).clamp(0.0, 1.0);
-
-        weighted_risk.max(floor_risk)
     }
 
     fn effective_sample_score_risk(&self, sample_score_risk: f64, churn_amplifier: f64) -> f64 {

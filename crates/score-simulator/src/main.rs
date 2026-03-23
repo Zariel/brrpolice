@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use brrpolice::{
     config::{FiltersConfig, PolicyConfig},
-    policy::PolicyEngine,
+    policy::{PolicyEngine, ReplayScoreModel},
     types::{
         BanDisposition, OffenceHistory, OffenceIdentity, PeerContext, PeerObservationId,
         PeerSessionState, PeerSnapshot, TorrentScope,
@@ -63,6 +63,8 @@ struct SimulatorConfig {
     policy: PolicyConfig,
     peer_ip: Option<IpAddr>,
     hydrate_logged_score_state: bool,
+    compare_adr_0006: bool,
+    corpus_name: Option<String>,
 }
 
 impl Default for SimulatorConfig {
@@ -73,6 +75,8 @@ impl Default for SimulatorConfig {
             policy,
             peer_ip: None,
             hydrate_logged_score_state: true,
+            compare_adr_0006: false,
+            corpus_name: None,
         }
     }
 }
@@ -94,6 +98,7 @@ struct LogFields {
     ban_score: Option<f64>,
     ban_score_above_threshold_seconds: Option<u64>,
     sample_score_risk: Option<f64>,
+    effective_sample_score_risk: Option<f64>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -188,8 +193,121 @@ struct PeerResultRow {
     sample_count: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CandidateProfile {
+    model: ReplayScoreModel,
+}
+
+impl CandidateProfile {
+    fn key(self) -> &'static str {
+        self.model.key()
+    }
+
+    fn description(self) -> &'static str {
+        self.model.description()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CandidateSummaryRow {
+    record_type: &'static str,
+    corpus_name: String,
+    candidate_key: &'static str,
+    candidate_description: &'static str,
+    lines_total: u64,
+    decision_lines: u64,
+    peer_behaviors_seen: usize,
+    simulated_bans: u64,
+    actual_bans: u64,
+    simulated_bans_with_churn: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CandidateBandSummaryRow {
+    record_type: &'static str,
+    corpus_name: String,
+    candidate_key: &'static str,
+    rate_reference_band: &'static str,
+    peer_behaviors: usize,
+    simulated_bans: usize,
+    actual_bans: usize,
+    decision_changes_vs_baseline: usize,
+    bans_lost_vs_baseline: usize,
+    bans_gained_vs_baseline: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CandidateDeltaRow {
+    record_type: &'static str,
+    corpus_name: String,
+    baseline_candidate_key: &'static str,
+    candidate_key: &'static str,
+    candidate_description: &'static str,
+    torrent_hash: String,
+    torrent_name: Option<String>,
+    torrent_tracker: Option<String>,
+    peer_ip: String,
+    peer_behavior_key: String,
+    first_observed_at: String,
+    last_observed_at: String,
+    rate_reference_band: &'static str,
+    torrent_total_size_bytes: u64,
+    baseline_decision: String,
+    candidate_decision: String,
+    decision_changed: bool,
+    baseline_ever_banned: bool,
+    candidate_ever_banned: bool,
+    ban_changed: bool,
+    baseline_ban_events: u32,
+    candidate_ban_events: u32,
+    actual_ban_events: u32,
+    baseline_rate_reference_ratio: f64,
+    candidate_rate_reference_ratio: f64,
+    baseline_progress_delta: f64,
+    candidate_progress_delta: f64,
+    baseline_required_progress_delta: f64,
+    candidate_required_progress_delta: f64,
+    baseline_progress_deficit_bytes: u64,
+    candidate_progress_deficit_bytes: u64,
+    baseline_final_score: f64,
+    candidate_final_score: f64,
+}
+
+struct CandidateRun {
+    profile: CandidateProfile,
+    summary: Summary,
+    state: ReplayState,
+}
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let config = parse_args(args)?;
+    if config.compare_adr_0006 {
+        let runs = run_candidate_set(&config, &adr_0006_candidate_profiles())?;
+        print_comparison(&config, &runs);
+    } else {
+        let run = run_candidate(
+            &config,
+            CandidateProfile {
+                model: ReplayScoreModel::CurrentComposite,
+            },
+        )?;
+        print_summary(&config, &run.summary, &run.state);
+    }
+    Ok(())
+}
+
+fn run_candidate_set(
+    config: &SimulatorConfig,
+    profiles: &[CandidateProfile],
+) -> Result<Vec<CandidateRun>> {
+    profiles
+        .iter()
+        .copied()
+        .map(|profile| run_candidate(config, profile))
+        .collect()
+}
+
+fn run_candidate(config: &SimulatorConfig, profile: CandidateProfile) -> Result<CandidateRun> {
     let policy = PolicyEngine::new(config.policy.clone(), &FiltersConfig::default());
     let mut state = ReplayState::default();
     let mut summary = Summary::default();
@@ -200,7 +318,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
         let reader = BufReader::new(file);
         process_reader(
             &policy,
-            &config,
+            profile.model,
+            config,
             reader,
             input.display().to_string(),
             &mut state,
@@ -208,12 +327,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
         )?;
     }
 
-    print_summary(&config, &summary, &state);
-    Ok(())
+    Ok(CandidateRun {
+        profile,
+        summary,
+        state,
+    })
 }
 
 fn process_reader<R: BufRead>(
     policy: &PolicyEngine,
+    model: ReplayScoreModel,
     config: &SimulatorConfig,
     reader: R,
     source_name: String,
@@ -231,7 +354,7 @@ fn process_reader<R: BufRead>(
         let Some(fields) = parse_log_fields(&line) else {
             continue;
         };
-        process_fields(policy, config, fields, state, summary)?;
+        process_fields(policy, model, config, fields, state, summary)?;
     }
 
     Ok(())
@@ -239,6 +362,7 @@ fn process_reader<R: BufRead>(
 
 fn process_fields(
     policy: &PolicyEngine,
+    model: ReplayScoreModel,
     config: &SimulatorConfig,
     fields: LogFields,
     state: &mut ReplayState,
@@ -248,6 +372,7 @@ fn process_fields(
         && fields.message != "peer not bannable yet decision"
         && fields.message != "peer exemption decision"
         && fields.message != "peer ban applied"
+        && fields.message != "peer reban cooldown decision"
     {
         return Ok(());
     }
@@ -340,9 +465,12 @@ fn process_fields(
         has_active_ban,
     };
 
-    let mut evaluation =
-        policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
-    if config.hydrate_logged_score_state {
+    let mut evaluation = policy.evaluate_peer_with_model(
+        &peer_context,
+        existing.as_ref().or(carryover.as_ref()),
+        model,
+    );
+    if should_hydrate_logged_score_state(config, model) {
         hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
     } else if let Some(seconds) = fields.observed_duration_seconds {
         evaluation.session.observed_duration = Duration::from_secs(seconds);
@@ -364,8 +492,6 @@ fn process_fields(
         });
     let insights = policy.evaluation_insights(&peer_context, &evaluation);
     let report_key = OffenceKey::from_offence_identity(&evaluation.session.offence_identity);
-    let mut simulated_decision = "duplicate_suppressed";
-
     let mut session_to_store = evaluation.session.clone();
     if evaluation.session.churn_amplifier > 0.0 {
         summary.churn_samples += 1;
@@ -377,9 +503,8 @@ fn process_fields(
         .churn_max_reconnect_count
         .max(evaluation.session.churn_reconnect_count);
     let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
-    match disposition {
+    let simulated_decision = match disposition {
         BanDisposition::Ban(decision) => {
-            simulated_decision = "ban";
             summary.simulated_bans += 1;
             if evaluation.session.churn_amplifier > 0.0 {
                 summary.simulated_bans_with_churn += 1;
@@ -401,12 +526,13 @@ fn process_fields(
                 },
             );
             session_to_store = policy.record_ban_decision(&session_to_store, observed_at);
+            "ban"
         }
-        BanDisposition::Exempt(_) => simulated_decision = "exempt",
-        BanDisposition::NotBannableYet { .. } => simulated_decision = "not_bannable",
-        BanDisposition::RebanCooldown { .. } => simulated_decision = "reban_cooldown",
-        BanDisposition::DuplicateSuppressed => simulated_decision = "duplicate_suppressed",
-    }
+        BanDisposition::Exempt(_) => "exempt",
+        BanDisposition::NotBannableYet { .. } => "not_bannable",
+        BanDisposition::RebanCooldown { .. } => "reban_cooldown",
+        BanDisposition::DuplicateSuppressed => "duplicate_suppressed",
+    };
 
     state.sessions.insert(session_key, session_to_store);
     let report = state
@@ -499,6 +625,10 @@ fn latest_session_for_torrent_ip(
         .cloned()
 }
 
+fn should_hydrate_logged_score_state(config: &SimulatorConfig, model: ReplayScoreModel) -> bool {
+    config.hydrate_logged_score_state && model == ReplayScoreModel::CurrentComposite
+}
+
 fn parse_log_fields(line: &str) -> Option<LogFields> {
     let root: Value = serde_json::from_str(line).ok()?;
 
@@ -540,7 +670,8 @@ fn extract_log_fields(
         .map(str::to_string);
     let torrent_total_size_bytes = fields
         .get("torrent_total_size_bytes")
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        .or_else(|| fields.get("torrent_size_bytes").and_then(Value::as_u64));
     let observed_at = fields
         .get("observed_at")
         .and_then(Value::as_str)
@@ -557,6 +688,9 @@ fn extract_log_fields(
         .get("ban_score_above_threshold_seconds")
         .and_then(Value::as_u64);
     let sample_score_risk = fields.get("sample_score_risk").and_then(Value::as_f64);
+    let effective_sample_score_risk = fields
+        .get("effective_sample_score_risk")
+        .and_then(Value::as_f64);
 
     Some(LogFields {
         message,
@@ -574,6 +708,7 @@ fn extract_log_fields(
         ban_score,
         ban_score_above_threshold_seconds,
         sample_score_risk,
+        effective_sample_score_risk,
     })
 }
 
@@ -598,6 +733,9 @@ fn hydrate_evaluation_from_log_fields(
     }
     if let Some(risk) = fields.sample_score_risk {
         evaluation.sample_score_risk = risk;
+    }
+    if let Some(risk) = fields.effective_sample_score_risk {
+        evaluation.effective_sample_score_risk = risk;
     }
 
     let exemption_free = evaluation.session.last_exemption_reason.is_none();
@@ -708,6 +846,238 @@ fn build_peer_result_rows(state: &ReplayState) -> Vec<PeerResultRow> {
     rows
 }
 
+fn adr_0006_candidate_profiles() -> Vec<CandidateProfile> {
+    vec![
+        CandidateProfile {
+            model: ReplayScoreModel::CurrentComposite,
+        },
+        CandidateProfile {
+            model: ReplayScoreModel::RatePrimaryAmplified,
+        },
+        CandidateProfile {
+            model: ReplayScoreModel::MarginalBandBounded,
+        },
+    ]
+}
+
+fn print_comparison(config: &SimulatorConfig, runs: &[CandidateRun]) {
+    let corpus_name = config.corpus_name.clone().unwrap_or_else(|| {
+        config
+            .inputs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let Some(baseline) = runs
+        .iter()
+        .find(|run| run.profile.model == ReplayScoreModel::CurrentComposite)
+    else {
+        return;
+    };
+
+    println!("adr-0006 comparison");
+    println!("corpus={corpus_name}");
+    for run in runs {
+        let row = CandidateSummaryRow {
+            record_type: "candidate_summary",
+            corpus_name: corpus_name.clone(),
+            candidate_key: run.profile.key(),
+            candidate_description: run.profile.description(),
+            lines_total: run.summary.lines_total,
+            decision_lines: run.summary.lines_decision,
+            peer_behaviors_seen: run.state.peer_reports.len(),
+            simulated_bans: run.summary.simulated_bans,
+            actual_bans: run.summary.actual_bans,
+            simulated_bans_with_churn: run.summary.simulated_bans_with_churn,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&row).expect("candidate summary row should serialize")
+        );
+    }
+
+    for run in runs
+        .iter()
+        .filter(|run| run.profile.key() != baseline.profile.key())
+    {
+        for row in build_candidate_band_summary_rows(&corpus_name, baseline, run) {
+            println!(
+                "{}",
+                serde_json::to_string(&row).expect("candidate band summary row should serialize")
+            );
+        }
+        for row in build_candidate_delta_rows(&corpus_name, baseline, run) {
+            println!(
+                "{}",
+                serde_json::to_string(&row).expect("candidate delta row should serialize")
+            );
+        }
+    }
+}
+
+fn build_candidate_band_summary_rows(
+    corpus_name: &str,
+    baseline: &CandidateRun,
+    candidate: &CandidateRun,
+) -> Vec<CandidateBandSummaryRow> {
+    const BANDS: [&str; 5] = [
+        "clearly_bad",
+        "low_side_gray",
+        "marginal",
+        "high_side_gray",
+        "clearly_healthy",
+    ];
+
+    BANDS
+        .iter()
+        .map(|band| {
+            let baseline_reports = baseline
+                .state
+                .peer_reports
+                .iter()
+                .filter(|(_, report)| report.rate_reference_band == *band)
+                .collect::<Vec<_>>();
+            let candidate_reports = candidate
+                .state
+                .peer_reports
+                .iter()
+                .filter(|(_, report)| report.rate_reference_band == *band)
+                .collect::<Vec<_>>();
+            let peer_behaviors = candidate_reports.len();
+            let simulated_bans = candidate_reports
+                .iter()
+                .filter(|(_, report)| report.simulated_ban_events > 0)
+                .count();
+            let actual_bans = candidate_reports
+                .iter()
+                .filter(|(_, report)| report.actual_ban_events > 0)
+                .count();
+            let decision_changes_vs_baseline = candidate_reports
+                .iter()
+                .filter(|(key, report)| {
+                    baseline
+                        .state
+                        .peer_reports
+                        .get(*key)
+                        .map(|baseline_report| {
+                            baseline_report.simulated_decision != report.simulated_decision
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            let bans_lost_vs_baseline = baseline_reports
+                .iter()
+                .filter(|(key, baseline_report)| {
+                    baseline_report.simulated_ban_events > 0
+                        && candidate
+                            .state
+                            .peer_reports
+                            .get(*key)
+                            .map(|candidate_report| candidate_report.simulated_ban_events == 0)
+                            .unwrap_or(false)
+                })
+                .count();
+            let bans_gained_vs_baseline = candidate_reports
+                .iter()
+                .filter(|(key, candidate_report)| {
+                    candidate_report.simulated_ban_events > 0
+                        && baseline
+                            .state
+                            .peer_reports
+                            .get(*key)
+                            .map(|baseline_report| baseline_report.simulated_ban_events == 0)
+                            .unwrap_or(true)
+                })
+                .count();
+
+            CandidateBandSummaryRow {
+                record_type: "candidate_band_summary",
+                corpus_name: corpus_name.to_string(),
+                candidate_key: candidate.profile.key(),
+                rate_reference_band: band,
+                peer_behaviors,
+                simulated_bans,
+                actual_bans,
+                decision_changes_vs_baseline,
+                bans_lost_vs_baseline,
+                bans_gained_vs_baseline,
+            }
+        })
+        .collect()
+}
+
+fn build_candidate_delta_rows(
+    corpus_name: &str,
+    baseline: &CandidateRun,
+    candidate: &CandidateRun,
+) -> Vec<CandidateDeltaRow> {
+    let mut rows = candidate
+        .state
+        .peer_reports
+        .iter()
+        .filter_map(|(key, candidate_report)| {
+            let baseline_report = baseline.state.peer_reports.get(key)?;
+            Some(CandidateDeltaRow {
+                record_type: "candidate_delta",
+                corpus_name: corpus_name.to_string(),
+                baseline_candidate_key: baseline.profile.key(),
+                candidate_key: candidate.profile.key(),
+                candidate_description: candidate.profile.description(),
+                torrent_hash: candidate_report.torrent_hash.clone(),
+                torrent_name: candidate_report.torrent_name.clone(),
+                torrent_tracker: candidate_report.torrent_tracker.clone(),
+                peer_ip: candidate_report.peer_ip.to_string(),
+                peer_behavior_key: format!(
+                    "{}+{}",
+                    candidate_report.torrent_hash, candidate_report.peer_ip
+                ),
+                first_observed_at: humantime::format_rfc3339_millis(
+                    candidate_report.first_observed_at,
+                )
+                .to_string(),
+                last_observed_at: humantime::format_rfc3339_millis(
+                    candidate_report.last_observed_at,
+                )
+                .to_string(),
+                rate_reference_band: candidate_report.rate_reference_band,
+                torrent_total_size_bytes: candidate_report.torrent_total_size_bytes,
+                baseline_decision: baseline_report.simulated_decision.to_string(),
+                candidate_decision: candidate_report.simulated_decision.to_string(),
+                decision_changed: baseline_report.simulated_decision
+                    != candidate_report.simulated_decision,
+                baseline_ever_banned: baseline_report.simulated_ban_events > 0,
+                candidate_ever_banned: candidate_report.simulated_ban_events > 0,
+                ban_changed: (baseline_report.simulated_ban_events > 0)
+                    != (candidate_report.simulated_ban_events > 0),
+                baseline_ban_events: baseline_report.simulated_ban_events,
+                candidate_ban_events: candidate_report.simulated_ban_events,
+                actual_ban_events: candidate_report.actual_ban_events,
+                baseline_rate_reference_ratio: baseline_report.rate_reference_ratio,
+                candidate_rate_reference_ratio: candidate_report.rate_reference_ratio,
+                baseline_progress_delta: baseline_report.progress_delta,
+                candidate_progress_delta: candidate_report.progress_delta,
+                baseline_required_progress_delta: baseline_report.required_progress_delta,
+                candidate_required_progress_delta: candidate_report.required_progress_delta,
+                baseline_progress_deficit_bytes: baseline_report.progress_deficit_bytes,
+                candidate_progress_deficit_bytes: candidate_report.progress_deficit_bytes,
+                baseline_final_score: baseline_report.final_score,
+                candidate_final_score: candidate_report.final_score,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .ban_changed
+            .cmp(&left.ban_changed)
+            .then(right.decision_changed.cmp(&left.decision_changed))
+            .then(left.rate_reference_band.cmp(right.rate_reference_band))
+            .then(left.torrent_hash.cmp(&right.torrent_hash))
+            .then(left.peer_ip.cmp(&right.peer_ip))
+    });
+    rows
+}
+
 fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
     let mut config = SimulatorConfig::default();
     let mut iter = args.into_iter();
@@ -802,6 +1172,16 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                     value
                         .parse::<IpAddr>()
                         .with_context(|| format!("invalid peer IP `{value}`"))?,
+                );
+            }
+            "--compare-adr-0006" => {
+                config.compare_adr_0006 = true;
+                config.hydrate_logged_score_state = false;
+            }
+            "--corpus-name" => {
+                config.corpus_name = Some(
+                    iter.next()
+                        .context("expected corpus name after `--corpus-name`")?,
                 );
             }
             "--recompute-score" => {
@@ -906,6 +1286,10 @@ fn print_help() {
     println!("  --churn-decay-per-second <f>     Churn amplifier decay rate");
     println!("  --peer-ip <ip>                   Optional peer IP filter");
     println!(
+        "  --compare-adr-0006               Replay baseline plus built-in ADR-0006 candidates"
+    );
+    println!("  --corpus-name <name>             Label used in comparison output");
+    println!(
         "  --recompute-score                Recompute score instead of hydrating logged score state"
     );
 }
@@ -914,8 +1298,12 @@ fn print_help() {
 mod tests {
     use std::{io::Cursor, path::PathBuf};
 
-    use super::{Summary, build_peer_result_rows, parse_args, parse_log_fields, process_reader};
-    use brrpolice::policy::PolicyEngine;
+    use super::{
+        Summary, adr_0006_candidate_profiles, build_candidate_band_summary_rows,
+        build_candidate_delta_rows, build_peer_result_rows, parse_args, parse_log_fields,
+        process_reader, run_candidate_set,
+    };
+    use brrpolice::policy::{PolicyEngine, ReplayScoreModel};
 
     #[test]
     fn parses_vmui_wrapped_json_line() {
@@ -933,6 +1321,14 @@ mod tests {
         assert_eq!(parsed.message, "peer ban applied");
         assert_eq!(parsed.torrent_hash, "abc");
         assert_eq!(parsed.torrent_total_size_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn parses_local_corpus_torrent_size_alias() {
+        let line = r#"{"timestamp":"2026-03-23T04:13:44.986Z","fields":{"message":"peer policy update","peer_ip":"1.2.3.4","peer_port":51413,"torrent_hash":"abc","torrent_size_bytes":2048,"observed_at":"2026-03-23T04:13:44.986Z","progress_delta":0.01,"average_upload_rate_bps":99,"sample_score_risk":0.2,"effective_sample_score_risk":0.3}}"#;
+        let parsed = parse_log_fields(line).expect("expected parsed fields");
+        assert_eq!(parsed.torrent_total_size_bytes, Some(2_048));
+        assert_eq!(parsed.effective_sample_score_risk, Some(0.3));
     }
 
     #[test]
@@ -985,6 +1381,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_supports_adr_comparison_mode() {
+        let args = vec![
+            "--input".to_string(),
+            "one.json".to_string(),
+            "--compare-adr-0006".to_string(),
+            "--corpus-name".to_string(),
+            "holdout".to_string(),
+        ];
+        let config = parse_args(args).expect("expected args to parse");
+        assert!(config.compare_adr_0006);
+        assert!(!config.hydrate_logged_score_state);
+        assert_eq!(config.corpus_name.as_deref(), Some("holdout"));
+    }
+
+    #[test]
     fn replay_harness_aggregates_across_multiple_readers() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
         let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
@@ -1000,6 +1411,7 @@ mod tests {
 
         process_reader(
             &policy,
+            ReplayScoreModel::CurrentComposite,
             &config,
             first,
             "first".to_string(),
@@ -1009,6 +1421,7 @@ mod tests {
         .unwrap();
         process_reader(
             &policy,
+            ReplayScoreModel::CurrentComposite,
             &config,
             second,
             "second".to_string(),
@@ -1058,6 +1471,7 @@ mod tests {
 
         process_reader(
             &policy,
+            ReplayScoreModel::CurrentComposite,
             &config,
             replay,
             "replay".to_string(),
@@ -1089,6 +1503,7 @@ mod tests {
 
         process_reader(
             &policy,
+            ReplayScoreModel::CurrentComposite,
             &config,
             replay,
             "replay".to_string(),
@@ -1104,5 +1519,53 @@ mod tests {
         assert_eq!(rows[0].progress_delta_bytes, 10_000);
         assert_eq!(rows[0].actual_ban_events, 1);
         assert_eq!(rows[0].peer_behavior_key, "abc+1.2.3.4");
+    }
+
+    #[test]
+    fn adr_comparison_emits_delta_and_band_summaries() {
+        let config = parse_args(vec![
+            "--input".into(),
+            "dummy".into(),
+            "--compare-adr-0006".into(),
+        ])
+        .unwrap();
+        let replay = concat!(
+            "{\"timestamp\":\"2026-03-23T04:13:44.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"healthy\",\"torrent_name\":\"Healthy\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:13:44.986Z\",\"progress_delta\":0.0005,\"average_upload_rate_bps\":160000,\"observed_duration_seconds\":300}}\n",
+            "{\"timestamp\":\"2026-03-23T04:13:54.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"healthy\",\"torrent_name\":\"Healthy\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:13:54.986Z\",\"progress_delta\":0.0005,\"average_upload_rate_bps\":160000,\"observed_duration_seconds\":310}}\n",
+            "{\"timestamp\":\"2026-03-23T04:14:04.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"healthy\",\"torrent_name\":\"Healthy\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:14:04.986Z\",\"progress_delta\":0.0005,\"average_upload_rate_bps\":160000,\"observed_duration_seconds\":320}}\n",
+            "{\"timestamp\":\"2026-03-23T04:13:44.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"5.6.7.8\",\"peer_port\":60000,\"torrent_hash\":\"marginal\",\"torrent_name\":\"Marginal\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:13:44.986Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":65536,\"observed_duration_seconds\":300}}\n",
+            "{\"timestamp\":\"2026-03-23T04:13:54.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"5.6.7.8\",\"peer_port\":60000,\"torrent_hash\":\"marginal\",\"torrent_name\":\"Marginal\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:13:54.986Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":65536,\"observed_duration_seconds\":310}}\n",
+            "{\"timestamp\":\"2026-03-23T04:14:04.986Z\",\"fields\":{\"message\":\"peer policy update\",\"peer_ip\":\"5.6.7.8\",\"peer_port\":60000,\"torrent_hash\":\"marginal\",\"torrent_name\":\"Marginal\",\"torrent_size_bytes\":1000000000,\"observed_at\":\"2026-03-23T04:14:04.986Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":65536,\"observed_duration_seconds\":320}}\n"
+        );
+        let input = std::env::temp_dir().join(format!(
+            "score-simulator-adr-compare-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&input, replay).expect("write replay");
+
+        let mut compare_config = config.clone();
+        compare_config.inputs = vec![input.clone()];
+        compare_config.corpus_name = Some("unit".into());
+        let runs = run_candidate_set(&compare_config, &adr_0006_candidate_profiles())
+            .expect("candidate set");
+        let baseline = runs
+            .iter()
+            .find(|run| run.profile.model == ReplayScoreModel::CurrentComposite)
+            .expect("baseline run");
+        let candidate = runs
+            .iter()
+            .find(|run| run.profile.model == ReplayScoreModel::MarginalBandBounded)
+            .expect("marginal run");
+
+        let band_rows = build_candidate_band_summary_rows("unit", baseline, candidate);
+        let delta_rows = build_candidate_delta_rows("unit", baseline, candidate);
+
+        assert_eq!(band_rows.len(), 5);
+        assert!(
+            delta_rows
+                .iter()
+                .any(|row| row.peer_behavior_key == "marginal+5.6.7.8")
+        );
+        let _ = std::fs::remove_file(input);
     }
 }
