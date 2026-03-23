@@ -814,13 +814,7 @@ impl PolicyEngine {
                 weighted_risk.max(floor_risk)
             }
             ReplayScoreModel::RatePrimaryAmplified => {
-                let healthy_taper = if rate_ratio <= 1.25 {
-                    1.0
-                } else if rate_ratio >= 2.0 {
-                    0.0
-                } else {
-                    ((2.0 - rate_ratio) / 0.75).clamp(0.0, 1.0)
-                };
+                let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
                 let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
                 (rate_risk * amplification).clamp(0.0, 1.0)
             }
@@ -913,6 +907,22 @@ fn progress_fraction_to_bytes(total_size_bytes: u64, progress_fraction: f64) -> 
     }
 
     ((total_size_bytes as f64) * progress_fraction.clamp(0.0, 1.0)).round() as u64
+}
+
+fn smooth_rolloff(value: f64, start: f64, end: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value <= start {
+        return 1.0;
+    }
+    if value >= end || end <= start {
+        return 0.0;
+    }
+
+    let progress = ((value - start) / (end - start)).clamp(0.0, 1.0);
+    let smoothstep = progress * progress * (3.0 - (2.0 * progress));
+    1.0 - smoothstep
 }
 
 #[cfg(test)]
@@ -1138,6 +1148,25 @@ mod tests {
 
         assert_eq!(baseline, 0.02);
         assert_eq!(scaled, 0.005);
+    }
+
+    #[test]
+    fn smooth_rolloff_is_full_before_start_and_zero_after_end() {
+        assert_eq!(super::smooth_rolloff(0.9, 1.0, 1.5), 1.0);
+        assert_eq!(super::smooth_rolloff(1.0, 1.0, 1.5), 1.0);
+        assert_eq!(super::smooth_rolloff(1.5, 1.0, 1.5), 0.0);
+        assert_eq!(super::smooth_rolloff(1.6, 1.0, 1.5), 0.0);
+    }
+
+    #[test]
+    fn smooth_rolloff_transitions_smoothly_inside_window() {
+        let early = super::smooth_rolloff(1.1, 1.0, 1.5);
+        let mid = super::smooth_rolloff(1.25, 1.0, 1.5);
+        let late = super::smooth_rolloff(1.4, 1.0, 1.5);
+
+        assert!(early < 1.0 && early > mid);
+        assert!((mid - 0.5).abs() < 0.0001);
+        assert!(late < mid && late > 0.0);
     }
 
     #[test]

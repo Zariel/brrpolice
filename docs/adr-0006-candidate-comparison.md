@@ -37,7 +37,8 @@ Replay-only candidate using rolling average upload rate as the primary risk sign
 
 - base risk is normalized rate risk from the rolling reference rate
 - progress inefficiency can only amplify existing rate risk
-- progress amplification tapers to zero between `1.25x` and `2.0x` target rate
+- progress amplification stays full up to `1.0x` target rate and then rolls off smoothly to zero
+  by `1.25x` target rate
 - progress cannot create risk when rate risk is zero
 
 Formula shape:
@@ -152,7 +153,34 @@ Current conclusion:
 - `marginal_band_bounded` is not acceptable in its current form because it weakens clearly-bad
   low-rate safety while still leaving healthy-rate bans behind
 
+## Follow-up Iteration
+
+The next refinement pass tightened the `rate_primary_amplified` taper to the more protective end
+of the ADR-0006 range:
+
+- full progress influence at or below `1.0x` target rate
+- smooth rolloff between `1.0x` and `1.25x`
+- zero progress influence above `1.25x`
+
+That stricter taper did not materially change the aggregate outcomes on either local corpus. The
+same hard-gate failures remained:
+
+- `prod-fixed` still had `1` clearly healthy simulated ban under `rate_primary_amplified`
+- `logs-2026-03-23` still had `5` clearly healthy simulated bans under `rate_primary_amplified`
+- marginal and high-side-gray bans lost relative to current were unchanged on `logs-2026-03-23`
+
+Current interpretation:
+
+- the rate-primary tapered-amplification family is still the most credible ADR-0006 direction to
+  keep iterating on
+- this specific taper refinement is not enough to unblock production work
+- the remaining errors are not solved by taper shape alone; the next iteration needs to adjust how
+  near-target and slightly-above-target peers accumulate risk, not only how clearly healthy peers
+  are protected
+
 ## Consequence For Backlog
 
 `brrpolice-d6br.4` should not start from either candidate in this document. More candidate
-iteration is required before a production ADR-0006 model can be selected.
+iteration is required before a production ADR-0006 model can be selected, but future refinement
+should start from the `rate_primary_amplified` family rather than the bounded marginal-band
+variant.
