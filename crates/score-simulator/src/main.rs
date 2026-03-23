@@ -855,6 +855,9 @@ fn adr_0006_candidate_profiles() -> Vec<CandidateProfile> {
             model: ReplayScoreModel::RatePrimaryAmplified,
         },
         CandidateProfile {
+            model: ReplayScoreModel::RatePrimaryCurvedShoulder,
+        },
+        CandidateProfile {
             model: ReplayScoreModel::RatePrimaryResidencyShoulder,
         },
         CandidateProfile {

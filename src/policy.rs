@@ -30,6 +30,7 @@ const RATE_REFERENCE_NAME: &str = "rolling_avg_upload_rate_bps";
 pub enum ReplayScoreModel {
     CurrentComposite,
     RatePrimaryAmplified,
+    RatePrimaryCurvedShoulder,
     RatePrimaryResidencyShoulder,
     RatePrimaryGatedResidencyShoulder,
     RatePrimaryGatedLongResidency,
@@ -41,6 +42,7 @@ impl ReplayScoreModel {
         match self {
             Self::CurrentComposite => "current_composite",
             Self::RatePrimaryAmplified => "rate_primary_amplified",
+            Self::RatePrimaryCurvedShoulder => "rate_primary_curved_shoulder",
             Self::RatePrimaryResidencyShoulder => "rate_primary_residency_shoulder",
             Self::RatePrimaryGatedResidencyShoulder => "rate_primary_gated_residency_shoulder",
             Self::RatePrimaryGatedLongResidency => "rate_primary_gated_long_residency",
@@ -53,6 +55,9 @@ impl ReplayScoreModel {
             Self::CurrentComposite => "Current weighted composite score model.",
             Self::RatePrimaryAmplified => {
                 "Rate-primary risk with bounded progress amplification that cannot create bans on its own."
+            }
+            Self::RatePrimaryCurvedShoulder => {
+                "Rate-primary risk with curved progress pressure and a steeper above-target shoulder for marginal tuning."
             }
             Self::RatePrimaryResidencyShoulder => {
                 "Rate-primary risk with an above-target shoulder and residency pressure for long-lived peers."
@@ -813,6 +818,9 @@ impl PolicyEngine {
             ReplayScoreModel::RatePrimaryAmplified => {
                 normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
             }
+            ReplayScoreModel::RatePrimaryCurvedShoulder => {
+                normalized_rate_risk(rate_reference_bps, self.config.score.target_rate_bps)
+            }
             ReplayScoreModel::RatePrimaryResidencyShoulder => {
                 replay_rate_primary_base_risk(rate_ratio, 1.0, 1.5, 0.15)
             }
@@ -846,6 +854,17 @@ impl PolicyEngine {
                 let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.25);
                 let amplification = 1.0 + (0.75 * progress_risk * healthy_taper);
                 (rate_risk * amplification).clamp(0.0, 1.0)
+            }
+            ReplayScoreModel::RatePrimaryCurvedShoulder => {
+                let curved_progress = curved_progress_penalty(progress_risk, 1.75);
+                let below_target_taper = smooth_rolloff(rate_ratio, 1.0, 1.20).powf(1.35);
+                let base_amplified =
+                    rate_risk * (1.0 + (0.70 * curved_progress * below_target_taper));
+                let above_target_pressure = 0.18
+                    * curved_progress
+                    * above_target_shoulder_taper(rate_ratio, 1.0, 1.20).powf(2.5);
+
+                (base_amplified + above_target_pressure).clamp(0.0, 1.0)
             }
             ReplayScoreModel::RatePrimaryResidencyShoulder => {
                 let healthy_taper = smooth_rolloff(rate_ratio, 1.0, 1.5);
@@ -995,6 +1014,10 @@ fn above_target_shoulder_taper(value: f64, start: f64, end: f64) -> f64 {
     }
 
     smooth_rolloff(value, start, end)
+}
+
+fn curved_progress_penalty(progress_risk: f64, exponent: f64) -> f64 {
+    progress_risk.clamp(0.0, 1.0).powf(exponent.max(1.0))
 }
 
 fn replay_long_residency_risk(rate_ratio: f64, current_progress: f64, progress_risk: f64) -> f64 {
@@ -1314,6 +1337,16 @@ mod tests {
         assert_eq!(super::above_target_shoulder_taper(1.0, 1.0, 1.15), 0.0);
         assert!(super::above_target_shoulder_taper(1.05, 1.0, 1.15) > 0.0);
         assert_eq!(super::above_target_shoulder_taper(1.2, 1.0, 1.15), 0.0);
+    }
+
+    #[test]
+    fn curved_progress_penalty_suppresses_midrange_more_than_high_end() {
+        let mild = super::curved_progress_penalty(0.4, 1.75);
+        let severe = super::curved_progress_penalty(0.9, 1.75);
+
+        assert!(mild < 0.4);
+        assert!(severe > 0.8);
+        assert!(mild < severe);
     }
 
     #[test]

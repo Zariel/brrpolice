@@ -52,6 +52,20 @@ Formula shape:
 sample_risk = clamp(rate_risk * (1 + 0.75 * progress_risk * taper), 0, 1)
 ```
 
+### `rate_primary_curved_shoulder`
+
+Replay-only follow-up that keeps the same rate-primary family but makes the progress and shoulder
+pressure more conservative with curved weighting:
+
+- mid-range progress deficits are suppressed with a convex progress curve
+- the below-target taper rolls off more steeply than the current amplified candidate
+- the above-target shoulder also decays more steeply, so only near-target high deficits get any
+  extra pressure
+
+On the current corpora this produces the same aggregate and band outcomes as
+`rate_primary_amplified`, so this class of curved marginal tuning appears too weak to move replay
+results.
+
 ### `marginal_band_bounded`
 
 Replay-only candidate using rolling average upload rate as the primary signal and adding progress
@@ -111,6 +125,7 @@ above-target lane is too easy to trigger across whole peer behaviors and floods 
 | --- | ---: | ---: | ---: |
 | `current_composite` | 188 | 23 | 22 |
 | `rate_primary_amplified` | 188 | 23 | 22 |
+| `rate_primary_curved_shoulder` | 188 | 23 | 22 |
 | `rate_primary_residency_shoulder` | 188 | 24 | 22 |
 | `rate_primary_gated_residency_shoulder` | 188 | 23 | 22 |
 | `rate_primary_gated_long_residency` | 188 | 62 | 22 |
@@ -121,6 +136,7 @@ Key band outcomes versus current:
 | candidate | clearly bad bans lost | clearly bad bans gained | marginal bans lost | clearly healthy bans lost | clearly healthy bans kept |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 3 | 2 | 3 | 1 |
+| `rate_primary_curved_shoulder` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_residency_shoulder` | 0 | 3 | 1 | 3 | 1 |
 | `rate_primary_gated_residency_shoulder` | 0 | 3 | 2 | 3 | 1 |
 | `rate_primary_gated_long_residency` | 0 | 40 | 2 | 3 | 1 |
@@ -132,6 +148,7 @@ Key band outcomes versus current:
 | --- | ---: | ---: | ---: |
 | `current_composite` | 176 | 22 | 21 |
 | `rate_primary_amplified` | 176 | 16 | 21 |
+| `rate_primary_curved_shoulder` | 176 | 16 | 21 |
 | `rate_primary_residency_shoulder` | 176 | 23 | 21 |
 | `rate_primary_gated_residency_shoulder` | 176 | 16 | 21 |
 | `rate_primary_gated_long_residency` | 176 | 44 | 21 |
@@ -142,6 +159,7 @@ Key band outcomes versus current:
 | candidate | clearly bad bans lost | clearly bad bans gained | marginal bans lost | high-side gray bans lost | clearly healthy bans lost | clearly healthy bans kept |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `rate_primary_amplified` | 0 | 1 | 2 | 2 | 3 | 5 |
+| `rate_primary_curved_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_residency_shoulder` | 0 | 2 | 1 | 1 | 3 | 6 |
 | `rate_primary_gated_residency_shoulder` | 0 | 1 | 2 | 2 | 3 | 5 |
 | `rate_primary_gated_long_residency` | 0 | 26 | 2 | 2 | 3 | 5 |
@@ -201,6 +219,9 @@ Current conclusion:
 - against `main`, `rate_primary_amplified` is directionally closer to the ADR because it rescues
   several clearly healthy large-torrent peers while preserving clearly-bad ban status on these
   corpora
+- `rate_primary_curved_shoulder` keeps the same overall behavior against `main`; the curved taper
+  and penalty shape are conservative enough that they do not move aggregate or band outcomes on
+  the current corpora
 - `rate_primary_residency_shoulder` better matches the clarified product intuition for
   slightly-above-target, low-completion peers, but against `main` it overcorrects and becomes too
   ban-heavy on the noisier corpus
@@ -217,20 +238,24 @@ Current conclusion:
 
 ## Follow-up Iteration
 
-The next refinement passes tested four ideas:
+The next refinement passes tested five ideas:
 
 1. A stricter taper for `rate_primary_amplified`:
    - full progress influence at or below `1.0x` target rate
    - smooth rolloff between `1.0x` and `1.25x`
    - zero progress influence above `1.25x`
-2. A separate `rate_primary_residency_shoulder` candidate:
+2. A curved `rate_primary_curved_shoulder` follow-up:
+   - convex progress penalty to suppress mid-range deficits
+   - steeper below-target taper
+   - steeper above-target shoulder
+3. A separate `rate_primary_residency_shoulder` candidate:
    - small above-target base-risk shoulder through `1.5x`
    - residency pressure from low completion plus progress inefficiency
-3. A narrower `rate_primary_gated_residency_shoulder` follow-up:
+4. A narrower `rate_primary_gated_residency_shoulder` follow-up:
    - shoulder only above target, never below it
    - shoulder narrowed to `1.0x..1.15x`
    - extra pressure only while completion remains low
-4. A `rate_primary_gated_long_residency` follow-up:
+5. A `rate_primary_gated_long_residency` follow-up:
    - keep `rate_primary_amplified` as the base path
    - open a second lane only in `1.0x..1.10x`
    - require `<=10%` completion and `>=0.95` progress risk
@@ -239,6 +264,8 @@ The next refinement passes tested four ideas:
 Results:
 
 - the stricter taper did not materially change aggregate outcomes for `rate_primary_amplified`
+- the curved shoulder candidate also did not materially change aggregate or band outcomes relative
+  to `rate_primary_amplified`
 - the broad residency-shoulder candidate improved marginal losses on `prod-fixed` from `2` to `1`
   relative to `main`, but regressed badly on `logs-2026-03-23`, increasing total simulated bans
   from `22` on `main` to `23`
@@ -252,6 +279,8 @@ Current interpretation:
 - the rate-primary tapered-amplification family is still the most credible ADR-0006 direction to
   keep iterating on
 - the specific taper refinement is not enough to unblock production work
+- conservative curved tapering and progress weighting were also too weak to move outcomes on the
+  current corpora
 - a broad above-target shoulder over-bans, while a tightly gated shoulder becomes too weak to move
   replay outcomes on the current corpora
 - a single-sample long-residency lane also over-bans, which suggests any above-target residency
