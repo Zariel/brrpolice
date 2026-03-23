@@ -24,6 +24,21 @@ pub struct PolicyEngine {
 }
 
 const SCORE_BASED_REASON_CODE: &str = "score_based";
+const RATE_REFERENCE_NAME: &str = "rolling_avg_upload_rate_bps";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluationInsights {
+    pub rate_reference_name: &'static str,
+    pub rate_reference_bps: u64,
+    pub rate_reference_target_bps: u64,
+    pub rate_reference_ratio: f64,
+    pub rate_reference_band: &'static str,
+    pub required_progress_delta: f64,
+    pub torrent_total_size_bytes: u64,
+    pub progress_delta_bytes: u64,
+    pub required_progress_bytes: u64,
+    pub progress_deficit_bytes: u64,
+}
 
 impl PolicyEngine {
     pub fn new(config: PolicyConfig, filters: &FiltersConfig) -> Self {
@@ -451,6 +466,37 @@ impl PolicyEngine {
         Vec::new()
     }
 
+    pub fn evaluation_insights(
+        &self,
+        peer: &PeerContext,
+        evaluation: &PeerEvaluation,
+    ) -> EvaluationInsights {
+        let rate_reference_bps = evaluation.session.rolling_avg_up_rate_bps;
+        let rate_reference_target_bps = self.config.score.target_rate_bps;
+        let rate_reference_ratio =
+            Self::rate_reference_ratio(rate_reference_bps, rate_reference_target_bps);
+        let required_progress_delta =
+            self.required_progress_delta(evaluation.session.observed_duration, rate_reference_bps);
+        let torrent_total_size_bytes = peer.torrent.total_size_bytes;
+        let progress_delta_bytes =
+            progress_fraction_to_bytes(torrent_total_size_bytes, evaluation.progress_delta);
+        let required_progress_bytes =
+            progress_fraction_to_bytes(torrent_total_size_bytes, required_progress_delta);
+
+        EvaluationInsights {
+            rate_reference_name: RATE_REFERENCE_NAME,
+            rate_reference_bps,
+            rate_reference_target_bps,
+            rate_reference_ratio,
+            rate_reference_band: Self::rate_reference_band(rate_reference_ratio),
+            required_progress_delta,
+            torrent_total_size_bytes,
+            progress_delta_bytes,
+            required_progress_bytes,
+            progress_deficit_bytes: required_progress_bytes.saturating_sub(progress_delta_bytes),
+        }
+    }
+
     fn is_allowlisted(&self, ip: IpAddr) -> bool {
         self.allowlisted_ips.contains(&ip)
             || self.allowlisted_cidrs.iter().any(|cidr| cidr.contains(&ip))
@@ -600,6 +646,28 @@ impl PolicyEngine {
 
         let progress = ((ratio - start) / (end - start)).clamp(0.0, 1.0);
         1.0 - ((1.0 - min_scale) * progress)
+    }
+
+    fn rate_reference_ratio(rate_reference_bps: u64, target_rate_bps: u64) -> f64 {
+        if target_rate_bps == 0 {
+            return 0.0;
+        }
+
+        rate_reference_bps as f64 / target_rate_bps as f64
+    }
+
+    fn rate_reference_band(rate_reference_ratio: f64) -> &'static str {
+        if rate_reference_ratio < 0.5 {
+            "clearly_bad"
+        } else if rate_reference_ratio < 0.75 {
+            "low_side_gray"
+        } else if rate_reference_ratio <= 1.25 {
+            "marginal"
+        } else if rate_reference_ratio < 2.0 {
+            "high_side_gray"
+        } else {
+            "clearly_healthy"
+        }
     }
 
     fn advance_progress_baseline(
@@ -758,6 +826,14 @@ fn normalized_progress_risk(progress_delta: f64, required_progress_delta: f64) -
     }
     let deficit = (required_progress_delta - progress_delta).max(0.0);
     (deficit / required_progress_delta).clamp(0.0, 1.0)
+}
+
+fn progress_fraction_to_bytes(total_size_bytes: u64, progress_fraction: f64) -> u64 {
+    if total_size_bytes == 0 || !progress_fraction.is_finite() || progress_fraction <= 0.0 {
+        return 0;
+    }
+
+    ((total_size_bytes as f64) * progress_fraction.clamp(0.0, 1.0)).round() as u64
 }
 
 #[cfg(test)]
@@ -1722,6 +1798,7 @@ mod tests {
                 hash: "abc123".to_string(),
                 name: "torrent-abc123".to_string(),
                 tracker: None,
+                total_size_bytes: 1_000_000,
                 category: Some("tv".to_string()),
                 tags: vec!["seed".to_string()],
                 total_seeders: 5,
@@ -1737,6 +1814,31 @@ mod tests {
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(observed_secs),
             has_active_ban: false,
         }
+    }
+
+    #[test]
+    fn evaluation_insights_report_rate_band_and_byte_metrics() {
+        let config = PolicyConfig {
+            score: ScorePolicyConfig {
+                target_rate_bps: 1_000,
+                required_progress_delta: 0.02,
+                sustain_duration: Duration::from_secs(120),
+                ..ScorePolicyConfig::default()
+            },
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+
+        let peer = seeded_peer(180, 0.11, 2_000);
+        let evaluation = engine.evaluate_peer(&peer, None);
+        let insights = engine.evaluation_insights(&peer, &evaluation);
+
+        assert_eq!(insights.rate_reference_name, "rolling_avg_upload_rate_bps");
+        assert_eq!(insights.rate_reference_band, "clearly_healthy");
+        assert_eq!(insights.torrent_total_size_bytes, 1_000_000);
+        assert_eq!(insights.progress_delta_bytes, 0);
+        assert_eq!(insights.required_progress_bytes, 20_000);
+        assert_eq!(insights.progress_deficit_bytes, 20_000);
     }
 
     #[test]

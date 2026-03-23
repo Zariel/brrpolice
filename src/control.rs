@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
-    policy::PolicyEngine,
+    policy::{EvaluationInsights, PolicyEngine},
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
     types::{
@@ -29,6 +29,7 @@ macro_rules! log_peer_decision {
         $torrent_tracker:expr,
         $peer:expr,
         $evaluation:expr,
+        $insights:expr,
         $observed_at_rfc3339:expr
         $(, $extra_key:ident = $extra_value:expr )* $(,)?
     ) => {
@@ -50,6 +51,16 @@ macro_rules! log_peer_decision {
             effective_sample_score_risk = $evaluation.effective_sample_score_risk,
             progress_delta = $evaluation.progress_delta,
             average_upload_rate_bps = $evaluation.session.rolling_avg_up_rate_bps,
+            rate_reference_name = $insights.rate_reference_name,
+            rate_reference_bps = $insights.rate_reference_bps,
+            rate_reference_target_bps = $insights.rate_reference_target_bps,
+            rate_reference_ratio = $insights.rate_reference_ratio,
+            rate_reference_band = $insights.rate_reference_band,
+            required_progress_delta = $insights.required_progress_delta,
+            torrent_total_size_bytes = $insights.torrent_total_size_bytes,
+            progress_delta_bytes = $insights.progress_delta_bytes,
+            required_progress_bytes = $insights.required_progress_bytes,
+            progress_deficit_bytes = $insights.progress_deficit_bytes,
             churn_reconnect_count = $evaluation.session.churn_reconnect_count,
             churn_amplifier = $evaluation.session.churn_amplifier,
             sample_count = $evaluation.session.sample_count,
@@ -88,6 +99,16 @@ macro_rules! log_ban_action {
             effective_sample_score_risk = $action.evaluation.effective_sample_score_risk,
             progress_delta = $action.evaluation.progress_delta,
             average_upload_rate_bps = $action.evaluation.session.rolling_avg_up_rate_bps,
+            rate_reference_name = $action.insights.rate_reference_name,
+            rate_reference_bps = $action.insights.rate_reference_bps,
+            rate_reference_target_bps = $action.insights.rate_reference_target_bps,
+            rate_reference_ratio = $action.insights.rate_reference_ratio,
+            rate_reference_band = $action.insights.rate_reference_band,
+            required_progress_delta = $action.insights.required_progress_delta,
+            torrent_total_size_bytes = $action.insights.torrent_total_size_bytes,
+            progress_delta_bytes = $action.insights.progress_delta_bytes,
+            required_progress_bytes = $action.insights.required_progress_bytes,
+            progress_deficit_bytes = $action.insights.progress_deficit_bytes,
             churn_reconnect_count = $action.evaluation.session.churn_reconnect_count,
             churn_amplifier = $action.evaluation.session.churn_amplifier,
             sample_count = $action.evaluation.session.sample_count,
@@ -126,6 +147,7 @@ struct PendingBanAction {
     torrent_tracker: String,
     decision: BanDecision,
     evaluation: PeerEvaluation,
+    insights: EvaluationInsights,
     pending_intent: PendingBanIntentRecord,
 }
 
@@ -322,6 +344,7 @@ impl ControlLoop {
                 hash: torrent.hash.clone(),
                 name: torrent.name.clone(),
                 tracker: torrent.tracker.clone(),
+                total_size_bytes: torrent.total_size_bytes,
                 category: torrent.category.clone(),
                 tags: torrent.tags.clone(),
                 total_seeders: torrent.total_seeders,
@@ -390,6 +413,8 @@ impl ControlLoop {
                 let evaluation = self
                     .policy
                     .evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
+                let evaluation_insights =
+                    self.policy.evaluation_insights(&peer_context, &evaluation);
                 self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
                 self.metrics.record_score_evaluation(
                     evaluation.session.ban_score,
@@ -416,6 +441,7 @@ impl ControlLoop {
                             torrent_tracker,
                             peer,
                             evaluation,
+                            evaluation_insights,
                             observed_at_rfc3339,
                             offence_number = decision.offence_number,
                             selected_ban_ttl_seconds = decision.ttl.as_secs(),
@@ -432,6 +458,7 @@ impl ControlLoop {
                                 torrent_tracker,
                                 peer,
                                 evaluation,
+                                evaluation_insights,
                                 observed_at_rfc3339,
                                 offence_number = decision.offence_number,
                                 selected_ban_ttl_seconds = decision.ttl.as_secs(),
@@ -469,6 +496,7 @@ impl ControlLoop {
                             torrent_tracker: torrent_tracker.clone(),
                             decision,
                             evaluation,
+                            insights: evaluation_insights,
                             pending_intent,
                         });
                     }
@@ -485,6 +513,7 @@ impl ControlLoop {
                             torrent_tracker,
                             peer,
                             evaluation,
+                            evaluation_insights,
                             observed_at_rfc3339,
                             exemption_reason = format!("{reason:?}"),
                             latest_peer_progress = peer.peer.progress
@@ -498,6 +527,7 @@ impl ControlLoop {
                                 torrent_tracker,
                                 peer,
                                 evaluation,
+                                evaluation_insights,
                                 observed_at_rfc3339,
                                 exemption_reason = format!("{reason:?}"),
                                 latest_peer_progress = peer.peer.progress
@@ -531,6 +561,7 @@ impl ControlLoop {
                             torrent_tracker,
                             peer,
                             evaluation,
+                            evaluation_insights,
                             observed_at_rfc3339,
                             observed_duration_seconds = observed_duration.as_secs(),
                             required_observation_seconds = required_observation.as_secs(),
@@ -551,6 +582,7 @@ impl ControlLoop {
                                 torrent_tracker,
                                 peer,
                                 evaluation,
+                                evaluation_insights,
                                 observed_at_rfc3339,
                                 observed_duration_seconds = observed_duration.as_secs(),
                                 required_observation_seconds = required_observation.as_secs(),
@@ -577,6 +609,7 @@ impl ControlLoop {
                             torrent_tracker,
                             peer,
                             evaluation,
+                            evaluation_insights,
                             observed_at_rfc3339,
                             reban_cooldown_remaining_seconds = remaining.as_secs(),
                             latest_peer_progress = peer.peer.progress
@@ -593,6 +626,7 @@ impl ControlLoop {
                                 torrent_tracker,
                                 peer,
                                 evaluation,
+                                evaluation_insights,
                                 observed_at_rfc3339,
                                 reban_cooldown_remaining_seconds = remaining.as_secs(),
                                 latest_peer_progress = peer.peer.progress
@@ -612,6 +646,7 @@ impl ControlLoop {
                             torrent_tracker,
                             peer,
                             evaluation,
+                            evaluation_insights,
                             observed_at_rfc3339,
                             latest_peer_progress = peer.peer.progress
                         );
@@ -627,6 +662,7 @@ impl ControlLoop {
                                 torrent_tracker,
                                 peer,
                                 evaluation,
+                                evaluation_insights,
                                 observed_at_rfc3339,
                                 latest_peer_progress = peer.peer.progress
                             );

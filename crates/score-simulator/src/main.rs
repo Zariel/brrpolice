@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use humantime::parse_rfc3339;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use brrpolice::{
@@ -85,6 +85,7 @@ struct LogFields {
     torrent_hash: String,
     torrent_name: Option<String>,
     torrent_tracker: Option<String>,
+    torrent_total_size_bytes: Option<u64>,
     observed_at: String,
     progress_delta: f64,
     average_upload_rate_bps: u64,
@@ -120,7 +121,71 @@ struct ReplayState {
     sessions: HashMap<SessionKey, PeerSessionState>,
     offences: HashMap<OffenceKey, OffenceHistory>,
     active_bans: HashMap<ActiveBanKey, SystemTime>,
-    ban_events: HashMap<SessionKey, u32>,
+    peer_reports: HashMap<OffenceKey, PeerReport>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerReport {
+    torrent_hash: String,
+    torrent_name: Option<String>,
+    torrent_tracker: Option<String>,
+    peer_ip: IpAddr,
+    last_peer_port: u16,
+    first_observed_at: SystemTime,
+    last_observed_at: SystemTime,
+    simulated_decision: &'static str,
+    simulated_ban_events: u32,
+    actual_ban_events: u32,
+    rate_reference_name: &'static str,
+    rate_reference_bps: u64,
+    rate_reference_target_bps: u64,
+    rate_reference_ratio: f64,
+    rate_reference_band: &'static str,
+    torrent_total_size_bytes: u64,
+    progress_delta: f64,
+    progress_delta_bytes: u64,
+    required_progress_delta: f64,
+    required_progress_bytes: u64,
+    progress_deficit_bytes: u64,
+    final_score: f64,
+    sample_score_risk: f64,
+    effective_sample_score_risk: f64,
+    churn_reconnect_count: u32,
+    churn_amplifier: f64,
+    sample_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PeerResultRow {
+    record_type: &'static str,
+    torrent_hash: String,
+    torrent_name: Option<String>,
+    torrent_tracker: Option<String>,
+    peer_ip: String,
+    peer_behavior_key: String,
+    last_peer_port: u16,
+    first_observed_at: String,
+    last_observed_at: String,
+    simulated_decision: String,
+    simulated_ban_events: u32,
+    actual_ban_events: u32,
+    rate_reference_name: &'static str,
+    rate_reference_bps: u64,
+    rate_reference_target_bps: u64,
+    rate_reference_ratio: f64,
+    rate_reference_band: &'static str,
+    torrent_total_size_bytes: u64,
+    progress_delta: f64,
+    progress_delta_bytes: u64,
+    required_progress_delta: f64,
+    required_progress_bytes: u64,
+    progress_deficit_bytes: u64,
+    final_score: f64,
+    sample_score_risk: f64,
+    effective_sample_score_risk: f64,
+    churn_reconnect_count: u32,
+    churn_amplifier: f64,
+    sample_count: u32,
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
@@ -198,10 +263,6 @@ fn process_fields(
         return Ok(());
     }
 
-    if fields.message == "peer ban applied" {
-        summary.actual_bans += 1;
-    }
-
     let observed_at =
         parse_rfc3339(&fields.observed_at).with_context(|| "parsing observed_at timestamp")?;
     state
@@ -262,6 +323,7 @@ fn process_fields(
                 .clone()
                 .unwrap_or_else(|| fields.torrent_hash.clone()),
             tracker: fields.torrent_tracker.clone(),
+            total_size_bytes: fields.torrent_total_size_bytes.unwrap_or(0),
             category: None,
             tags: Vec::new(),
             total_seeders: config.policy.min_total_seeders.max(1),
@@ -300,6 +362,9 @@ fn process_fields(
             offence_count: 0,
             last_ban_expires_at: None,
         });
+    let insights = policy.evaluation_insights(&peer_context, &evaluation);
+    let report_key = OffenceKey::from_offence_identity(&evaluation.session.offence_identity);
+    let mut simulated_decision = "duplicate_suppressed";
 
     let mut session_to_store = evaluation.session.clone();
     if evaluation.session.churn_amplifier > 0.0 {
@@ -311,17 +376,18 @@ fn process_fields(
     summary.churn_max_reconnect_count = summary
         .churn_max_reconnect_count
         .max(evaluation.session.churn_reconnect_count);
-    match policy.decide_ban(&peer_context, &evaluation, &history) {
+    let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
+    match disposition {
         BanDisposition::Ban(decision) => {
+            simulated_decision = "ban";
             summary.simulated_bans += 1;
             if evaluation.session.churn_amplifier > 0.0 {
                 summary.simulated_bans_with_churn += 1;
             }
-            *state.ban_events.entry(session_key.clone()).or_default() += 1;
             let expires_at = observed_at + decision.ttl;
             state.active_bans.insert(
                 ActiveBanKey {
-                    torrent_hash: fields.torrent_hash,
+                    torrent_hash: fields.torrent_hash.clone(),
                     peer_ip,
                     peer_port: fields.peer_port,
                 },
@@ -336,13 +402,78 @@ fn process_fields(
             );
             session_to_store = policy.record_ban_decision(&session_to_store, observed_at);
         }
-        BanDisposition::Exempt(_)
-        | BanDisposition::NotBannableYet { .. }
-        | BanDisposition::RebanCooldown { .. }
-        | BanDisposition::DuplicateSuppressed => {}
+        BanDisposition::Exempt(_) => simulated_decision = "exempt",
+        BanDisposition::NotBannableYet { .. } => simulated_decision = "not_bannable",
+        BanDisposition::RebanCooldown { .. } => simulated_decision = "reban_cooldown",
+        BanDisposition::DuplicateSuppressed => simulated_decision = "duplicate_suppressed",
     }
 
     state.sessions.insert(session_key, session_to_store);
+    let report = state
+        .peer_reports
+        .entry(report_key)
+        .or_insert_with(|| PeerReport {
+            torrent_hash: fields.torrent_hash.clone(),
+            torrent_name: fields.torrent_name.clone(),
+            torrent_tracker: fields.torrent_tracker.clone(),
+            peer_ip,
+            last_peer_port: fields.peer_port,
+            first_observed_at: observed_at,
+            last_observed_at: observed_at,
+            simulated_decision,
+            simulated_ban_events: 0,
+            actual_ban_events: 0,
+            rate_reference_name: insights.rate_reference_name,
+            rate_reference_bps: insights.rate_reference_bps,
+            rate_reference_target_bps: insights.rate_reference_target_bps,
+            rate_reference_ratio: insights.rate_reference_ratio,
+            rate_reference_band: insights.rate_reference_band,
+            torrent_total_size_bytes: insights.torrent_total_size_bytes,
+            progress_delta: evaluation.progress_delta,
+            progress_delta_bytes: insights.progress_delta_bytes,
+            required_progress_delta: insights.required_progress_delta,
+            required_progress_bytes: insights.required_progress_bytes,
+            progress_deficit_bytes: insights.progress_deficit_bytes,
+            final_score: evaluation.session.ban_score,
+            sample_score_risk: evaluation.sample_score_risk,
+            effective_sample_score_risk: evaluation.effective_sample_score_risk,
+            churn_reconnect_count: evaluation.session.churn_reconnect_count,
+            churn_amplifier: evaluation.session.churn_amplifier,
+            sample_count: evaluation.session.sample_count,
+        });
+    report.torrent_name = fields.torrent_name.clone().or(report.torrent_name.clone());
+    report.torrent_tracker = fields
+        .torrent_tracker
+        .clone()
+        .or(report.torrent_tracker.clone());
+    report.last_peer_port = fields.peer_port;
+    report.first_observed_at = report.first_observed_at.min(observed_at);
+    report.last_observed_at = report.last_observed_at.max(observed_at);
+    report.simulated_decision = simulated_decision;
+    if simulated_decision == "ban" {
+        report.simulated_ban_events += 1;
+    }
+    if fields.message == "peer ban applied" {
+        summary.actual_bans += 1;
+        report.actual_ban_events += 1;
+    }
+    report.rate_reference_name = insights.rate_reference_name;
+    report.rate_reference_bps = insights.rate_reference_bps;
+    report.rate_reference_target_bps = insights.rate_reference_target_bps;
+    report.rate_reference_ratio = insights.rate_reference_ratio;
+    report.rate_reference_band = insights.rate_reference_band;
+    report.torrent_total_size_bytes = insights.torrent_total_size_bytes;
+    report.progress_delta = evaluation.progress_delta;
+    report.progress_delta_bytes = insights.progress_delta_bytes;
+    report.required_progress_delta = insights.required_progress_delta;
+    report.required_progress_bytes = insights.required_progress_bytes;
+    report.progress_deficit_bytes = insights.progress_deficit_bytes;
+    report.final_score = evaluation.session.ban_score;
+    report.sample_score_risk = evaluation.sample_score_risk;
+    report.effective_sample_score_risk = evaluation.effective_sample_score_risk;
+    report.churn_reconnect_count = evaluation.session.churn_reconnect_count;
+    report.churn_amplifier = evaluation.session.churn_amplifier;
+    report.sample_count = evaluation.session.sample_count;
     Ok(())
 }
 
@@ -407,6 +538,9 @@ fn extract_log_fields(
         .get("torrent_tracker")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let torrent_total_size_bytes = fields
+        .get("torrent_total_size_bytes")
+        .and_then(Value::as_u64);
     let observed_at = fields
         .get("observed_at")
         .and_then(Value::as_str)
@@ -431,6 +565,7 @@ fn extract_log_fields(
         torrent_hash,
         torrent_name,
         torrent_tracker,
+        torrent_total_size_bytes,
         observed_at,
         progress_delta,
         average_upload_rate_bps,
@@ -520,38 +655,57 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         summary.churn_max_amplifier,
         summary.churn_max_reconnect_count
     );
-
-    let mut interesting: Vec<(&SessionKey, &u32)> = state
-        .ban_events
-        .iter()
-        .filter(|(_, count)| **count > 0)
-        .collect();
-    interesting.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
-    for (observation_id, count) in interesting.into_iter().take(20) {
-        let final_score = state
-            .sessions
-            .get(observation_id)
-            .map(|session| session.ban_score)
-            .unwrap_or(0.0);
+    for row in build_peer_result_rows(state) {
         println!(
-            "simulated_ban peer={} port={} torrent_hash={} ban_events={} final_score={:.3} final_churn_amplifier={:.3} final_churn_reconnect_count={}",
-            observation_id.peer_ip,
-            observation_id.peer_port,
-            observation_id.torrent_hash,
-            count,
-            final_score,
-            state
-                .sessions
-                .get(observation_id)
-                .map(|session| session.churn_amplifier)
-                .unwrap_or(0.0),
-            state
-                .sessions
-                .get(observation_id)
-                .map(|session| session.churn_reconnect_count)
-                .unwrap_or(0),
+            "{}",
+            serde_json::to_string(&row).expect("peer result row should serialize")
         );
     }
+}
+
+fn build_peer_result_rows(state: &ReplayState) -> Vec<PeerResultRow> {
+    let mut rows = state
+        .peer_reports
+        .values()
+        .map(|report| PeerResultRow {
+            record_type: "peer_result",
+            torrent_hash: report.torrent_hash.clone(),
+            torrent_name: report.torrent_name.clone(),
+            torrent_tracker: report.torrent_tracker.clone(),
+            peer_ip: report.peer_ip.to_string(),
+            peer_behavior_key: format!("{}+{}", report.torrent_hash, report.peer_ip),
+            last_peer_port: report.last_peer_port,
+            first_observed_at: humantime::format_rfc3339_millis(report.first_observed_at)
+                .to_string(),
+            last_observed_at: humantime::format_rfc3339_millis(report.last_observed_at).to_string(),
+            simulated_decision: report.simulated_decision.to_string(),
+            simulated_ban_events: report.simulated_ban_events,
+            actual_ban_events: report.actual_ban_events,
+            rate_reference_name: report.rate_reference_name,
+            rate_reference_bps: report.rate_reference_bps,
+            rate_reference_target_bps: report.rate_reference_target_bps,
+            rate_reference_ratio: report.rate_reference_ratio,
+            rate_reference_band: report.rate_reference_band,
+            torrent_total_size_bytes: report.torrent_total_size_bytes,
+            progress_delta: report.progress_delta,
+            progress_delta_bytes: report.progress_delta_bytes,
+            required_progress_delta: report.required_progress_delta,
+            required_progress_bytes: report.required_progress_bytes,
+            progress_deficit_bytes: report.progress_deficit_bytes,
+            final_score: report.final_score,
+            sample_score_risk: report.sample_score_risk,
+            effective_sample_score_risk: report.effective_sample_score_risk,
+            churn_reconnect_count: report.churn_reconnect_count,
+            churn_amplifier: report.churn_amplifier,
+            sample_count: report.sample_count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.torrent_hash
+            .cmp(&right.torrent_hash)
+            .then(left.peer_ip.cmp(&right.peer_ip))
+    });
+    rows
 }
 
 fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
@@ -760,7 +914,7 @@ fn print_help() {
 mod tests {
     use std::{io::Cursor, path::PathBuf};
 
-    use super::{Summary, parse_args, parse_log_fields, process_reader};
+    use super::{Summary, build_peer_result_rows, parse_args, parse_log_fields, process_reader};
     use brrpolice::policy::PolicyEngine;
 
     #[test]
@@ -774,10 +928,11 @@ mod tests {
 
     #[test]
     fn parses_direct_structured_json_line() {
-        let line = r#"{"timestamp":"2026-03-12T10:00:00Z","level":"INFO","fields":{"message":"peer ban applied","peer_ip":"1.2.3.4","peer_port":51413,"torrent_hash":"abc","observed_at":"2026-03-12T10:00:00Z","progress_delta":0.0,"average_upload_rate_bps":0}}"#;
+        let line = r#"{"timestamp":"2026-03-12T10:00:00Z","level":"INFO","fields":{"message":"peer ban applied","peer_ip":"1.2.3.4","peer_port":51413,"torrent_hash":"abc","torrent_total_size_bytes":1048576,"observed_at":"2026-03-12T10:00:00Z","progress_delta":0.0,"average_upload_rate_bps":0}}"#;
         let parsed = parse_log_fields(line).expect("expected parsed fields");
         assert_eq!(parsed.message, "peer ban applied");
         assert_eq!(parsed.torrent_hash, "abc");
+        assert_eq!(parsed.torrent_total_size_bytes, Some(1_048_576));
     }
 
     #[test]
@@ -912,5 +1067,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.simulated_bans, 1);
+    }
+
+    #[test]
+    fn peer_result_rows_include_rate_band_and_byte_metrics() {
+        let config = parse_args(vec![
+            "--input".into(),
+            "dummy".into(),
+            "--target-rate-bps".into(),
+            "1000".into(),
+        ])
+        .unwrap();
+        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+
+        let replay = Cursor::new(concat!(
+            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"torrent_name\":\"Example\",\"torrent_total_size_bytes\":1000000,\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.01,\"average_upload_rate_bps\":2000,\"observed_duration_seconds\":300}}\n",
+            "{\"timestamp\":\"2026-03-12T10:02:00Z\",\"fields\":{\"message\":\"peer ban applied\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"torrent_name\":\"Example\",\"torrent_total_size_bytes\":1000000,\"observed_at\":\"2026-03-12T10:02:00Z\",\"progress_delta\":0.01,\"average_upload_rate_bps\":2000,\"observed_duration_seconds\":420}}\n"
+        ));
+
+        process_reader(
+            &policy,
+            &config,
+            replay,
+            "replay".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        let rows = build_peer_result_rows(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rate_reference_band, "clearly_healthy");
+        assert_eq!(rows[0].torrent_total_size_bytes, 1_000_000);
+        assert_eq!(rows[0].progress_delta_bytes, 10_000);
+        assert_eq!(rows[0].actual_ban_events, 1);
+        assert_eq!(rows[0].peer_behavior_key, "abc+1.2.3.4");
     }
 }

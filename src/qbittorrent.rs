@@ -349,13 +349,17 @@ impl QbittorrentClient {
         torrents
             .into_iter()
             .filter(|torrent| torrent.amount_left == 0)
-            .map(|torrent| TorrentSummary {
-                hash: torrent.hash,
-                name: torrent.name,
-                tracker: empty_string_to_none(torrent.tracker),
-                total_seeders: torrent.num_complete.max(0) as u32,
-                category: empty_string_to_none(torrent.category),
-                tags: split_tags(&torrent.tags),
+            .map(|torrent| {
+                let total_size_bytes = torrent.total_size_bytes();
+                TorrentSummary {
+                    hash: torrent.hash,
+                    name: torrent.name,
+                    tracker: empty_string_to_none(torrent.tracker),
+                    total_size_bytes,
+                    total_seeders: torrent.num_complete.max(0) as u32,
+                    category: empty_string_to_none(torrent.category),
+                    tags: split_tags(&torrent.tags),
+                }
             })
             .collect()
     }
@@ -622,11 +626,21 @@ struct QbTorrent {
     name: String,
     #[serde(default)]
     tracker: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    total_size: u64,
     category: String,
     tags: String,
     num_complete: i64,
     #[serde(default)]
     amount_left: i64,
+}
+
+impl QbTorrent {
+    fn total_size_bytes(&self) -> u64 {
+        self.total_size.max(self.size)
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -836,6 +850,7 @@ mod tests {
                         "hash":"abc123",
                         "name":"Example Torrent",
                         "tracker":"https://tracker.example/announce",
+                        "size":1048576,
                         "category":"tv",
                         "tags":"seed,public",
                         "num_complete":17,
@@ -845,6 +860,7 @@ mod tests {
                         "hash":"def456",
                         "name":"No Category",
                         "tracker":"",
+                        "size":4096,
                         "category":"",
                         "tags":"",
                         "num_complete":0,
@@ -858,6 +874,7 @@ mod tests {
         assert_eq!(torrents[0].hash, "abc123");
         assert_eq!(torrents[0].name, "Example Torrent");
         assert_eq!(torrents[0].tracker, "https://tracker.example/announce");
+        assert_eq!(torrents[0].size, 1_048_576);
         assert_eq!(torrents[0].category, "tv");
         assert_eq!(torrents[0].tags, "seed,public");
         assert_eq!(torrents[0].num_complete, 17);
@@ -879,9 +896,11 @@ mod tests {
 
         assert_eq!(torrents.len(), 2);
         assert_eq!(torrents[0].hash, "abc123");
+        assert_eq!(torrents[0].total_size_bytes(), 734_003_200);
         assert_eq!(torrents[0].num_complete, 21);
         assert_eq!(torrents[0].amount_left, 0);
         assert_eq!(torrents[1].hash, "def456");
+        assert_eq!(torrents[1].total_size_bytes(), 12_582_912);
         assert_eq!(torrents[1].amount_left, 4096);
     }
 
@@ -893,6 +912,8 @@ mod tests {
                 hash: "a".to_string(),
                 name: "Complete".to_string(),
                 tracker: "https://tracker.example/announce".to_string(),
+                size: 1_000_000,
+                total_size: 0,
                 category: "tv".to_string(),
                 tags: "seed,public".to_string(),
                 num_complete: 7,
@@ -902,6 +923,8 @@ mod tests {
                 hash: "b".to_string(),
                 name: "Incomplete".to_string(),
                 tracker: String::new(),
+                size: 2_000_000,
+                total_size: 0,
                 category: "tv".to_string(),
                 tags: "seed".to_string(),
                 num_complete: 9,
@@ -1279,6 +1302,7 @@ mod tests {
             hash: hash.to_string(),
             name: format!("torrent-{hash}"),
             tracker: None,
+            total_size_bytes: 1_000_000,
             total_seeders,
             category: category.map(str::to_string),
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
