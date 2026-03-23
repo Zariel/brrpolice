@@ -147,6 +147,10 @@ No production implementation should land until replay and simulator results show
 
 ## Follow-up Work
 
+Reference evaluation spec:
+
+- [`adr-0006-evaluation-spec.md`](./adr-0006-evaluation-spec.md)
+
 1. Define the replay corpus and pass/fail criteria for clearly bad, marginal, and clearly healthy
    rate bands.
 2. Enrich replay inputs, simulator output, and logs so they expose torrent-size-derived movement,
