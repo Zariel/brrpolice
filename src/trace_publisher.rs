@@ -250,6 +250,7 @@ fn prune_closed_clients(clients: &mut Vec<TraceClient>) {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr},
+        sync::Arc,
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -362,6 +363,104 @@ mod tests {
         drop(subscription);
 
         assert!(publisher.subscribe().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_publish_subscribe_drop_stays_nonblocking() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 4, 1));
+        let mut subscriptions = (0..4)
+            .map(|_| publisher.subscribe().unwrap())
+            .collect::<Vec<_>>();
+        let record = sample_record();
+
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            PublishOutcome::Published {
+                delivered: 4,
+                dropped: 0
+            }
+        );
+
+        let slow_a = subscriptions.remove(0);
+        let slow_b = subscriptions.remove(0);
+        drop(subscriptions);
+
+        let subscriber_publisher = Arc::clone(&publisher);
+        let subscriber_churn = tokio::spawn(async move {
+            for _ in 0..50 {
+                if let Ok(subscription) = subscriber_publisher.subscribe() {
+                    drop(subscription);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let publish_tasks = (0..4)
+            .map(|_| {
+                let publisher = Arc::clone(&publisher);
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut delivered = 0;
+                    let mut dropped = 0;
+                    let mut skipped = 0;
+
+                    for _ in 0..50 {
+                        match publisher.publish(&record).unwrap() {
+                            PublishOutcome::Published {
+                                delivered: delivered_count,
+                                dropped: dropped_count,
+                            } => {
+                                delivered += delivered_count;
+                                dropped += dropped_count;
+                            }
+                            PublishOutcome::SkippedNoClients => skipped += 1,
+                            PublishOutcome::SkippedDisabled => {
+                                panic!("publisher should stay enabled")
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+
+                    (delivered, dropped, skipped)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (delivered, dropped, skipped) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut delivered = 0;
+            let mut dropped = 0;
+            let mut skipped = 0;
+
+            for task in publish_tasks {
+                let (task_delivered, task_dropped, task_skipped) = task.await.unwrap();
+                delivered += task_delivered;
+                dropped += task_dropped;
+                skipped += task_skipped;
+            }
+
+            subscriber_churn.await.unwrap();
+            (delivered, dropped, skipped)
+        })
+        .await
+        .expect("concurrent trace publishes should not block on slow clients");
+
+        assert_eq!(skipped, 0);
+        assert!(delivered <= 50);
+        assert!(dropped >= 400);
+        assert_eq!(publisher.total_dropped(), dropped);
+        assert_eq!(
+            publisher.take_dropped_for_client(slow_a.client_id),
+            Some(200)
+        );
+        assert_eq!(
+            publisher.take_dropped_for_client(slow_b.client_id),
+            Some(200)
+        );
+        assert_eq!(publisher.active_client_count(), 2);
+
+        drop(slow_a);
+        drop(slow_b);
+        assert_eq!(publisher.active_client_count(), 0);
     }
 
     fn sample_record() -> PolicyTraceRecord {
