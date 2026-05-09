@@ -4,12 +4,14 @@ use anyhow::{Context, Result};
 use brrpolice::{
     config::{AppConfig, QbittorrentConfig},
     control::ControlLoop,
+    debug_trace::DebugTraceServer,
     http::HttpServer,
     metrics::AppMetrics,
     persistence::Persistence,
     policy::PolicyEngine,
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
+    trace_publisher::{DEFAULT_TRACE_CLIENT_BUFFER, PolicyTracePublisher},
 };
 use secrecy::SecretString;
 use tokio::{signal, sync::watch};
@@ -70,6 +72,11 @@ async fn main() -> Result<()> {
     )?);
 
     let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+    let trace_publisher = Arc::new(PolicyTracePublisher::new(
+        config.debug.policy_trace.enabled,
+        config.debug.policy_trace.max_clients as usize,
+        DEFAULT_TRACE_CLIENT_BUFFER,
+    ));
     let http_server = HttpServer::new(
         config.clone(),
         persistence.clone(),
@@ -78,6 +85,8 @@ async fn main() -> Result<()> {
         metrics.clone(),
         shutdown_rx.clone(),
     );
+    let debug_trace_server =
+        DebugTraceServer::new(config.clone(), trace_publisher.clone(), shutdown_rx.clone());
     let control_loop = ControlLoop::new(
         config,
         persistence,
@@ -86,9 +95,11 @@ async fn main() -> Result<()> {
         state.clone(),
         metrics,
         shutdown_rx,
-    );
+    )
+    .with_trace_publisher(trace_publisher);
 
     let http_handle = tokio::spawn(async move { http_server.run().await });
+    let debug_trace_handle = tokio::spawn(async move { debug_trace_server.run().await });
     let control_handle = tokio::spawn(async move { control_loop.run().await });
 
     info!("startup complete; readiness will follow control-loop initialization");
@@ -97,6 +108,7 @@ async fn main() -> Result<()> {
         state,
         shutdown_tx,
         http_handle,
+        debug_trace_handle,
         control_handle,
         shutdown_signal(),
     )
@@ -224,6 +236,7 @@ async fn run_until_shutdown<F>(
     state: Arc<ServiceState>,
     shutdown_tx: watch::Sender<bool>,
     mut http_handle: tokio::task::JoinHandle<Result<()>>,
+    mut debug_trace_handle: tokio::task::JoinHandle<Result<()>>,
     mut control_handle: tokio::task::JoinHandle<Result<()>>,
     shutdown_signal: F,
 ) -> Result<()>
@@ -238,6 +251,36 @@ where
             let mut primary_error = None;
             if let Err(error) = primary {
                 primary_error = Some(error);
+            }
+            if let Err(error) = control_handle.await? {
+                error!(?error, "control loop shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
+            }
+            if let Err(error) = debug_trace_handle.await? {
+                error!(?error, "debug trace server shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
+            }
+            if let Some(error) = primary_error {
+                return Err(error);
+            }
+        }
+        result = &mut debug_trace_handle => {
+            state.begin_shutdown();
+            let _ = shutdown_tx.send(true);
+            let primary = result?;
+            let mut primary_error = None;
+            if let Err(error) = primary {
+                primary_error = Some(error);
+            }
+            if let Err(error) = http_handle.await? {
+                error!(?error, "http server shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
             }
             if let Err(error) = control_handle.await? {
                 error!(?error, "control loop shutdown failed");
@@ -263,6 +306,12 @@ where
                     return Err(error);
                 }
             }
+            if let Err(error) = debug_trace_handle.await? {
+                error!(?error, "debug trace server shutdown failed");
+                if primary_error.is_none() {
+                    return Err(error);
+                }
+            }
             if let Some(error) = primary_error {
                 return Err(error);
             }
@@ -273,6 +322,10 @@ where
             let _ = shutdown_tx.send(true);
             if let Err(error) = http_handle.await? {
                 error!(?error, "http server shutdown failed");
+                return Err(error);
+            }
+            if let Err(error) = debug_trace_handle.await? {
+                error!(?error, "debug trace server shutdown failed");
                 return Err(error);
             }
             if let Err(error) = control_handle.await? {
@@ -311,11 +364,13 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
         let http_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let debug_trace_handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
         let result = run_until_shutdown(
             state,
             shutdown_tx,
             http_handle,
+            debug_trace_handle,
             control_handle,
             std::future::pending(),
         )

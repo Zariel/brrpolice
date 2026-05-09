@@ -1,6 +1,7 @@
 pub mod backoff;
 pub mod config;
 pub mod control;
+pub mod debug_trace;
 pub mod http;
 pub mod metrics;
 pub mod persistence;
