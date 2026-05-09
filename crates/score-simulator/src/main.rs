@@ -9,15 +9,18 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use humantime::parse_rfc3339;
-use serde::Deserialize;
 use serde_json::Value;
 
 use brrpolice::{
     config::{FiltersConfig, PolicyConfig},
     policy::PolicyEngine,
+    policy_trace::{
+        POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceExemptionReason,
+        TracePeerBehaviourIdentity, TracePeerObservationIdentity, TracePeerSessionState,
+    },
     types::{
-        BanDisposition, OffenceHistory, OffenceIdentity, PeerContext, PeerObservationId,
-        PeerSessionState, PeerSnapshot, TorrentScope,
+        BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
+        PeerObservationId, PeerSessionState, PeerSnapshot, TorrentScope,
     },
 };
 
@@ -77,24 +80,6 @@ impl Default for SimulatorConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct LogFields {
-    message: String,
-    peer_ip: String,
-    peer_port: u16,
-    torrent_hash: String,
-    torrent_name: Option<String>,
-    torrent_tracker: Option<String>,
-    observed_at: String,
-    progress_delta: f64,
-    average_upload_rate_bps: u64,
-    observed_duration_seconds: Option<u64>,
-    bad_time_seconds: Option<u64>,
-    ban_score: Option<f64>,
-    ban_score_above_threshold_seconds: Option<u64>,
-    sample_score_risk: Option<f64>,
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct ActiveBanKey {
     torrent_hash: String,
@@ -113,6 +98,7 @@ struct Summary {
     churn_samples: u64,
     churn_max_amplifier: f64,
     churn_max_reconnect_count: u32,
+    dropped_trace_records: u64,
 }
 
 #[derive(Default)]
@@ -163,145 +149,142 @@ fn process_reader<R: BufRead>(
         }
         summary.lines_total += 1;
 
-        let Some(fields) = parse_log_fields(&line) else {
-            continue;
-        };
-        process_fields(policy, config, fields, state, summary)?;
+        match parse_trace_line(&line)
+            .with_context(|| format!("parsing line {} from `{source_name}`", index + 1))?
+        {
+            TraceInputLine::PeerObservation(record) => {
+                process_trace_record(policy, config, *record, state, summary)?;
+            }
+            TraceInputLine::DroppedRecords { dropped_count } => {
+                summary.dropped_trace_records =
+                    summary.dropped_trace_records.saturating_add(dropped_count);
+            }
+        }
     }
 
     Ok(())
 }
 
-fn process_fields(
+enum TraceInputLine {
+    PeerObservation(Box<PolicyTraceRecord>),
+    DroppedRecords { dropped_count: u64 },
+}
+
+fn parse_trace_line(line: &str) -> Result<TraceInputLine> {
+    let value: Value = serde_json::from_str(line).context("invalid JSON trace line")?;
+    let record_type = value
+        .get("record_type")
+        .and_then(Value::as_str)
+        .context("expected ADR-0004 policy trace line with top-level record_type")?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .context("expected ADR-0004 policy trace line with top-level schema_version")?;
+    if schema_version != u64::from(POLICY_TRACE_SCHEMA_VERSION) {
+        bail!("unsupported policy trace schema_version `{schema_version}`");
+    }
+
+    match record_type {
+        "peer_observation" => Ok(TraceInputLine::PeerObservation(Box::new(
+            serde_json::from_value(value).context("invalid peer_observation trace record")?,
+        ))),
+        "dropped_records" => {
+            let dropped_count = value
+                .get("dropped_count")
+                .and_then(Value::as_u64)
+                .context("dropped_records trace line missing dropped_count")?;
+            Ok(TraceInputLine::DroppedRecords { dropped_count })
+        }
+        other => bail!("unsupported policy trace record_type `{other}`"),
+    }
+}
+
+fn process_trace_record(
     policy: &PolicyEngine,
     config: &SimulatorConfig,
-    fields: LogFields,
+    record: PolicyTraceRecord,
     state: &mut ReplayState,
     summary: &mut Summary,
 ) -> Result<()> {
-    if fields.message != "peer policy update"
-        && fields.message != "peer not bannable yet decision"
-        && fields.message != "peer exemption decision"
-        && fields.message != "peer ban applied"
-    {
-        return Ok(());
-    }
     summary.lines_decision += 1;
-
-    let peer_ip: IpAddr = match fields.peer_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => return Ok(()),
-    };
+    validate_required_trace_fields(&record)?;
+    let observed_at =
+        parse_rfc3339(&record.observed_at).context("parsing trace observed_at timestamp")?;
+    let peer_ip = record
+        .peer
+        .ip
+        .context("trace peer.ip is required for simulator replay")?;
     if let Some(filter_ip) = config.peer_ip
         && peer_ip != filter_ip
     {
         return Ok(());
     }
-
-    if fields.message == "peer ban applied" {
-        summary.actual_bans += 1;
-    }
-
-    let observed_at =
-        parse_rfc3339(&fields.observed_at).with_context(|| "parsing observed_at timestamp")?;
     state
         .active_bans
         .retain(|_, expires_at| *expires_at > observed_at);
 
-    let observation_id = PeerObservationId {
-        torrent_hash: fields.torrent_hash.clone(),
-        peer_ip,
-        peer_port: fields.peer_port,
-    };
+    let observation_id =
+        observation_id_from_trace(&record.simulator_hints.peer_observation_identity)?;
     let session_key = SessionKey::from_observation_id(&observation_id);
-    let existing = state.sessions.get(&session_key).cloned();
-    let carryover = if existing.is_none() {
-        latest_session_for_torrent_ip(
-            &state.sessions,
-            &fields.torrent_hash,
-            peer_ip,
-            observed_at,
-            config.policy.decay_window,
-        )
-    } else {
-        None
-    };
-    if existing.is_none() && carryover.is_none() {
+    let existing = record
+        .prior_session
+        .as_ref()
+        .map(session_from_trace)
+        .transpose()?;
+    if !state.sessions.contains_key(&session_key) && existing.is_none() {
         summary.peers_seen += 1;
     }
 
-    let baseline_progress = existing
-        .as_ref()
-        .or(carryover.as_ref())
-        .map(|session| session.baseline_progress)
-        .unwrap_or(0.0);
-    let progress = (baseline_progress + fields.progress_delta).clamp(0.0, 1.0);
-
-    let first_seen_at = fields
-        .observed_duration_seconds
-        .and_then(|seconds| observed_at.checked_sub(Duration::from_secs(seconds)))
-        .or_else(|| {
-            existing
-                .as_ref()
-                .or(carryover.as_ref())
-                .map(|session| session.first_seen_at)
-        })
-        .unwrap_or(observed_at);
-
     let has_active_ban = state.active_bans.contains_key(&ActiveBanKey {
-        torrent_hash: fields.torrent_hash.clone(),
+        torrent_hash: record.torrent.hash.clone(),
         peer_ip,
-        peer_port: fields.peer_port,
+        peer_port: record.peer.port,
     });
 
     let peer_context = PeerContext {
         torrent: TorrentScope {
-            hash: fields.torrent_hash.clone(),
-            name: fields
-                .torrent_name
+            hash: record.torrent.hash.clone(),
+            name: record
+                .torrent
+                .name
                 .clone()
-                .unwrap_or_else(|| fields.torrent_hash.clone()),
-            tracker: fields.torrent_tracker.clone(),
-            category: None,
-            tags: Vec::new(),
-            total_seeders: config.policy.min_total_seeders.max(1),
-            in_scope: true,
+                .unwrap_or_else(|| record.torrent.hash.clone()),
+            tracker: record.torrent.tracker.clone(),
+            category: record.torrent.category.clone(),
+            tags: record.torrent.tags.clone(),
+            total_seeders: record.torrent.total_seeders,
+            in_scope: record.torrent.in_scope,
         },
         peer: PeerSnapshot {
             ip: peer_ip,
-            port: fields.peer_port,
-            progress,
-            up_rate_bps: fields.average_upload_rate_bps,
+            port: record.peer.port,
+            progress: record.peer.progress,
+            up_rate_bps: record.peer.up_rate_bps,
         },
-        first_seen_at,
+        first_seen_at: record
+            .prior_session
+            .as_ref()
+            .map(|session| parse_rfc3339(&session.first_seen_at))
+            .transpose()
+            .context("parsing trace prior_session.first_seen_at")?
+            .unwrap_or(observed_at),
         observed_at,
         has_active_ban,
     };
 
-    let mut evaluation =
-        policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
-    if config.hydrate_logged_score_state {
-        hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
-    } else if let Some(seconds) = fields.observed_duration_seconds {
-        evaluation.session.observed_duration = Duration::from_secs(seconds);
-        let exemption_free = evaluation.session.last_exemption_reason.is_none();
-        evaluation.is_bannable = exemption_free
-            && evaluation.session.observed_duration >= config.policy.score.min_observation_duration
-            && evaluation.session.ban_score_above_threshold_duration
-                >= config.policy.score.sustain_duration;
-    }
-    let history = state
-        .offences
-        .get(&OffenceKey::from_offence_identity(
-            &evaluation.session.offence_identity,
-        ))
-        .cloned()
-        .unwrap_or(OffenceHistory {
-            offence_count: 0,
-            last_ban_expires_at: None,
-        });
+    let evaluation = policy.evaluate_peer(&peer_context, existing.as_ref());
+    let history = OffenceHistory {
+        offence_count: record.guardrail_inputs.offence_history.offence_count,
+        last_ban_expires_at: record
+            .guardrail_inputs
+            .offence_history
+            .last_ban_expires_at
+            .as_ref()
+            .map(|value| parse_rfc3339(value))
+            .transpose()
+            .context("parsing trace offence_history.last_ban_expires_at")?,
+    };
 
-    let mut session_to_store = evaluation.session.clone();
     if evaluation.session.churn_amplifier > 0.0 {
         summary.churn_samples += 1;
         summary.churn_max_amplifier = summary
@@ -321,9 +304,9 @@ fn process_fields(
             let expires_at = observed_at + decision.ttl;
             state.active_bans.insert(
                 ActiveBanKey {
-                    torrent_hash: fields.torrent_hash,
+                    torrent_hash: record.torrent.hash.clone(),
                     peer_ip,
-                    peer_port: fields.peer_port,
+                    peer_port: record.peer.port,
                 },
                 expires_at,
             );
@@ -334,7 +317,6 @@ fn process_fields(
                     last_ban_expires_at: Some(expires_at),
                 },
             );
-            session_to_store = policy.record_ban_decision(&session_to_store, observed_at);
         }
         BanDisposition::Exempt(_)
         | BanDisposition::NotBannableYet { .. }
@@ -342,134 +324,159 @@ fn process_fields(
         | BanDisposition::DuplicateSuppressed => {}
     }
 
-    state.sessions.insert(session_key, session_to_store);
+    if let TraceBanDisposition::Ban { decision } = &record.decision_output.disposition {
+        summary.actual_bans += 1;
+        record_recorded_ban(state, decision, &record.torrent.hash, observed_at)?;
+    }
+    state
+        .sessions
+        .insert(session_key, session_from_trace(&record.evaluated_session)?);
     Ok(())
 }
 
-fn latest_session_for_torrent_ip(
-    sessions: &HashMap<SessionKey, PeerSessionState>,
-    torrent_hash: &str,
-    peer_ip: IpAddr,
-    observed_at: SystemTime,
-    decay_window: Duration,
-) -> Option<PeerSessionState> {
-    sessions
-        .values()
-        .filter(|session| {
-            session.observation_id.torrent_hash == torrent_hash
-                && session.observation_id.peer_ip == peer_ip
-                && observed_at >= session.last_seen_at
-                && observed_at
-                    .duration_since(session.last_seen_at)
-                    .unwrap_or_default()
-                    <= decay_window
-        })
-        .max_by_key(|session| session.last_seen_at)
-        .cloned()
-}
-
-fn parse_log_fields(line: &str) -> Option<LogFields> {
-    let root: Value = serde_json::from_str(line).ok()?;
-
-    if let Some(inner_message) = root.get("_msg").and_then(Value::as_str) {
-        let inner: Value = serde_json::from_str(inner_message).ok()?;
-        return extract_log_fields(
-            inner.get("fields").and_then(Value::as_object),
-            inner
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+fn validate_required_trace_fields(record: &PolicyTraceRecord) -> Result<()> {
+    if record.record_type != brrpolice::policy_trace::PolicyTraceRecordType::PeerObservation {
+        bail!("unsupported policy trace record type");
+    }
+    if record.schema_version != POLICY_TRACE_SCHEMA_VERSION {
+        bail!(
+            "unsupported policy trace schema_version `{}`",
+            record.schema_version
         );
     }
-
-    extract_log_fields(
-        root.get("fields").and_then(Value::as_object),
-        root.get("timestamp")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    )
+    let _ = observation_id_from_trace(&record.simulator_hints.peer_observation_identity)?;
+    let _ = offence_identity_from_trace(&record.simulator_hints.peer_behaviour_identity)?;
+    let _ = session_from_trace(&record.evaluated_session)?;
+    if record.service_version.trim().is_empty() {
+        bail!("trace record missing service_version");
+    }
+    if record.policy_trace_id.trim().is_empty() {
+        bail!("trace record missing policy_trace_id");
+    }
+    if record.config_fingerprint.trim().is_empty() {
+        bail!("trace record missing config_fingerprint");
+    }
+    Ok(())
 }
 
-fn extract_log_fields(
-    fields: Option<&serde_json::Map<String, Value>>,
-    fallback_timestamp: Option<String>,
-) -> Option<LogFields> {
-    let fields = fields?;
-    let message = fields.get("message")?.as_str()?.to_string();
-    let peer_ip = fields.get("peer_ip")?.as_str()?.to_string();
-    let peer_port = u16::try_from(fields.get("peer_port")?.as_u64()?).ok()?;
-    let torrent_hash = fields.get("torrent_hash")?.as_str()?.to_string();
-    let torrent_name = fields
-        .get("torrent_name")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let torrent_tracker = fields
-        .get("torrent_tracker")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let observed_at = fields
-        .get("observed_at")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or(fallback_timestamp)?;
-    let progress_delta = fields.get("progress_delta")?.as_f64()?;
-    let average_upload_rate_bps = fields.get("average_upload_rate_bps")?.as_u64()?;
-    let observed_duration_seconds = fields
-        .get("observed_duration_seconds")
-        .and_then(Value::as_u64);
-    let bad_time_seconds = fields.get("bad_time_seconds").and_then(Value::as_u64);
-    let ban_score = fields.get("ban_score").and_then(Value::as_f64);
-    let ban_score_above_threshold_seconds = fields
-        .get("ban_score_above_threshold_seconds")
-        .and_then(Value::as_u64);
-    let sample_score_risk = fields.get("sample_score_risk").and_then(Value::as_f64);
+fn record_recorded_ban(
+    state: &mut ReplayState,
+    decision: &brrpolice::policy_trace::TraceBanDecision,
+    torrent_hash: &str,
+    observed_at: SystemTime,
+) -> Result<()> {
+    let peer_ip = decision
+        .peer_ip
+        .context("recorded ban decision peer_ip is required for simulator replay")?;
+    let ttl = Duration::from_millis(decision.ttl_ms);
+    let expires_at = observed_at + ttl;
+    state.active_bans.insert(
+        ActiveBanKey {
+            torrent_hash: torrent_hash.to_string(),
+            peer_ip,
+            peer_port: decision.peer_port,
+        },
+        expires_at,
+    );
+    state.offences.insert(
+        OffenceKey {
+            torrent_hash: torrent_hash.to_string(),
+            peer_ip,
+        },
+        OffenceHistory {
+            offence_count: decision.offence_number,
+            last_ban_expires_at: Some(expires_at),
+        },
+    );
+    Ok(())
+}
 
-    Some(LogFields {
-        message,
-        peer_ip,
-        peer_port,
-        torrent_hash,
-        torrent_name,
-        torrent_tracker,
-        observed_at,
-        progress_delta,
-        average_upload_rate_bps,
-        observed_duration_seconds,
-        bad_time_seconds,
-        ban_score,
-        ban_score_above_threshold_seconds,
-        sample_score_risk,
+fn session_from_trace(value: &TracePeerSessionState) -> Result<PeerSessionState> {
+    Ok(PeerSessionState {
+        observation_id: observation_id_from_trace(&value.observation_id)?,
+        offence_identity: offence_identity_from_trace(&value.offence_identity)?,
+        first_seen_at: parse_rfc3339(&value.first_seen_at)
+            .context("parsing trace session first_seen_at")?,
+        last_seen_at: parse_rfc3339(&value.last_seen_at)
+            .context("parsing trace session last_seen_at")?,
+        baseline_progress: value.baseline_progress,
+        latest_progress: value.latest_progress,
+        rolling_avg_up_rate_bps: value.rolling_avg_up_rate_bps,
+        observed_duration: Duration::from_millis(value.observed_duration_ms),
+        bad_duration: Duration::from_millis(value.bad_duration_ms),
+        ban_score: value.ban_score,
+        ban_score_above_threshold_duration: Duration::from_millis(
+            value.ban_score_above_threshold_duration_ms,
+        ),
+        churn_reconnect_count: value.churn_reconnect_count,
+        churn_window_started_at: value
+            .churn_window_started_at
+            .as_ref()
+            .map(|timestamp| parse_rfc3339(timestamp))
+            .transpose()
+            .context("parsing trace session churn_window_started_at")?,
+        churn_amplifier: value.churn_amplifier,
+        sample_count: value.sample_count,
+        last_torrent_seeder_count: value.last_torrent_seeder_count,
+        last_exemption_reason: value
+            .last_exemption_reason
+            .as_ref()
+            .map(exemption_from_trace)
+            .transpose()?,
+        bannable_since: value
+            .bannable_since
+            .as_ref()
+            .map(|timestamp| parse_rfc3339(timestamp))
+            .transpose()
+            .context("parsing trace session bannable_since")?,
+        last_ban_decision_at: value
+            .last_ban_decision_at
+            .as_ref()
+            .map(|timestamp| parse_rfc3339(timestamp))
+            .transpose()
+            .context("parsing trace session last_ban_decision_at")?,
     })
 }
 
-fn hydrate_evaluation_from_log_fields(
-    evaluation: &mut brrpolice::types::PeerEvaluation,
-    fields: &LogFields,
-    config: &SimulatorConfig,
-) {
-    evaluation.progress_delta = fields.progress_delta;
-    evaluation.session.rolling_avg_up_rate_bps = fields.average_upload_rate_bps;
-    if let Some(seconds) = fields.observed_duration_seconds {
-        evaluation.session.observed_duration = Duration::from_secs(seconds);
-    }
-    if let Some(seconds) = fields.bad_time_seconds {
-        evaluation.session.bad_duration = Duration::from_secs(seconds);
-    }
-    if let Some(score) = fields.ban_score {
-        evaluation.session.ban_score = score;
-    }
-    if let Some(seconds) = fields.ban_score_above_threshold_seconds {
-        evaluation.session.ban_score_above_threshold_duration = Duration::from_secs(seconds);
-    }
-    if let Some(risk) = fields.sample_score_risk {
-        evaluation.sample_score_risk = risk;
-    }
+fn observation_id_from_trace(value: &TracePeerObservationIdentity) -> Result<PeerObservationId> {
+    Ok(PeerObservationId {
+        torrent_hash: value.torrent_hash.clone(),
+        peer_ip: value
+            .peer_ip
+            .context("trace peer observation identity peer_ip is required for simulator replay")?,
+        peer_port: value.peer_port,
+    })
+}
 
-    let exemption_free = evaluation.session.last_exemption_reason.is_none();
-    evaluation.is_bannable = exemption_free
-        && evaluation.session.observed_duration >= config.policy.score.min_observation_duration
-        && evaluation.session.ban_score_above_threshold_duration
-            >= config.policy.score.sustain_duration;
+fn offence_identity_from_trace(value: &TracePeerBehaviourIdentity) -> Result<OffenceIdentity> {
+    Ok(OffenceIdentity {
+        torrent_hash: value.torrent_hash.clone(),
+        peer_ip: value
+            .peer_ip
+            .context("trace peer behaviour identity peer_ip is required for simulator replay")?,
+    })
+}
+
+fn exemption_from_trace(value: &TraceExemptionReason) -> Result<ExemptionReason> {
+    Ok(match value {
+        TraceExemptionReason::TorrentExcluded => ExemptionReason::TorrentExcluded,
+        TraceExemptionReason::AllowlistedPeer => ExemptionReason::AllowlistedPeer,
+        TraceExemptionReason::NearComplete {
+            progress,
+            threshold,
+        } => ExemptionReason::NearComplete {
+            progress: *progress,
+            threshold: *threshold,
+        },
+        TraceExemptionReason::NewPeerGracePeriod {
+            age_ms,
+            grace_period_ms,
+        } => ExemptionReason::NewPeerGracePeriod {
+            age: Duration::from_millis(*age_ms),
+            grace_period: Duration::from_millis(*grace_period_ms),
+        },
+        TraceExemptionReason::AlreadyBanned => ExemptionReason::AlreadyBanned,
+    })
 }
 
 fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayState) {
@@ -509,9 +516,10 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         println!("peer_filter_ip={peer_ip}");
     }
     println!(
-        "lines_total={} decision_lines={} peers_seen={} simulated_bans={} actual_bans={} simulated_bans_with_churn={} churn_samples={} churn_max_amplifier={:.4} churn_max_reconnect_count={}",
+        "lines_total={} decision_lines={} dropped_trace_records={} peers_seen={} simulated_bans={} actual_bans={} simulated_bans_with_churn={} churn_samples={} churn_max_amplifier={:.4} churn_max_reconnect_count={}",
         summary.lines_total,
         summary.lines_decision,
+        summary.dropped_trace_records,
         summary.peers_seen,
         summary.simulated_bans,
         summary.actual_bans,
@@ -760,25 +768,8 @@ fn print_help() {
 mod tests {
     use std::{io::Cursor, path::PathBuf};
 
-    use super::{Summary, parse_args, parse_log_fields, process_reader};
+    use super::{Summary, parse_args, process_reader};
     use brrpolice::policy::PolicyEngine;
-
-    #[test]
-    fn parses_vmui_wrapped_json_line() {
-        let line = r#"{"_msg":"{\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":42}}"}"#;
-        let parsed = parse_log_fields(line).expect("expected parsed fields");
-        assert_eq!(parsed.peer_ip, "1.2.3.4");
-        assert_eq!(parsed.peer_port, 51413);
-        assert_eq!(parsed.observed_duration_seconds, Some(42));
-    }
-
-    #[test]
-    fn parses_direct_structured_json_line() {
-        let line = r#"{"timestamp":"2026-03-12T10:00:00Z","level":"INFO","fields":{"message":"peer ban applied","peer_ip":"1.2.3.4","peer_port":51413,"torrent_hash":"abc","observed_at":"2026-03-12T10:00:00Z","progress_delta":0.0,"average_upload_rate_bps":0}}"#;
-        let parsed = parse_log_fields(line).expect("expected parsed fields");
-        assert_eq!(parsed.message, "peer ban applied");
-        assert_eq!(parsed.torrent_hash, "abc");
-    }
 
     #[test]
     fn parse_args_supports_multiple_inputs() {
@@ -830,76 +821,74 @@ mod tests {
     }
 
     #[test]
-    fn replay_harness_aggregates_across_multiple_readers() {
+    fn trace_reader_consumes_schema_v1_fixtures() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
         let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
 
-        let first = Cursor::new(
-            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":300}}\n",
-        );
-        let second = Cursor::new(
-            "{\"timestamp\":\"2026-03-12T10:02:00Z\",\"fields\":{\"message\":\"peer ban applied\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:02:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":420}}\n",
-        );
+        let replay = Cursor::new(format!(
+            "{}\n{}\n{}\n",
+            fixture_line(include_str!(
+                "../../../testdata/policy-trace/v1-exempt-peer.json"
+            )),
+            fixture_line(include_str!(
+                "../../../testdata/policy-trace/v1-not-bannable-peer.json"
+            )),
+            fixture_line(include_str!(
+                "../../../testdata/policy-trace/v1-ban-decision.json"
+            ))
+        ));
 
         process_reader(
             &policy,
             &config,
-            first,
-            "first".to_string(),
-            &mut state,
-            &mut summary,
-        )
-        .unwrap();
-        process_reader(
-            &policy,
-            &config,
-            second,
-            "second".to_string(),
+            replay,
+            "fixtures".to_string(),
             &mut state,
             &mut summary,
         )
         .unwrap();
 
-        assert_eq!(summary.lines_total, 2);
-        assert_eq!(summary.lines_decision, 2);
+        assert_eq!(summary.lines_total, 3);
+        assert_eq!(summary.lines_decision, 3);
         assert_eq!(summary.actual_bans, 1);
         assert_eq!(summary.peers_seen, 1);
+        assert!(state.sessions.len() >= 3);
     }
 
     #[test]
-    fn active_ban_window_suppresses_repeat_bans_for_same_peer() {
-        let config = parse_args(vec![
-            "--input".into(),
-            "dummy".into(),
-            "--target-rate-bps".into(),
-            "1".into(),
-            "--weight-rate".into(),
-            "1.0".into(),
-            "--weight-progress".into(),
-            "0.0".into(),
-            "--ban-threshold".into(),
-            "0.8".into(),
-            "--clear-threshold".into(),
-            "0.4".into(),
-            "--sustain-seconds".into(),
-            "1".into(),
-            "--min-observation-seconds".into(),
-            "1".into(),
-            "--decay-per-second".into(),
-            "0.0025".into(),
-        ])
-        .unwrap();
+    fn trace_reader_rejects_operator_logs() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
         let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
+        let replay = Cursor::new(
+            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer policy update\"}}\n",
+        );
 
-        let replay = Cursor::new(concat!(
-            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":300}}\n",
-            "{\"timestamp\":\"2026-03-12T10:01:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:01:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":360}}\n",
-            "{\"timestamp\":\"2026-03-12T10:02:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:02:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":420}}\n"
-        ));
+        let error = process_reader(
+            &policy,
+            &config,
+            replay,
+            "operator-log".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("expected ADR-0004 policy trace line"));
+    }
+
+    #[test]
+    fn trace_reader_counts_dropped_record_notices() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let replay = Cursor::new(
+            "{\"record_type\":\"dropped_records\",\"schema_version\":1,\"client_id\":1,\"dropped_count\":7}\n",
+        );
 
         process_reader(
             &policy,
@@ -911,6 +900,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(summary.simulated_bans, 1);
+        assert_eq!(summary.lines_total, 1);
+        assert_eq!(summary.lines_decision, 0);
+        assert_eq!(summary.dropped_trace_records, 7);
+    }
+
+    fn fixture_line(raw: &str) -> String {
+        serde_json::to_string(&serde_json::from_str::<serde_json::Value>(raw).unwrap()).unwrap()
     }
 }
