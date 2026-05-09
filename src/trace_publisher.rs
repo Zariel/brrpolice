@@ -338,6 +338,21 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_client_is_pruned_without_backpressure() {
+        let publisher = PolicyTracePublisher::new(true, 1, 1);
+        let subscription = publisher.subscribe().unwrap();
+        let record = sample_record();
+
+        drop(subscription);
+
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            PublishOutcome::SkippedNoClients
+        );
+        assert_eq!(publisher.active_client_count(), 0);
+    }
+
+    #[test]
     fn subscription_limit_counts_only_open_clients() {
         let publisher = PolicyTracePublisher::new(true, 1, 1);
         let subscription = publisher.subscribe().unwrap();

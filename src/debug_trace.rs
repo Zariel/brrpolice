@@ -214,10 +214,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use tokio::sync::watch;
     use tower::ServiceExt;
 
     use crate::{
-        config::DebugPolicyTraceConfig,
+        config::{AppConfig, DebugConfig, DebugPolicyTraceConfig},
         policy_trace::{
             POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, PolicyTraceRecordType,
             TraceDecisionOutput, TraceGuardrailInputs, TraceOffenceHistory, TracePeer,
@@ -229,6 +230,62 @@ mod tests {
             BanDisposition, OffenceIdentity, PeerEvaluation, PeerObservationId, PeerSessionState,
         },
     };
+
+    #[test]
+    fn default_trace_config_is_disabled_and_loopback_only() {
+        let config = DebugPolicyTraceConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 9091);
+        assert_eq!(config.bind_addr().unwrap().to_string(), "127.0.0.1:9091");
+    }
+
+    #[tokio::test]
+    async fn disabled_trace_server_stops_on_shutdown_without_binding() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = super::DebugTraceServer::new(
+            Arc::new(app_config_with_trace_config(
+                DebugPolicyTraceConfig::default(),
+            )),
+            Arc::new(PolicyTracePublisher::disabled()),
+            shutdown_rx,
+        );
+        let handle = tokio::spawn(server.run());
+
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_trace_server_stops_on_shutdown() {
+        let trace_config = DebugPolicyTraceConfig {
+            enabled: true,
+            port: 0,
+            ..DebugPolicyTraceConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = super::DebugTraceServer::new(
+            Arc::new(app_config_with_trace_config(trace_config)),
+            Arc::new(PolicyTracePublisher::new(true, 1, 4)),
+            shutdown_rx,
+        );
+        let handle = tokio::spawn(server.run());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn stream_returns_ndjson_records() {
@@ -486,6 +543,19 @@ mod tests {
             enabled: true,
             max_duration,
             ..DebugPolicyTraceConfig::default()
+        }
+    }
+
+    fn app_config_with_trace_config(policy_trace: DebugPolicyTraceConfig) -> AppConfig {
+        AppConfig {
+            qbittorrent: Default::default(),
+            policy: Default::default(),
+            filters: Default::default(),
+            database: Default::default(),
+            retention: Default::default(),
+            http: Default::default(),
+            logging: Default::default(),
+            debug: DebugConfig { policy_trace },
         }
     }
 

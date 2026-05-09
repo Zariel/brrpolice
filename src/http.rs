@@ -579,6 +579,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_router_does_not_expose_debug_trace_stream() {
+        let app = test_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn readyz_returns_service_unavailable_when_not_ready() {
         let app = test_router().await;
 
