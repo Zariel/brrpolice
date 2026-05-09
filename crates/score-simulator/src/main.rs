@@ -12,7 +12,7 @@ use humantime::parse_rfc3339;
 use serde_json::Value;
 
 use brrpolice::{
-    config::{FiltersConfig, PolicyConfig},
+    config::{BanLadderConfig, ChurnPolicyConfig, FiltersConfig, PolicyConfig, ScorePolicyConfig},
     policy::PolicyEngine,
     policy_trace::{
         POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceDecisionOutput,
@@ -65,17 +65,74 @@ impl OffenceKey {
 #[derive(Debug, Clone)]
 struct SimulatorConfig {
     inputs: Vec<PathBuf>,
-    policy: PolicyConfig,
+    candidate_policy: PolicyConfig,
+    candidate_overrides: Vec<PolicyOverride>,
     peer_ip: Option<IpAddr>,
 }
 
 impl Default for SimulatorConfig {
     fn default() -> Self {
-        let policy = PolicyConfig::default();
         Self {
             inputs: Vec::new(),
-            policy,
+            candidate_policy: PolicyConfig::default(),
+            candidate_overrides: Vec::new(),
             peer_ip: None,
+        }
+    }
+}
+
+impl SimulatorConfig {
+    fn record_policy_override(&mut self, policy_override: PolicyOverride) {
+        policy_override.apply(&mut self.candidate_policy);
+        self.candidate_overrides.push(policy_override);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PolicyOverride {
+    TargetRateBps(u64),
+    RequiredProgressDelta(f64),
+    ProgressRateScaleStart(f64),
+    ProgressRateScaleEnd(f64),
+    ProgressRateMinScale(f64),
+    WeightRate(f64),
+    WeightProgress(f64),
+    RateRiskFloor(f64),
+    BanThreshold(f64),
+    ClearThreshold(f64),
+    SustainDuration(Duration),
+    DecayPerSecond(f64),
+    MinObservationDuration(Duration),
+    RebanCooldown(Duration),
+    ChurnEnabled(bool),
+    ChurnReconnectWindow(Duration),
+    ChurnMinReconnects(u32),
+    ChurnMaxAmplifier(f64),
+    ChurnDecayPerSecond(f64),
+}
+
+impl PolicyOverride {
+    fn apply(self, policy: &mut PolicyConfig) {
+        match self {
+            Self::TargetRateBps(value) => policy.score.target_rate_bps = value,
+            Self::RequiredProgressDelta(value) => policy.score.required_progress_delta = value,
+            Self::ProgressRateScaleStart(value) => policy.score.progress_rate_scale_start = value,
+            Self::ProgressRateScaleEnd(value) => policy.score.progress_rate_scale_end = value,
+            Self::ProgressRateMinScale(value) => policy.score.progress_rate_min_scale = value,
+            Self::WeightRate(value) => policy.score.weight_rate = value,
+            Self::WeightProgress(value) => policy.score.weight_progress = value,
+            Self::RateRiskFloor(value) => policy.score.rate_risk_floor = value,
+            Self::BanThreshold(value) => policy.score.ban_threshold = value,
+            Self::ClearThreshold(value) => policy.score.clear_threshold = value,
+            Self::SustainDuration(value) => policy.score.sustain_duration = value,
+            Self::DecayPerSecond(value) => policy.score.decay_per_second = value,
+            Self::MinObservationDuration(value) => policy.score.min_observation_duration = value,
+            Self::RebanCooldown(value) => policy.reban_cooldown = value,
+            Self::ChurnEnabled(value) => policy.score.churn.enabled = value,
+            Self::ChurnReconnectWindow(value) => policy.score.churn.reconnect_window = value,
+            Self::ChurnMinReconnects(value) => policy.score.churn.min_reconnects = value,
+            Self::ChurnMaxAmplifier(value) => policy.score.churn.max_amplifier = value,
+            Self::ChurnDecayPerSecond(value) => policy.score.churn.decay_per_second = value,
         }
     }
 }
@@ -122,21 +179,12 @@ impl Summary {
         }
     }
 
-    fn record_trace_replay_deltas(
+    fn record_candidate_deltas(
         &mut self,
         decision_deltas: Vec<String>,
         score_state_deltas: Vec<String>,
         guardrail_deltas: Vec<String>,
     ) {
-        if decision_deltas.is_empty()
-            && score_state_deltas.is_empty()
-            && guardrail_deltas.is_empty()
-        {
-            self.record_reproduction_pass();
-            return;
-        }
-
-        self.reproduction_failures += 1;
         for delta in decision_deltas {
             self.decision_deltas += 1;
             if self.decision_delta_reports.len() < 20 {
@@ -166,13 +214,13 @@ impl Summary {
 struct ReplayState {
     sessions: HashMap<SessionKey, PeerSessionState>,
     offences: HashMap<OffenceKey, OffenceHistory>,
-    active_bans: HashMap<ActiveBanKey, SystemTime>,
+    recorded_active_bans: HashMap<ActiveBanKey, SystemTime>,
+    candidate_active_bans: HashMap<ActiveBanKey, SystemTime>,
     ban_events: HashMap<SessionKey, u32>,
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let config = parse_args(args)?;
-    let policy = PolicyEngine::new(config.policy.clone(), &FiltersConfig::default());
     let mut state = ReplayState::default();
     let mut summary = Summary::default();
 
@@ -181,7 +229,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
             .with_context(|| format!("opening input file `{}`", input.display()))?;
         let reader = BufReader::new(file);
         process_reader(
-            &policy,
             &config,
             reader,
             input.display().to_string(),
@@ -203,7 +250,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn process_reader<R: BufRead>(
-    policy: &PolicyEngine,
     config: &SimulatorConfig,
     reader: R,
     source_name: String,
@@ -223,7 +269,6 @@ fn process_reader<R: BufRead>(
         {
             TraceInputLine::PeerObservation(record) => {
                 process_trace_record(
-                    policy,
                     config,
                     *record,
                     TraceLineContext {
@@ -253,9 +298,22 @@ enum TraceInputLine {
     DroppedRecords { dropped_count: u64 },
 }
 
+#[derive(Clone, Copy)]
 struct TraceLineContext<'a> {
     source_name: &'a str,
     line_number: usize,
+}
+
+struct TracePeerContext {
+    torrent: TorrentScope,
+    peer: PeerSnapshot,
+    first_seen_at: SystemTime,
+    observed_at: SystemTime,
+}
+
+struct TraceEvaluation {
+    evaluation: brrpolice::types::PeerEvaluation,
+    disposition: BanDisposition,
 }
 
 fn parse_trace_line(line: &str) -> Result<TraceInputLine> {
@@ -288,7 +346,6 @@ fn parse_trace_line(line: &str) -> Result<TraceInputLine> {
 }
 
 fn process_trace_record(
-    policy: &PolicyEngine,
     config: &SimulatorConfig,
     record: PolicyTraceRecord,
     line_context: TraceLineContext<'_>,
@@ -309,7 +366,10 @@ fn process_trace_record(
         return Ok(());
     }
     state
-        .active_bans
+        .recorded_active_bans
+        .retain(|_, expires_at| *expires_at > observed_at);
+    state
+        .candidate_active_bans
         .retain(|_, expires_at| *expires_at > observed_at);
 
     let observation_id =
@@ -324,13 +384,18 @@ fn process_trace_record(
         summary.peers_seen += 1;
     }
 
-    let has_active_ban = state.active_bans.contains_key(&ActiveBanKey {
+    let recorded_has_active_ban = state.recorded_active_bans.contains_key(&ActiveBanKey {
+        torrent_hash: record.torrent.hash.clone(),
+        peer_ip,
+        peer_port: record.peer.port,
+    });
+    let candidate_has_active_ban = state.candidate_active_bans.contains_key(&ActiveBanKey {
         torrent_hash: record.torrent.hash.clone(),
         peer_ip,
         peer_port: record.peer.port,
     });
 
-    let peer_context = PeerContext {
+    let peer_context = TracePeerContext {
         torrent: TorrentScope {
             hash: record.torrent.hash.clone(),
             name: record
@@ -356,12 +421,13 @@ fn process_trace_record(
             .map(|session| parse_rfc3339(&session.first_seen_at))
             .transpose()
             .context("parsing trace prior_session.first_seen_at")?
-            .unwrap_or(observed_at),
+            .unwrap_or(
+                parse_rfc3339(&record.evaluated_session.first_seen_at)
+                    .context("parsing trace evaluated_session.first_seen_at")?,
+            ),
         observed_at,
-        has_active_ban,
     };
 
-    let evaluation = policy.evaluate_peer(&peer_context, existing.as_ref());
     let history = OffenceHistory {
         offence_count: record.guardrail_inputs.offence_history.offence_count,
         last_ban_expires_at: record
@@ -374,35 +440,58 @@ fn process_trace_record(
             .context("parsing trace offence_history.last_ban_expires_at")?,
     };
 
-    if evaluation.session.churn_amplifier > 0.0 {
-        summary.churn_samples += 1;
-        summary.churn_max_amplifier = summary
-            .churn_max_amplifier
-            .max(evaluation.session.churn_amplifier);
-    }
-    summary.churn_max_reconnect_count = summary
-        .churn_max_reconnect_count
-        .max(evaluation.session.churn_reconnect_count);
-    let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
-    check_current_policy_reproduction(
-        config,
+    let replay_policy = policy_config_from_trace(&record.policy_inputs);
+    let current = evaluate_trace(
+        &replay_policy,
+        &peer_context,
+        recorded_has_active_ban,
+        existing.as_ref(),
+        &history,
+    );
+    let current_reproduced = check_current_policy_reproduction(
+        &replay_policy,
         &record,
-        &evaluation,
-        &disposition,
+        &current.evaluation,
+        &current.disposition,
         &history,
         summary,
         line_context,
     );
 
-    match &disposition {
+    let mut candidate_policy = replay_policy.clone();
+    for policy_override in &config.candidate_overrides {
+        policy_override.apply(&mut candidate_policy);
+    }
+    let candidate = evaluate_trace(
+        &candidate_policy,
+        &peer_context,
+        candidate_has_active_ban,
+        existing.as_ref(),
+        &history,
+    );
+    if current_reproduced {
+        record_candidate_deltas(&record, &candidate, &history, summary, line_context);
+    }
+
+    if candidate.evaluation.session.churn_amplifier > 0.0 {
+        summary.churn_samples += 1;
+        summary.churn_max_amplifier = summary
+            .churn_max_amplifier
+            .max(candidate.evaluation.session.churn_amplifier);
+    }
+    summary.churn_max_reconnect_count = summary
+        .churn_max_reconnect_count
+        .max(candidate.evaluation.session.churn_reconnect_count);
+
+    match &candidate.disposition {
         BanDisposition::Ban(decision) => {
             summary.simulated_bans += 1;
-            if evaluation.session.churn_amplifier > 0.0 {
+            if candidate.evaluation.session.churn_amplifier > 0.0 {
                 summary.simulated_bans_with_churn += 1;
             }
             *state.ban_events.entry(session_key.clone()).or_default() += 1;
             let expires_at = observed_at + decision.ttl;
-            state.active_bans.insert(
+            state.candidate_active_bans.insert(
                 ActiveBanKey {
                     torrent_hash: record.torrent.hash.clone(),
                     peer_ip,
@@ -411,7 +500,7 @@ fn process_trace_record(
                 expires_at,
             );
             state.offences.insert(
-                OffenceKey::from_offence_identity(&evaluation.session.offence_identity),
+                OffenceKey::from_offence_identity(&candidate.evaluation.session.offence_identity),
                 OffenceHistory {
                     offence_count: decision.offence_number,
                     last_ban_expires_at: Some(expires_at),
@@ -432,6 +521,30 @@ fn process_trace_record(
         .sessions
         .insert(session_key, session_from_trace(&record.evaluated_session)?);
     Ok(())
+}
+
+fn evaluate_trace(
+    policy_config: &PolicyConfig,
+    trace_context: &TracePeerContext,
+    has_active_ban: bool,
+    existing: Option<&PeerSessionState>,
+    history: &OffenceHistory,
+) -> TraceEvaluation {
+    let policy = PolicyEngine::new(policy_config.clone(), &FiltersConfig::default());
+    let peer_context = PeerContext {
+        torrent: trace_context.torrent.clone(),
+        peer: trace_context.peer.clone(),
+        first_seen_at: trace_context.first_seen_at,
+        observed_at: trace_context.observed_at,
+        has_active_ban,
+    };
+    let evaluation = policy.evaluate_peer(&peer_context, existing);
+    let disposition = policy.decide_ban(&peer_context, &evaluation, history);
+
+    TraceEvaluation {
+        evaluation,
+        disposition,
+    }
 }
 
 fn validate_required_trace_fields(record: &PolicyTraceRecord) -> Result<()> {
@@ -459,16 +572,59 @@ fn validate_required_trace_fields(record: &PolicyTraceRecord) -> Result<()> {
     Ok(())
 }
 
+fn policy_config_from_trace(inputs: &TracePolicyInputs) -> PolicyConfig {
+    PolicyConfig {
+        new_peer_grace_period: Duration::from_millis(inputs.new_peer_grace_period_ms),
+        decay_window: Duration::from_millis(inputs.decay_window_ms),
+        ignore_peer_progress_at_or_above: inputs.ignore_peer_progress_at_or_above,
+        min_total_seeders: inputs.min_total_seeders,
+        reban_cooldown: Duration::from_millis(inputs.reban_cooldown_ms),
+        score: ScorePolicyConfig {
+            target_rate_bps: inputs.score.target_rate_bps,
+            required_progress_delta: inputs.score.required_progress_delta,
+            progress_rate_scale_start: inputs.score.progress_rate_scale_start,
+            progress_rate_scale_end: inputs.score.progress_rate_scale_end,
+            progress_rate_min_scale: inputs.score.progress_rate_min_scale,
+            weight_rate: inputs.score.weight_rate,
+            weight_progress: inputs.score.weight_progress,
+            rate_risk_floor: inputs.score.rate_risk_floor,
+            ban_threshold: inputs.score.ban_threshold,
+            clear_threshold: inputs.score.clear_threshold,
+            sustain_duration: Duration::from_millis(inputs.score.sustain_duration_ms),
+            decay_per_second: inputs.score.decay_per_second,
+            min_observation_duration: Duration::from_millis(
+                inputs.score.min_observation_duration_ms,
+            ),
+            max_score: inputs.score.max_score,
+            churn: ChurnPolicyConfig {
+                enabled: inputs.score.churn_enabled,
+                reconnect_window: Duration::from_millis(inputs.score.churn_reconnect_window_ms),
+                min_reconnects: inputs.score.churn_min_reconnects,
+                max_amplifier: inputs.score.churn_max_amplifier,
+                decay_per_second: inputs.score.churn_decay_per_second,
+            },
+        },
+        ban_ladder: BanLadderConfig {
+            durations: inputs
+                .ban_ladder_duration_ms
+                .iter()
+                .copied()
+                .map(Duration::from_millis)
+                .collect(),
+        },
+    }
+}
+
 fn check_current_policy_reproduction(
-    config: &SimulatorConfig,
+    replay_policy: &PolicyConfig,
     record: &PolicyTraceRecord,
     evaluation: &brrpolice::types::PeerEvaluation,
     disposition: &BanDisposition,
     history: &OffenceHistory,
     summary: &mut Summary,
     line_context: TraceLineContext<'_>,
-) {
-    let replayed_policy_inputs = TracePolicyInputs::from(&config.policy);
+) -> bool {
+    let replayed_policy_inputs = TracePolicyInputs::from(replay_policy);
     let replayed_session = TracePeerSessionState::from(&evaluation.session);
     let replayed_decision_output =
         TraceDecisionOutput::from_evaluation_and_disposition(evaluation, disposition);
@@ -476,9 +632,6 @@ fn check_current_policy_reproduction(
     let context = trace_report_context(record, line_context);
 
     let mut reproduction_problems = Vec::new();
-    let mut decision_deltas = Vec::new();
-    let mut score_state_deltas = Vec::new();
-    let mut guardrail_deltas = Vec::new();
     if record.policy_inputs != replayed_policy_inputs {
         reproduction_problems.push(format!(
             "{context} policy_inputs recorded={} replayed={}",
@@ -487,21 +640,21 @@ fn check_current_policy_reproduction(
         ));
     }
     if record.evaluated_session != replayed_session {
-        score_state_deltas.push(format!(
+        reproduction_problems.push(format!(
             "{context} evaluated_session recorded={} replayed={}",
             abbrev_debug(&record.evaluated_session),
             abbrev_debug(&replayed_session)
         ));
     }
     if record.decision_output != replayed_decision_output {
-        decision_deltas.push(format!(
+        reproduction_problems.push(format!(
             "{context} decision_output recorded={} replayed={}",
             abbrev_debug(&record.decision_output),
             abbrev_debug(&replayed_decision_output)
         ));
     }
     if record.guardrail_inputs != replayed_guardrail_inputs {
-        guardrail_deltas.push(format!(
+        reproduction_problems.push(format!(
             "{context} guardrail_inputs recorded={} replayed={}",
             abbrev_debug(&record.guardrail_inputs),
             abbrev_debug(&replayed_guardrail_inputs)
@@ -509,7 +662,8 @@ fn check_current_policy_reproduction(
     }
 
     if reproduction_problems.is_empty() {
-        summary.record_trace_replay_deltas(decision_deltas, score_state_deltas, guardrail_deltas);
+        summary.record_reproduction_pass();
+        true
     } else {
         summary.reproduction_failures += 1;
         for problem in reproduction_problems {
@@ -517,25 +671,55 @@ fn check_current_policy_reproduction(
                 summary.reproduction_problems.push(problem);
             }
         }
-        for delta in decision_deltas {
-            summary.decision_deltas += 1;
-            if summary.decision_delta_reports.len() < 20 {
-                summary.decision_delta_reports.push(delta);
-            }
-        }
-        for delta in score_state_deltas {
-            summary.score_state_deltas += 1;
-            if summary.score_state_delta_reports.len() < 20 {
-                summary.score_state_delta_reports.push(delta);
-            }
-        }
-        for delta in guardrail_deltas {
-            summary.guardrail_deltas += 1;
-            if summary.guardrail_delta_reports.len() < 20 {
-                summary.guardrail_delta_reports.push(delta);
-            }
-        }
+        false
     }
+}
+
+fn record_candidate_deltas(
+    record: &PolicyTraceRecord,
+    candidate: &TraceEvaluation,
+    history: &OffenceHistory,
+    summary: &mut Summary,
+    line_context: TraceLineContext<'_>,
+) {
+    let candidate_session = TracePeerSessionState::from(&candidate.evaluation.session);
+    let candidate_decision_output = TraceDecisionOutput::from_evaluation_and_disposition(
+        &candidate.evaluation,
+        &candidate.disposition,
+    );
+    let candidate_guardrail_inputs =
+        trace_guardrail_inputs(&candidate.evaluation, &candidate.disposition, history);
+    let context = trace_report_context(record, line_context);
+
+    let decision_deltas = if record.decision_output != candidate_decision_output {
+        vec![format!(
+            "{context} decision_output recorded={} candidate={}",
+            abbrev_debug(&record.decision_output),
+            abbrev_debug(&candidate_decision_output)
+        )]
+    } else {
+        Vec::new()
+    };
+    let score_state_deltas = if record.evaluated_session != candidate_session {
+        vec![format!(
+            "{context} evaluated_session recorded={} candidate={}",
+            abbrev_debug(&record.evaluated_session),
+            abbrev_debug(&candidate_session)
+        )]
+    } else {
+        Vec::new()
+    };
+    let guardrail_deltas = if record.guardrail_inputs != candidate_guardrail_inputs {
+        vec![format!(
+            "{context} guardrail_inputs recorded={} candidate={}",
+            abbrev_debug(&record.guardrail_inputs),
+            abbrev_debug(&candidate_guardrail_inputs)
+        )]
+    } else {
+        Vec::new()
+    };
+
+    summary.record_candidate_deltas(decision_deltas, score_state_deltas, guardrail_deltas);
 }
 
 fn trace_guardrail_inputs(
@@ -602,7 +786,7 @@ fn record_recorded_ban(
         .context("recorded ban decision peer_ip is required for simulator replay")?;
     let ttl = Duration::from_millis(decision.ttl_ms);
     let expires_at = observed_at + ttl;
-    state.active_bans.insert(
+    state.recorded_active_bans.insert(
         ActiveBanKey {
             torrent_hash: torrent_hash.to_string(),
             peer_ip,
@@ -724,25 +908,42 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
     );
     println!(
         "config: target_rate_bps={} required_progress_delta={:.6} progress_rate_scale(start={:.3},end={:.3},min={:.3}) weights(rate={:.3},progress={:.3}) rate_risk_floor={:.3} threshold(ban={:.3},clear={:.3}) sustain_seconds={} decay_per_second={:.6} min_observation_seconds={} reban_cooldown_seconds={} churn(enabled={},window_seconds={},min_reconnects={},max_amplifier={:.3},decay_per_second={:.6})",
-        config.policy.score.target_rate_bps,
-        config.policy.score.required_progress_delta,
-        config.policy.score.progress_rate_scale_start,
-        config.policy.score.progress_rate_scale_end,
-        config.policy.score.progress_rate_min_scale,
-        config.policy.score.weight_rate,
-        config.policy.score.weight_progress,
-        config.policy.score.rate_risk_floor,
-        config.policy.score.ban_threshold,
-        config.policy.score.clear_threshold,
-        config.policy.score.sustain_duration.as_secs(),
-        config.policy.score.decay_per_second,
-        config.policy.score.min_observation_duration.as_secs(),
-        config.policy.reban_cooldown.as_secs(),
-        config.policy.score.churn.enabled,
-        config.policy.score.churn.reconnect_window.as_secs(),
-        config.policy.score.churn.min_reconnects,
-        config.policy.score.churn.max_amplifier,
-        config.policy.score.churn.decay_per_second,
+        config.candidate_policy.score.target_rate_bps,
+        config.candidate_policy.score.required_progress_delta,
+        config.candidate_policy.score.progress_rate_scale_start,
+        config.candidate_policy.score.progress_rate_scale_end,
+        config.candidate_policy.score.progress_rate_min_scale,
+        config.candidate_policy.score.weight_rate,
+        config.candidate_policy.score.weight_progress,
+        config.candidate_policy.score.rate_risk_floor,
+        config.candidate_policy.score.ban_threshold,
+        config.candidate_policy.score.clear_threshold,
+        config.candidate_policy.score.sustain_duration.as_secs(),
+        config.candidate_policy.score.decay_per_second,
+        config
+            .candidate_policy
+            .score
+            .min_observation_duration
+            .as_secs(),
+        config.candidate_policy.reban_cooldown.as_secs(),
+        config.candidate_policy.score.churn.enabled,
+        config
+            .candidate_policy
+            .score
+            .churn
+            .reconnect_window
+            .as_secs(),
+        config.candidate_policy.score.churn.min_reconnects,
+        config.candidate_policy.score.churn.max_amplifier,
+        config.candidate_policy.score.churn.decay_per_second,
+    );
+    println!(
+        "candidate_overrides={}",
+        if config.candidate_overrides.is_empty() {
+            "none".to_string()
+        } else {
+            config.candidate_overrides.len().to_string()
+        }
     );
     if let Some(peer_ip) = config.peer_ip {
         println!("peer_filter_ip={peer_ip}");
@@ -837,82 +1038,115 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                 config.inputs.push(PathBuf::from(value));
             }
             "--target-rate-bps" => {
-                config.policy.score.target_rate_bps =
-                    parse_u64_arg(&mut iter, "--target-rate-bps")?;
+                config.record_policy_override(PolicyOverride::TargetRateBps(parse_u64_arg(
+                    &mut iter,
+                    "--target-rate-bps",
+                )?));
             }
             "--required-progress-delta" => {
-                config.policy.score.required_progress_delta =
-                    parse_f64_arg(&mut iter, "--required-progress-delta")?;
+                config.record_policy_override(PolicyOverride::RequiredProgressDelta(
+                    parse_f64_arg(&mut iter, "--required-progress-delta")?,
+                ));
             }
             "--progress-rate-scale-start" => {
-                config.policy.score.progress_rate_scale_start =
-                    parse_f64_arg(&mut iter, "--progress-rate-scale-start")?;
+                config.record_policy_override(PolicyOverride::ProgressRateScaleStart(
+                    parse_f64_arg(&mut iter, "--progress-rate-scale-start")?,
+                ));
             }
             "--progress-rate-scale-end" => {
-                config.policy.score.progress_rate_scale_end =
-                    parse_f64_arg(&mut iter, "--progress-rate-scale-end")?;
+                config.record_policy_override(PolicyOverride::ProgressRateScaleEnd(parse_f64_arg(
+                    &mut iter,
+                    "--progress-rate-scale-end",
+                )?));
             }
             "--progress-rate-min-scale" => {
-                config.policy.score.progress_rate_min_scale =
-                    parse_f64_arg(&mut iter, "--progress-rate-min-scale")?;
+                config.record_policy_override(PolicyOverride::ProgressRateMinScale(parse_f64_arg(
+                    &mut iter,
+                    "--progress-rate-min-scale",
+                )?));
             }
             "--weight-rate" => {
-                config.policy.score.weight_rate = parse_f64_arg(&mut iter, "--weight-rate")?;
+                config.record_policy_override(PolicyOverride::WeightRate(parse_f64_arg(
+                    &mut iter,
+                    "--weight-rate",
+                )?));
             }
             "--weight-progress" => {
-                config.policy.score.weight_progress =
-                    parse_f64_arg(&mut iter, "--weight-progress")?;
+                config.record_policy_override(PolicyOverride::WeightProgress(parse_f64_arg(
+                    &mut iter,
+                    "--weight-progress",
+                )?));
             }
             "--rate-risk-floor" => {
-                config.policy.score.rate_risk_floor =
-                    parse_f64_arg(&mut iter, "--rate-risk-floor")?;
+                config.record_policy_override(PolicyOverride::RateRiskFloor(parse_f64_arg(
+                    &mut iter,
+                    "--rate-risk-floor",
+                )?));
             }
             "--ban-threshold" => {
-                config.policy.score.ban_threshold = parse_f64_arg(&mut iter, "--ban-threshold")?;
+                config.record_policy_override(PolicyOverride::BanThreshold(parse_f64_arg(
+                    &mut iter,
+                    "--ban-threshold",
+                )?));
             }
             "--clear-threshold" => {
-                config.policy.score.clear_threshold =
-                    parse_f64_arg(&mut iter, "--clear-threshold")?;
+                config.record_policy_override(PolicyOverride::ClearThreshold(parse_f64_arg(
+                    &mut iter,
+                    "--clear-threshold",
+                )?));
             }
             "--sustain-seconds" => {
-                config.policy.score.sustain_duration =
-                    Duration::from_secs(parse_u64_arg(&mut iter, "--sustain-seconds")?);
+                config.record_policy_override(PolicyOverride::SustainDuration(
+                    Duration::from_secs(parse_u64_arg(&mut iter, "--sustain-seconds")?),
+                ));
             }
             "--decay-per-second" => {
-                config.policy.score.decay_per_second =
-                    parse_f64_arg(&mut iter, "--decay-per-second")?;
+                config.record_policy_override(PolicyOverride::DecayPerSecond(parse_f64_arg(
+                    &mut iter,
+                    "--decay-per-second",
+                )?));
             }
             "--min-observation-seconds" => {
-                config.policy.score.min_observation_duration =
-                    Duration::from_secs(parse_u64_arg(&mut iter, "--min-observation-seconds")?);
+                config.record_policy_override(PolicyOverride::MinObservationDuration(
+                    Duration::from_secs(parse_u64_arg(&mut iter, "--min-observation-seconds")?),
+                ));
             }
             "--reban-cooldown-seconds" => {
-                config.policy.reban_cooldown =
-                    Duration::from_secs(parse_u64_arg(&mut iter, "--reban-cooldown-seconds")?);
+                config.record_policy_override(PolicyOverride::RebanCooldown(Duration::from_secs(
+                    parse_u64_arg(&mut iter, "--reban-cooldown-seconds")?,
+                )));
             }
             "--churn-enabled" => {
-                config.policy.score.churn.enabled = true;
+                config.record_policy_override(PolicyOverride::ChurnEnabled(true));
             }
             "--churn-disabled" => {
-                config.policy.score.churn.enabled = false;
+                config.record_policy_override(PolicyOverride::ChurnEnabled(false));
             }
             "--churn-reconnect-window-seconds" => {
-                config.policy.score.churn.reconnect_window = Duration::from_secs(parse_u64_arg(
-                    &mut iter,
-                    "--churn-reconnect-window-seconds",
-                )?);
+                config.record_policy_override(PolicyOverride::ChurnReconnectWindow(
+                    Duration::from_secs(parse_u64_arg(
+                        &mut iter,
+                        "--churn-reconnect-window-seconds",
+                    )?),
+                ));
             }
             "--churn-min-reconnects" => {
-                config.policy.score.churn.min_reconnects =
-                    parse_u32_arg(&mut iter, "--churn-min-reconnects")?;
+                config.record_policy_override(PolicyOverride::ChurnMinReconnects(parse_u32_arg(
+                    &mut iter,
+                    "--churn-min-reconnects",
+                )?));
             }
             "--churn-max-amplifier" => {
-                config.policy.score.churn.max_amplifier =
-                    parse_f64_arg(&mut iter, "--churn-max-amplifier")?;
+                config.record_policy_override(PolicyOverride::ChurnMaxAmplifier(parse_f64_arg(
+                    &mut iter,
+                    "--churn-max-amplifier",
+                )?));
             }
             "--churn-decay-per-second" => {
-                config.policy.score.churn.decay_per_second =
-                    parse_f64_arg(&mut iter, "--churn-decay-per-second")?;
+                config.record_policy_override(PolicyOverride::ChurnDecayPerSecond(parse_f64_arg(
+                    &mut iter,
+                    "--churn-decay-per-second",
+                )?));
             }
             "--peer-ip" => {
                 let value = iter.next().context("expected peer IP after `--peer-ip`")?;
@@ -933,34 +1167,38 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
     if config.inputs.is_empty() {
         bail!("missing required `--input` argument (can be repeated)");
     }
-    if !(0.0..=1.0).contains(&config.policy.score.required_progress_delta) {
+    if !(0.0..=1.0).contains(&config.candidate_policy.score.required_progress_delta) {
         bail!("--required-progress-delta must be between 0.0 and 1.0");
     }
-    if config.policy.score.progress_rate_scale_start < 1.0 {
+    if config.candidate_policy.score.progress_rate_scale_start < 1.0 {
         bail!("--progress-rate-scale-start must be >= 1.0");
     }
-    if config.policy.score.progress_rate_scale_end < config.policy.score.progress_rate_scale_start {
+    if config.candidate_policy.score.progress_rate_scale_end
+        < config.candidate_policy.score.progress_rate_scale_start
+    {
         bail!("--progress-rate-scale-end must be >= --progress-rate-scale-start");
     }
-    if !(0.0..=1.0).contains(&config.policy.score.progress_rate_min_scale) {
+    if !(0.0..=1.0).contains(&config.candidate_policy.score.progress_rate_min_scale) {
         bail!("--progress-rate-min-scale must be between 0.0 and 1.0");
     }
-    if config.policy.score.weight_rate < 0.0 || config.policy.score.weight_progress < 0.0 {
+    if config.candidate_policy.score.weight_rate < 0.0
+        || config.candidate_policy.score.weight_progress < 0.0
+    {
         bail!("weights must be non-negative");
     }
-    if !(0.0..=1.0).contains(&config.policy.score.rate_risk_floor) {
+    if !(0.0..=1.0).contains(&config.candidate_policy.score.rate_risk_floor) {
         bail!("--rate-risk-floor must be between 0.0 and 1.0");
     }
-    if config.policy.score.clear_threshold > config.policy.score.ban_threshold {
+    if config.candidate_policy.score.clear_threshold > config.candidate_policy.score.ban_threshold {
         bail!("--clear-threshold must be <= --ban-threshold");
     }
-    if config.policy.score.churn.min_reconnects == 0 {
+    if config.candidate_policy.score.churn.min_reconnects == 0 {
         bail!("--churn-min-reconnects must be >= 1");
     }
-    if config.policy.score.churn.max_amplifier < 0.0 {
+    if config.candidate_policy.score.churn.max_amplifier < 0.0 {
         bail!("--churn-max-amplifier must be >= 0.0");
     }
-    if config.policy.score.churn.decay_per_second < 0.0 {
+    if config.candidate_policy.score.churn.decay_per_second < 0.0 {
         bail!("--churn-decay-per-second must be >= 0.0");
     }
 
@@ -1077,11 +1315,19 @@ mod tests {
             "0.03".to_string(),
         ];
         let config = parse_args(args).expect("expected args to parse");
-        assert!(config.policy.score.churn.enabled);
-        assert_eq!(config.policy.score.churn.reconnect_window.as_secs(), 120);
-        assert_eq!(config.policy.score.churn.min_reconnects, 2);
-        assert!((config.policy.score.churn.max_amplifier - 0.8).abs() < f64::EPSILON);
-        assert!((config.policy.score.churn.decay_per_second - 0.03).abs() < f64::EPSILON);
+        assert!(config.candidate_policy.score.churn.enabled);
+        assert_eq!(
+            config
+                .candidate_policy
+                .score
+                .churn
+                .reconnect_window
+                .as_secs(),
+            120
+        );
+        assert_eq!(config.candidate_policy.score.churn.min_reconnects, 2);
+        assert!((config.candidate_policy.score.churn.max_amplifier - 0.8).abs() < f64::EPSILON);
+        assert!((config.candidate_policy.score.churn.decay_per_second - 0.03).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1098,7 +1344,6 @@ mod tests {
     #[test]
     fn trace_reader_consumes_schema_v1_fixtures() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
 
@@ -1116,7 +1361,6 @@ mod tests {
         ));
 
         process_reader(
-            &policy,
             &config,
             replay,
             "fixtures".to_string(),
@@ -1139,14 +1383,13 @@ mod tests {
     #[test]
     fn trace_reader_passes_current_policy_reproduction_for_engine_trace() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let policy = PolicyEngine::new(config.candidate_policy.clone(), &Default::default());
         let record = replayable_trace_record(&config, &policy);
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
         let replay = Cursor::new(format!("{}\n", serde_json::to_string(&record).unwrap()));
 
         process_reader(
-            &policy,
             &config,
             replay,
             "generated".to_string(),
@@ -1163,7 +1406,6 @@ mod tests {
     #[test]
     fn trace_reader_rejects_operator_logs() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
         let replay = Cursor::new(
@@ -1171,7 +1413,6 @@ mod tests {
         );
 
         let error = process_reader(
-            &policy,
             &config,
             replay,
             "operator-log".to_string(),
@@ -1186,7 +1427,6 @@ mod tests {
     #[test]
     fn trace_reader_counts_dropped_record_notices() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
         let replay = Cursor::new(
@@ -1194,7 +1434,6 @@ mod tests {
         );
 
         process_reader(
-            &policy,
             &config,
             replay,
             "replay".to_string(),
@@ -1211,9 +1450,8 @@ mod tests {
     }
 
     #[test]
-    fn trace_reader_reports_policy_input_mismatches() {
+    fn trace_reader_reports_current_policy_reproduction_mismatches() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -1224,7 +1462,6 @@ mod tests {
         let replay = Cursor::new(format!("{}\n", serde_json::to_string(&fixture).unwrap()));
 
         process_reader(
-            &policy,
             &config,
             replay,
             "mismatch".to_string(),
@@ -1235,14 +1472,20 @@ mod tests {
 
         assert_eq!(summary.reproduction_passes, 0);
         assert_eq!(summary.reproduction_failures, 1);
-        assert!(summary.reproduction_problems[0].contains("policy_inputs"));
+        assert!(
+            summary
+                .reproduction_problems
+                .iter()
+                .any(|problem| problem.contains("decision_output")
+                    || problem.contains("evaluated_session"))
+        );
         assert!(summary.reproduction_problems[0].contains("torrent_hash="));
     }
 
     #[test]
-    fn trace_reader_buckets_replay_deltas_by_kind() {
+    fn current_policy_replay_deltas_are_reproduction_failures() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let policy = PolicyEngine::new(config.candidate_policy.clone(), &Default::default());
         let mut decision_record = replayable_trace_record(&config, &policy);
         decision_record.policy_trace_id = "decision-delta".to_string();
         decision_record.decision_output.is_bad_sample =
@@ -1266,7 +1509,6 @@ mod tests {
         let mut summary = Summary::default();
 
         process_reader(
-            &policy,
             &config,
             replay,
             "deltas".to_string(),
@@ -1277,13 +1519,85 @@ mod tests {
 
         assert_eq!(summary.reproduction_passes, 0);
         assert_eq!(summary.reproduction_failures, 3);
-        assert_eq!(summary.decision_deltas, 1);
-        assert_eq!(summary.score_state_deltas, 1);
-        assert_eq!(summary.guardrail_deltas, 1);
-        assert!(summary.reproduction_problems.is_empty());
-        assert!(summary.decision_delta_reports[0].contains("decision-delta"));
-        assert!(summary.score_state_delta_reports[0].contains("score-state-delta"));
-        assert!(summary.guardrail_delta_reports[0].contains("guardrail-delta"));
+        assert_eq!(summary.decision_deltas, 0);
+        assert_eq!(summary.score_state_deltas, 0);
+        assert_eq!(summary.guardrail_deltas, 0);
+        assert!(
+            summary
+                .reproduction_problems
+                .iter()
+                .any(|problem| problem.contains("decision-delta"))
+        );
+        assert!(
+            summary
+                .reproduction_problems
+                .iter()
+                .any(|problem| problem.contains("score-state-delta"))
+        );
+        assert!(
+            summary
+                .reproduction_problems
+                .iter()
+                .any(|problem| problem.contains("guardrail-delta"))
+        );
+    }
+
+    #[test]
+    fn trace_reader_reproduces_non_default_trace_policy() {
+        let mut trace_config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        trace_config.candidate_policy.score.target_rate_bps = 8_192;
+        let trace_policy =
+            PolicyEngine::new(trace_config.candidate_policy.clone(), &Default::default());
+        let record = replayable_slow_trace_record(&trace_config, &trace_policy);
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let replay = Cursor::new(format!("{}\n", serde_json::to_string(&record).unwrap()));
+
+        process_reader(
+            &config,
+            replay,
+            "non-default".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 1);
+        assert_eq!(summary.reproduction_failures, 0);
+        assert_eq!(summary.decision_deltas, 0);
+        assert_eq!(summary.score_state_deltas, 0);
+    }
+
+    #[test]
+    fn candidate_overrides_report_deltas_without_reproduction_failure() {
+        let trace_config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let trace_policy =
+            PolicyEngine::new(trace_config.candidate_policy.clone(), &Default::default());
+        let record = replayable_slow_trace_record(&trace_config, &trace_policy);
+        let config = parse_args(vec![
+            "--input".into(),
+            "dummy".into(),
+            "--ban-threshold".into(),
+            "0.9".into(),
+        ])
+        .unwrap();
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let replay = Cursor::new(format!("{}\n", serde_json::to_string(&record).unwrap()));
+
+        process_reader(
+            &config,
+            replay,
+            "candidate".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 1);
+        assert_eq!(summary.reproduction_failures, 0);
+        assert!(summary.decision_deltas >= 1 || summary.score_state_deltas >= 1);
     }
 
     #[test]
@@ -1319,7 +1633,7 @@ mod tests {
             tracker: Some("tracker.example".to_string()),
             category: Some("linux".to_string()),
             tags: vec!["public".to_string()],
-            total_seeders: config.policy.min_total_seeders.max(1),
+            total_seeders: config.candidate_policy.min_total_seeders.max(1),
             in_scope: true,
         };
         let peer = PeerSnapshot {
@@ -1358,7 +1672,7 @@ mod tests {
             },
             prior_session: None,
             evaluated_session: (&evaluation.session).into(),
-            policy_inputs: TracePolicyInputs::from(&config.policy),
+            policy_inputs: TracePolicyInputs::from(&config.candidate_policy),
             guardrail_inputs: TraceGuardrailInputs {
                 exemption_reason: evaluation
                     .session
@@ -1380,7 +1694,90 @@ mod tests {
                 &evaluation,
                 &disposition,
             ),
-            simulator_hints: TraceSimulatorHints::from_evaluation(&evaluation, &config.policy),
+            simulator_hints: TraceSimulatorHints::from_evaluation(
+                &evaluation,
+                &config.candidate_policy,
+            ),
+        }
+    }
+
+    fn replayable_slow_trace_record(
+        config: &super::SimulatorConfig,
+        policy: &PolicyEngine,
+    ) -> PolicyTraceRecord {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 45));
+        let torrent = TorrentScope {
+            hash: "generated-slow-trace".to_string(),
+            name: "generated-slow.iso".to_string(),
+            tracker: Some("tracker.example".to_string()),
+            category: Some("linux".to_string()),
+            tags: vec!["public".to_string()],
+            total_seeders: config.candidate_policy.min_total_seeders.max(1),
+            in_scope: true,
+        };
+        let peer = PeerSnapshot {
+            ip: peer_ip,
+            port: 51413,
+            progress: 0.10,
+            up_rate_bps: 0,
+        };
+        let peer_context = PeerContext {
+            torrent: torrent.clone(),
+            peer: peer.clone(),
+            first_seen_at: observed_at - Duration::from_secs(180),
+            observed_at,
+            has_active_ban: false,
+        };
+        let evaluation = policy.evaluate_peer(&peer_context, None);
+        let history = OffenceHistory {
+            offence_count: 0,
+            last_ban_expires_at: None,
+        };
+        let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
+
+        PolicyTraceRecord {
+            record_type: PolicyTraceRecordType::PeerObservation,
+            schema_version: POLICY_TRACE_SCHEMA_VERSION,
+            observed_at: trace_timestamp(observed_at),
+            service_version: "0.1.0-test".to_string(),
+            policy_trace_id: "generated-slow-trace-1".to_string(),
+            config_fingerprint: "generated-fingerprint".to_string(),
+            torrent: TraceTorrent::from(&torrent),
+            peer: TracePeer {
+                ip: Some(peer.ip),
+                port: peer.port,
+                progress: peer.progress,
+                up_rate_bps: peer.up_rate_bps,
+            },
+            prior_session: None,
+            evaluated_session: (&evaluation.session).into(),
+            policy_inputs: TracePolicyInputs::from(&config.candidate_policy),
+            guardrail_inputs: TraceGuardrailInputs {
+                exemption_reason: evaluation
+                    .session
+                    .last_exemption_reason
+                    .as_ref()
+                    .map(Into::into),
+                allowlisted_peer: matches!(
+                    evaluation.session.last_exemption_reason,
+                    Some(brrpolice::types::ExemptionReason::AllowlistedPeer)
+                ),
+                active_ban: matches!(
+                    evaluation.session.last_exemption_reason,
+                    Some(brrpolice::types::ExemptionReason::AlreadyBanned)
+                ),
+                reban_cooldown_remaining_ms: None,
+                offence_history: TraceOffenceHistory::from(&history),
+            },
+            decision_output: TraceDecisionOutput::from_evaluation_and_disposition(
+                &evaluation,
+                &disposition,
+            ),
+            simulator_hints: TraceSimulatorHints::from_evaluation(
+                &evaluation,
+                &config.candidate_policy,
+            ),
         }
     }
 
