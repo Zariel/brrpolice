@@ -258,6 +258,25 @@ cargo run -p score-simulator -- --input policy-trace.jsonl
 
 Do not expose `/debug/policy-trace/stream` through public ingress. If a Kubernetes Service is used, keep it internal-only and protect it with network policy that limits access to trusted operators. Treat captured `.jsonl` files as sensitive operational data and do not commit them.
 
+## Simulator Trace Replay
+
+`score-simulator` consumes ADR-0004 policy trace JSONL, not ordinary structured operator logs:
+
+```bash
+cargo run -p score-simulator -- --input policy-trace.jsonl
+```
+
+Repeat `--input` to combine multiple trace files from the same policy/config capture set. The simulator first runs a current-policy reproduction gate: each trace observation is replayed through the configured policy and compared with the recorded evaluated session, guardrails, and decision output. A run exits nonzero if the trace cannot be reproduced, if the trace reports dropped records, or if the simulator config does not match the recorded trace policy inputs.
+
+The output keeps replay fidelity separate from policy research deltas:
+
+- `current_policy_reproduction` and `reproduction_failure` identify data-quality, schema, config, or dropped-record problems.
+- `candidate_decision_deltas` and `decision_delta` show decision-output differences.
+- `candidate_score_state_deltas` and `score_state_delta` show evaluated session state differences.
+- `guardrail_or_exemption_deltas` and `guardrail_delta` show guardrail or exemption input differences.
+
+Future scoring-policy ADRs should use reproduced trace corpora as their evidence pipeline. Operator logs are no longer supported as policy-research replay input.
+
 ## Grafana Dashboard
 
 Import [`dashboards/grafana/brrpolice-overview.json`](dashboards/grafana/brrpolice-overview.json) into Grafana to get a starter operational dashboard for brrpolice metrics.
