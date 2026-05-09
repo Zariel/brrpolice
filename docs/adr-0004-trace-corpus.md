@@ -4,7 +4,7 @@ This note records the local trace replay corpus used to unblock scoring-policy r
 
 ## Corpus
 
-`testdata/policy-trace/v1-replay-corpus.jsonl` is a sanitized local JSONL corpus for the current default policy. It uses documentation-range peer IPs and fixture torrent metadata, not a production capture. Raw trace captures from `/debug/policy-trace/stream` remain sensitive operational data and must stay in untracked local storage such as `/private/tmp` or another restricted operator workspace.
+`testdata/policy-trace/v1-replay-corpus.jsonl` is a sanitized local JSONL corpus for the current policy replay gate. It uses documentation-range peer IPs and fixture torrent metadata, not a production capture. Raw trace captures from `/debug/policy-trace/stream` remain sensitive operational data and must stay in untracked local storage such as `/private/tmp` or another restricted operator workspace.
 
 The existing pretty JSON files in `testdata/policy-trace/` are schema examples. They are intentionally useful for schema compatibility, but they are not the replay corpus gate because they are hand-authored examples rather than current-policy output.
 
@@ -16,7 +16,7 @@ Run the replay gate with:
 cargo run -p score-simulator -- --input testdata/policy-trace/v1-replay-corpus.jsonl
 ```
 
-The May 9, 2026 local run passed with one trace decision, zero dropped trace records, one current-policy reproduction pass, and zero reproduction failures.
+The May 9, 2026 local run passed with four trace decisions, zero dropped trace records, four current-policy reproduction passes, and zero reproduction failures. The corpus includes exempt, not-bannable, ban, prior-session carryover, offence-history, and non-default policy-input cases.
 
 For a live local or Kubernetes capture, keep the raw file untracked and use the same command shape:
 

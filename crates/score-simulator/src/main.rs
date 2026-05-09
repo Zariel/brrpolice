@@ -1393,6 +1393,62 @@ mod tests {
     }
 
     #[test]
+    fn committed_replay_corpus_reproduces_and_covers_key_cases() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let raw = include_str!("../../../testdata/policy-trace/v1-replay-corpus.jsonl");
+
+        process_reader(
+            &config,
+            Cursor::new(raw),
+            "corpus".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.lines_decision, 4);
+        assert_eq!(summary.reproduction_passes, 4);
+        assert_eq!(summary.reproduction_failures, 0);
+        assert_eq!(summary.actual_bans, 1);
+        assert!(summary.reproduction_problems.is_empty());
+
+        let records = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            records.iter().any(|record| {
+                record["decision_output"]["disposition"]["disposition"] == "exempt"
+            })
+        );
+        assert!(records.iter().any(|record| {
+            record["decision_output"]["disposition"]["disposition"] == "not_bannable_yet"
+        }));
+        assert!(
+            records
+                .iter()
+                .any(|record| { record["decision_output"]["disposition"]["disposition"] == "ban" })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| !record["prior_session"].is_null())
+        );
+        assert!(records.iter().any(|record| {
+            record["guardrail_inputs"]["offence_history"]["offence_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        }));
+        assert!(records.iter().any(|record| {
+            record["policy_inputs"]["score"]["ban_threshold"]
+                .as_f64()
+                .is_some_and(|threshold| (threshold - 1.6).abs() > f64::EPSILON)
+        }));
+    }
+
+    #[test]
     fn trace_reader_rejects_operator_logs() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
         let mut state = super::ReplayState::default();
