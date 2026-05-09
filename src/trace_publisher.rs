@@ -123,11 +123,10 @@ impl PolicyTracePublisher {
             }
         }
 
-        let payload = serde_json::to_string(record)?;
-        Ok(self.publish_serialized(record, payload))
+        Ok(self.publish_record(record))
     }
 
-    fn publish_serialized(&self, record: &PolicyTraceRecord, payload: String) -> PublishOutcome {
+    fn publish_record(&self, record: &PolicyTraceRecord) -> PublishOutcome {
         let mut clients = self.clients.lock().expect("trace client lock poisoned");
         prune_closed_clients(&mut clients);
         if clients.is_empty() {
@@ -140,7 +139,7 @@ impl PolicyTracePublisher {
             if !client.filter.matches(record) {
                 return true;
             }
-            match client.tx.try_send(payload.clone()) {
+            match client.tx.try_send(record.clone()) {
                 Ok(()) => {
                     delivered += 1;
                     true
@@ -174,7 +173,7 @@ impl PolicyTracePublisher {
 #[derive(Debug)]
 struct TraceClient {
     id: u64,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<PolicyTraceRecord>,
     dropped: u64,
     filter: TraceSubscriptionFilter,
 }
@@ -227,7 +226,7 @@ impl TraceSubscriptionFilter {
 #[derive(Debug)]
 pub struct PolicyTraceSubscription {
     pub client_id: u64,
-    pub receiver: mpsc::Receiver<String>,
+    pub receiver: mpsc::Receiver<PolicyTraceRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,9 +299,7 @@ mod tests {
             }
         );
 
-        let payload = subscription.receiver.recv().await.unwrap();
-        let decoded: PolicyTraceRecord = serde_json::from_str(&payload).unwrap();
-        assert_eq!(decoded, record);
+        assert_eq!(subscription.receiver.recv().await.unwrap(), record);
     }
 
     #[test]

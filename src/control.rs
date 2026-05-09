@@ -8,14 +8,14 @@ use tracing::{debug, info, warn};
 
 use crate::{
     backoff::jittered_exponential_backoff,
-    config::{AppConfig, DebugPolicyTraceConfig},
+    config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
     policy::PolicyEngine,
     policy_trace::{
         POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, PolicyTraceRecordType, TraceDecisionOutput,
-        TraceGuardrailInputs, TraceOffenceHistory, TracePeer, TracePeerSessionState,
-        TracePolicyInputs, TraceSimulatorHints, duration_millis, trace_timestamp,
+        TraceGuardrailInputs, TraceOffenceHistory, TracePeer, TracePolicyInputs,
+        TraceSimulatorHints, duration_millis, trace_timestamp,
     },
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
@@ -698,7 +698,7 @@ impl ControlLoop {
             return;
         }
 
-        let mut record = PolicyTraceRecord {
+        let record = PolicyTraceRecord {
             record_type: PolicyTraceRecordType::PeerObservation,
             schema_version: POLICY_TRACE_SCHEMA_VERSION,
             observed_at: trace_timestamp(trace.observed_at),
@@ -750,8 +750,6 @@ impl ControlLoop {
                 &self.config.policy,
             ),
         };
-
-        apply_trace_redaction(&mut record, &self.config.debug.policy_trace);
 
         if let Err(error) = self.trace_publisher.publish(&record) {
             warn!(error = ?error, "failed to publish policy trace record");
@@ -1343,34 +1341,6 @@ fn trace_policy_record_id(
     )
 }
 
-fn apply_trace_redaction(record: &mut PolicyTraceRecord, config: &DebugPolicyTraceConfig) {
-    if config.redact_torrent_name {
-        record.torrent.name = None;
-    }
-
-    if !config.redact_peer_ip {
-        return;
-    }
-
-    record.peer.ip = None;
-    redact_trace_session(&mut record.evaluated_session);
-    if let Some(prior_session) = &mut record.prior_session {
-        redact_trace_session(prior_session);
-    }
-    record.simulator_hints.peer_observation_identity.peer_ip = None;
-    record.simulator_hints.peer_behaviour_identity.peer_ip = None;
-    if let crate::policy_trace::TraceBanDisposition::Ban { decision } =
-        &mut record.decision_output.disposition
-    {
-        decision.peer_ip = None;
-    }
-}
-
-fn redact_trace_session(session: &mut TracePeerSessionState) {
-    session.observation_id.peer_ip = None;
-    session.offence_identity.peer_ip = None;
-}
-
 async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
     loop {
         match shutdown.changed().await {
@@ -1461,7 +1431,7 @@ mod tests {
         metrics::AppMetrics,
         persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence},
         policy::PolicyEngine,
-        policy_trace::{PolicyTraceRecord, TraceBanDisposition},
+        policy_trace::TraceBanDisposition,
         runtime::ServiceState,
         trace_publisher::PolicyTracePublisher,
         types::{OffenceIdentity, PeerObservationId, PeerSessionState},
@@ -2145,7 +2115,6 @@ mod tests {
                 durations: vec![Duration::from_secs(3600)],
             },
         };
-        config.debug.policy_trace.redact_peer_ip = true;
         let config = Arc::new(config);
         let qbittorrent = Arc::new(
             crate::qbittorrent::QbittorrentClient::new(
@@ -2210,25 +2179,29 @@ mod tests {
                 .last_ban_decision_at
                 .is_some()
         );
-        let trace_payload = trace_subscription.receiver.try_recv().unwrap();
-        let trace: PolicyTraceRecord = serde_json::from_str(&trace_payload).unwrap();
+        let trace = trace_subscription.receiver.try_recv().unwrap();
         assert_eq!(trace.torrent.hash, "abc123");
-        assert_eq!(trace.torrent.name, None);
-        assert_eq!(trace.peer.ip, None);
+        assert_eq!(trace.torrent.name.as_deref(), Some("Example"));
+        assert_eq!(trace.peer.ip, Some("10.0.0.10".parse().unwrap()));
         assert!(trace.prior_session.is_some());
         assert_eq!(
             trace.prior_session.as_ref().unwrap().observation_id.peer_ip,
-            None
+            Some("10.0.0.10".parse().unwrap())
         );
-        assert_eq!(trace.evaluated_session.observation_id.peer_ip, None);
+        assert_eq!(
+            trace.evaluated_session.observation_id.peer_ip,
+            Some("10.0.0.10".parse().unwrap())
+        );
         assert_eq!(
             trace.simulator_hints.peer_observation_identity.peer_ip,
-            None
+            Some("10.0.0.10".parse().unwrap())
         );
         assert_eq!(trace.evaluated_session.latest_progress, 0.1005);
         assert_eq!(trace.guardrail_inputs.offence_history.offence_count, 0);
         match &trace.decision_output.disposition {
-            TraceBanDisposition::Ban { decision } => assert_eq!(decision.peer_ip, None),
+            TraceBanDisposition::Ban { decision } => {
+                assert_eq!(decision.peer_ip, Some("10.0.0.10".parse().unwrap()));
+            }
             other => panic!("expected ban disposition, got {other:?}"),
         }
 
