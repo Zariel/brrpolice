@@ -5,6 +5,7 @@ pub mod http;
 pub mod metrics;
 pub mod persistence;
 pub mod policy;
+pub mod policy_trace;
 pub mod qbittorrent;
 pub mod runtime;
 pub mod types;
