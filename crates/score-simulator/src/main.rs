@@ -66,7 +66,6 @@ struct SimulatorConfig {
     inputs: Vec<PathBuf>,
     policy: PolicyConfig,
     peer_ip: Option<IpAddr>,
-    hydrate_logged_score_state: bool,
 }
 
 impl Default for SimulatorConfig {
@@ -76,7 +75,6 @@ impl Default for SimulatorConfig {
             inputs: Vec::new(),
             policy,
             peer_ip: None,
-            hydrate_logged_score_state: true,
         }
     }
 }
@@ -789,9 +787,6 @@ fn parse_args(args: Vec<String>) -> Result<SimulatorConfig> {
                         .with_context(|| format!("invalid peer IP `{value}`"))?,
                 );
             }
-            "--recompute-score" => {
-                config.hydrate_logged_score_state = false;
-            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -866,7 +861,11 @@ fn parse_f64_arg(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<f6
 
 fn print_help() {
     println!("Usage:");
-    println!("  score-simulator --input <path> [--input <path> ...] [options]");
+    println!("  score-simulator --input <trace.jsonl> [--input <trace.jsonl> ...] [options]");
+    println!();
+    println!("Input:");
+    println!("  Each input must be ADR-0004 policy trace JSONL with schema_version=1 records.");
+    println!("  Legacy structured operator logs are rejected.");
     println!();
     println!("Options:");
     println!("  --target-rate-bps <n>            Upload target for rate-risk");
@@ -890,9 +889,6 @@ fn print_help() {
     println!("  --churn-max-amplifier <f>        Maximum churn amplifier added to sample risk");
     println!("  --churn-decay-per-second <f>     Churn amplifier decay rate");
     println!("  --peer-ip <ip>                   Optional peer IP filter");
-    println!(
-        "  --recompute-score                Recompute score instead of hydrating logged score state"
-    );
 }
 
 #[cfg(test)]
@@ -954,14 +950,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_supports_recompute_score_flag() {
+    fn parse_args_rejects_legacy_recompute_score_flag() {
         let args = vec![
             "--input".to_string(),
             "one.jsonl".to_string(),
             "--recompute-score".to_string(),
         ];
-        let config = parse_args(args).expect("expected args to parse");
-        assert!(!config.hydrate_logged_score_state);
+        let error = parse_args(args).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown argument `--recompute-score`"));
     }
 
     #[test]
