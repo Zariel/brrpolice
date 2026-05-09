@@ -15,8 +15,9 @@ use brrpolice::{
     config::{FiltersConfig, PolicyConfig},
     policy::PolicyEngine,
     policy_trace::{
-        POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceExemptionReason,
-        TracePeerBehaviourIdentity, TracePeerObservationIdentity, TracePeerSessionState,
+        POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceDecisionOutput,
+        TraceExemptionReason, TracePeerBehaviourIdentity, TracePeerObservationIdentity,
+        TracePeerSessionState, TracePolicyInputs,
     },
     types::{
         BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
@@ -91,6 +92,8 @@ struct ActiveBanKey {
 struct Summary {
     lines_total: u64,
     lines_decision: u64,
+    reproduction_passes: u64,
+    reproduction_failures: u64,
     peers_seen: u64,
     simulated_bans: u64,
     actual_bans: u64,
@@ -99,6 +102,24 @@ struct Summary {
     churn_max_amplifier: f64,
     churn_max_reconnect_count: u32,
     dropped_trace_records: u64,
+    reproduction_problems: Vec<String>,
+}
+
+impl Summary {
+    fn record_reproduction_pass(&mut self) {
+        self.reproduction_passes += 1;
+    }
+
+    fn record_reproduction_problem(&mut self, problem: String) {
+        self.reproduction_failures += 1;
+        if self.reproduction_problems.len() < 20 {
+            self.reproduction_problems.push(problem);
+        }
+    }
+
+    fn has_reproduction_failures(&self) -> bool {
+        self.reproduction_failures > 0 || self.dropped_trace_records > 0
+    }
 }
 
 #[derive(Default)]
@@ -130,6 +151,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
 
     print_summary(&config, &summary, &state);
+    if summary.has_reproduction_failures() {
+        bail!(
+            "current-policy reproduction failed: {} failures across {} trace records, {} dropped trace records",
+            summary.reproduction_failures,
+            summary.lines_decision,
+            summary.dropped_trace_records
+        );
+    }
     Ok(())
 }
 
@@ -153,11 +182,25 @@ fn process_reader<R: BufRead>(
             .with_context(|| format!("parsing line {} from `{source_name}`", index + 1))?
         {
             TraceInputLine::PeerObservation(record) => {
-                process_trace_record(policy, config, *record, state, summary)?;
+                process_trace_record(
+                    policy,
+                    config,
+                    *record,
+                    TraceLineContext {
+                        source_name: &source_name,
+                        line_number: index + 1,
+                    },
+                    state,
+                    summary,
+                )?;
             }
             TraceInputLine::DroppedRecords { dropped_count } => {
                 summary.dropped_trace_records =
                     summary.dropped_trace_records.saturating_add(dropped_count);
+                summary.record_reproduction_problem(format!(
+                    "{source_name}:{} dropped_records notice reported {dropped_count} missing trace records",
+                    index + 1
+                ));
             }
         }
     }
@@ -168,6 +211,11 @@ fn process_reader<R: BufRead>(
 enum TraceInputLine {
     PeerObservation(Box<PolicyTraceRecord>),
     DroppedRecords { dropped_count: u64 },
+}
+
+struct TraceLineContext<'a> {
+    source_name: &'a str,
+    line_number: usize,
 }
 
 fn parse_trace_line(line: &str) -> Result<TraceInputLine> {
@@ -203,6 +251,7 @@ fn process_trace_record(
     policy: &PolicyEngine,
     config: &SimulatorConfig,
     record: PolicyTraceRecord,
+    line_context: TraceLineContext<'_>,
     state: &mut ReplayState,
     summary: &mut Summary,
 ) -> Result<()> {
@@ -294,7 +343,17 @@ fn process_trace_record(
     summary.churn_max_reconnect_count = summary
         .churn_max_reconnect_count
         .max(evaluation.session.churn_reconnect_count);
-    match policy.decide_ban(&peer_context, &evaluation, &history) {
+    let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
+    check_current_policy_reproduction(
+        config,
+        &record,
+        &evaluation,
+        &disposition,
+        summary,
+        line_context,
+    );
+
+    match &disposition {
         BanDisposition::Ban(decision) => {
             summary.simulated_bans += 1;
             if evaluation.session.churn_amplifier > 0.0 {
@@ -357,6 +416,73 @@ fn validate_required_trace_fields(record: &PolicyTraceRecord) -> Result<()> {
         bail!("trace record missing config_fingerprint");
     }
     Ok(())
+}
+
+fn check_current_policy_reproduction(
+    config: &SimulatorConfig,
+    record: &PolicyTraceRecord,
+    evaluation: &brrpolice::types::PeerEvaluation,
+    disposition: &BanDisposition,
+    summary: &mut Summary,
+    line_context: TraceLineContext<'_>,
+) {
+    let replayed_policy_inputs = TracePolicyInputs::from(&config.policy);
+    let replayed_session = TracePeerSessionState::from(&evaluation.session);
+    let replayed_decision_output =
+        TraceDecisionOutput::from_evaluation_and_disposition(evaluation, disposition);
+
+    let mut mismatches = Vec::new();
+    if record.policy_inputs != replayed_policy_inputs {
+        mismatches.push(format!(
+            "policy_inputs recorded={} replayed={}",
+            abbrev_debug(&record.policy_inputs),
+            abbrev_debug(&replayed_policy_inputs)
+        ));
+    }
+    if record.evaluated_session != replayed_session {
+        mismatches.push(format!(
+            "evaluated_session recorded={} replayed={}",
+            abbrev_debug(&record.evaluated_session),
+            abbrev_debug(&replayed_session)
+        ));
+    }
+    if record.decision_output != replayed_decision_output {
+        mismatches.push(format!(
+            "decision_output recorded={} replayed={}",
+            abbrev_debug(&record.decision_output),
+            abbrev_debug(&replayed_decision_output)
+        ));
+    }
+
+    if mismatches.is_empty() {
+        summary.record_reproduction_pass();
+        return;
+    }
+
+    summary.record_reproduction_problem(format!(
+        "{}:{} trace_id={} torrent_hash={} peer={}:{} mismatches: {}",
+        line_context.source_name,
+        line_context.line_number,
+        record.policy_trace_id,
+        record.torrent.hash,
+        record
+            .peer
+            .ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "<redacted>".to_string()),
+        record.peer.port,
+        mismatches.join("; ")
+    ));
+}
+
+fn abbrev_debug<T: std::fmt::Debug>(value: &T) -> String {
+    const LIMIT: usize = 320;
+    let rendered = format!("{value:?}");
+    if rendered.len() <= LIMIT {
+        rendered
+    } else {
+        format!("{}...", rendered.chars().take(LIMIT).collect::<String>())
+    }
 }
 
 fn record_recorded_ban(
@@ -516,10 +642,12 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         println!("peer_filter_ip={peer_ip}");
     }
     println!(
-        "lines_total={} decision_lines={} dropped_trace_records={} peers_seen={} simulated_bans={} actual_bans={} simulated_bans_with_churn={} churn_samples={} churn_max_amplifier={:.4} churn_max_reconnect_count={}",
+        "lines_total={} decision_lines={} dropped_trace_records={} reproduction_passes={} reproduction_failures={} peers_seen={} simulated_bans={} actual_bans={} simulated_bans_with_churn={} churn_samples={} churn_max_amplifier={:.4} churn_max_reconnect_count={}",
         summary.lines_total,
         summary.lines_decision,
         summary.dropped_trace_records,
+        summary.reproduction_passes,
+        summary.reproduction_failures,
         summary.peers_seen,
         summary.simulated_bans,
         summary.actual_bans,
@@ -528,6 +656,9 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         summary.churn_max_amplifier,
         summary.churn_max_reconnect_count
     );
+    for problem in &summary.reproduction_problems {
+        println!("reproduction_failure {problem}");
+    }
 
     let mut interesting: Vec<(&SessionKey, &u32)> = state
         .ban_events
@@ -766,10 +897,23 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::PathBuf};
+    use std::{
+        io::Cursor,
+        net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     use super::{Summary, parse_args, process_reader};
-    use brrpolice::policy::PolicyEngine;
+    use brrpolice::{
+        policy::PolicyEngine,
+        policy_trace::{
+            POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, PolicyTraceRecordType,
+            TraceDecisionOutput, TraceGuardrailInputs, TraceOffenceHistory, TracePeer,
+            TracePolicyInputs, TraceSimulatorHints, TraceTorrent, trace_timestamp,
+        },
+        types::{OffenceHistory, PeerContext, PeerSnapshot, TorrentScope},
+    };
 
     #[test]
     fn parse_args_supports_multiple_inputs() {
@@ -852,9 +996,37 @@ mod tests {
 
         assert_eq!(summary.lines_total, 3);
         assert_eq!(summary.lines_decision, 3);
+        assert_eq!(
+            summary.reproduction_passes + summary.reproduction_failures,
+            3
+        );
         assert_eq!(summary.actual_bans, 1);
         assert_eq!(summary.peers_seen, 1);
         assert!(state.sessions.len() >= 3);
+    }
+
+    #[test]
+    fn trace_reader_passes_current_policy_reproduction_for_engine_trace() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let record = replayable_trace_record(&config, &policy);
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let replay = Cursor::new(format!("{}\n", serde_json::to_string(&record).unwrap()));
+
+        process_reader(
+            &policy,
+            &config,
+            replay,
+            "generated".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 1);
+        assert_eq!(summary.reproduction_failures, 0);
+        assert!(summary.reproduction_problems.is_empty());
     }
 
     #[test]
@@ -903,6 +1075,135 @@ mod tests {
         assert_eq!(summary.lines_total, 1);
         assert_eq!(summary.lines_decision, 0);
         assert_eq!(summary.dropped_trace_records, 7);
+        assert_eq!(summary.reproduction_failures, 1);
+        assert!(summary.reproduction_problems[0].contains("dropped_records notice"));
+    }
+
+    #[test]
+    fn trace_reader_reports_policy_input_mismatches() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../testdata/policy-trace/v1-not-bannable-peer.json"
+        ))
+        .unwrap();
+        fixture["policy_inputs"]["score"]["target_rate_bps"] = serde_json::json!(1);
+        let replay = Cursor::new(format!("{}\n", serde_json::to_string(&fixture).unwrap()));
+
+        process_reader(
+            &policy,
+            &config,
+            replay,
+            "mismatch".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 0);
+        assert_eq!(summary.reproduction_failures, 1);
+        assert!(summary.reproduction_problems[0].contains("policy_inputs"));
+        assert!(summary.reproduction_problems[0].contains("torrent_hash="));
+    }
+
+    #[test]
+    fn run_fails_when_reproduction_gate_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "score-simulator-dropped-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(
+            &path,
+            "{\"record_type\":\"dropped_records\",\"schema_version\":1,\"client_id\":1,\"dropped_count\":1}\n",
+        )
+        .unwrap();
+
+        let result = super::run(vec!["--input".into(), path.display().to_string()]);
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("current-policy reproduction failed")
+        );
+    }
+
+    fn replayable_trace_record(
+        config: &super::SimulatorConfig,
+        policy: &PolicyEngine,
+    ) -> PolicyTraceRecord {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        let torrent = TorrentScope {
+            hash: "generated-trace".to_string(),
+            name: "generated.iso".to_string(),
+            tracker: Some("tracker.example".to_string()),
+            category: Some("linux".to_string()),
+            tags: vec!["public".to_string()],
+            total_seeders: config.policy.min_total_seeders.max(1),
+            in_scope: true,
+        };
+        let peer = PeerSnapshot {
+            ip: peer_ip,
+            port: 51413,
+            progress: 0.97,
+            up_rate_bps: 0,
+        };
+        let peer_context = PeerContext {
+            torrent: torrent.clone(),
+            peer: peer.clone(),
+            first_seen_at: observed_at,
+            observed_at,
+            has_active_ban: false,
+        };
+        let evaluation = policy.evaluate_peer(&peer_context, None);
+        let history = OffenceHistory {
+            offence_count: 0,
+            last_ban_expires_at: None,
+        };
+        let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
+
+        PolicyTraceRecord {
+            record_type: PolicyTraceRecordType::PeerObservation,
+            schema_version: POLICY_TRACE_SCHEMA_VERSION,
+            observed_at: trace_timestamp(observed_at),
+            service_version: "0.1.0-test".to_string(),
+            policy_trace_id: "generated-trace-1".to_string(),
+            config_fingerprint: "generated-fingerprint".to_string(),
+            torrent: TraceTorrent::from(&torrent),
+            peer: TracePeer {
+                ip: Some(peer.ip),
+                port: peer.port,
+                progress: peer.progress,
+                up_rate_bps: peer.up_rate_bps,
+            },
+            prior_session: None,
+            evaluated_session: (&evaluation.session).into(),
+            policy_inputs: TracePolicyInputs::from(&config.policy),
+            guardrail_inputs: TraceGuardrailInputs {
+                exemption_reason: evaluation
+                    .session
+                    .last_exemption_reason
+                    .as_ref()
+                    .map(Into::into),
+                allowlisted_peer: matches!(
+                    evaluation.session.last_exemption_reason,
+                    Some(brrpolice::types::ExemptionReason::AllowlistedPeer)
+                ),
+                active_ban: matches!(
+                    evaluation.session.last_exemption_reason,
+                    Some(brrpolice::types::ExemptionReason::AlreadyBanned)
+                ),
+                reban_cooldown_remaining_ms: None,
+                offence_history: TraceOffenceHistory::from(&history),
+            },
+            decision_output: TraceDecisionOutput::from_evaluation_and_disposition(
+                &evaluation,
+                &disposition,
+            ),
+            simulator_hints: TraceSimulatorHints::from_evaluation(&evaluation, &config.policy),
+        }
     }
 
     fn fixture_line(raw: &str) -> String {
