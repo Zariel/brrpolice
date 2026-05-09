@@ -292,6 +292,8 @@ The output keeps replay fidelity separate from policy research deltas:
 
 Future scoring-policy ADRs should use reproduced trace corpora as their evidence pipeline. Operator logs are no longer supported as policy-research replay input.
 
+The local sanitized corpus check and command history are recorded in [`docs/adr-0004-trace-corpus.md`](docs/adr-0004-trace-corpus.md).
+
 ## Grafana Dashboard
 
 Import [`dashboards/grafana/brrpolice-overview.json`](dashboards/grafana/brrpolice-overview.json) into Grafana to get a starter operational dashboard for brrpolice metrics.
