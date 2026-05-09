@@ -258,6 +258,19 @@ cargo run -p score-simulator -- --input policy-trace.jsonl
 
 Do not expose `/debug/policy-trace/stream` through public ingress. If a Kubernetes Service is used, keep it internal-only and protect it with network policy that limits access to trusted operators. Treat captured `.jsonl` files as sensitive operational data and do not commit them.
 
+## Policy Trace Data Handling
+
+Trace files are sensitive operational data. They can contain peer IPs, torrent names, trackers, categories, tags, torrent hashes, policy inputs, evaluated score state, offence history, active-ban state, and ban reason details. Store ad hoc captures in a local untracked path, restrict file permissions, and delete them when the research task is complete.
+
+Redaction and capture choices trade replay usefulness against privacy:
+
+- `debug.policy_trace.redact_peer_ip = true` removes peer IPs from peer fields, session identities, simulator hints, and ban decisions. This is useful for inspection, but it makes the trace unreplayable because the simulator needs peer IPs to rebuild observation and offence identities.
+- `debug.policy_trace.redact_torrent_name = true` removes torrent names while preserving torrent hashes and policy state. This is the safer default and still allows simulator replay.
+- `include_names=true` should be used only for short, local captures where torrent names are necessary for diagnosis. It cannot be treated as safe for broad collection, and it must not bypass configured redaction policy.
+- Local-only storage is preferred for ad hoc research. Do not send traces to default log aggregation, object storage, issue trackers, or public paste tools.
+
+Do not use public ingress as a trace transport. Use `kubectl port-forward` or a tightly scoped internal debug Service protected by network policy.
+
 ## Simulator Trace Replay
 
 `score-simulator` consumes ADR-0004 policy trace JSONL, not ordinary structured operator logs:
