@@ -1,0 +1,135 @@
+{
+  "record_type": "peer_observation",
+  "schema_version": 1,
+  "observed_at": "2023-11-14T22:13:20.000Z",
+  "service_version": "0.1.0-test",
+  "policy_trace_id": "fixture-exempt",
+  "config_fingerprint": "fingerprint-exempt",
+  "torrent": {
+    "hash": "torrent-exempt",
+    "name": null,
+    "tracker": "tracker.example",
+    "total_size_bytes": 1048576,
+    "category": "linux",
+    "tags": ["public"],
+    "total_seeders": 12,
+    "in_scope": true
+  },
+  "peer": {
+    "ip": "198.51.100.10",
+    "port": 51413,
+    "progress": 0.97,
+    "up_rate_bps": 98304
+  },
+  "prior_session": null,
+  "evaluated_session": {
+    "observation_id": {
+      "torrent_hash": "torrent-exempt",
+      "peer_ip": "198.51.100.10",
+      "peer_port": 51413
+    },
+    "offence_identity": {
+      "torrent_hash": "torrent-exempt",
+      "peer_ip": "198.51.100.10"
+    },
+    "first_seen_at": "2023-11-14T22:12:20.000Z",
+    "last_seen_at": "2023-11-14T22:13:20.000Z",
+    "baseline_progress": 0.96,
+    "latest_progress": 0.97,
+    "rolling_avg_up_rate_bps": 98304,
+    "observed_duration_ms": 60000,
+    "bad_duration_ms": 0,
+    "ban_score": 0.0,
+    "ban_score_above_threshold_duration_ms": 0,
+    "churn_reconnect_count": 0,
+    "churn_window_started_at": null,
+    "churn_amplifier": 0.0,
+    "sample_count": 1,
+    "last_torrent_seeder_count": 12,
+    "last_exemption_reason": {
+      "reason_code": "near_complete",
+      "progress": 0.97,
+      "threshold": 0.95
+    },
+    "bannable_since": null,
+    "last_ban_decision_at": null
+  },
+  "policy_inputs": {
+    "new_peer_grace_period_ms": 60000,
+    "decay_window_ms": 3600000,
+    "ignore_peer_progress_at_or_above": 0.95,
+    "min_total_seeders": 3,
+    "reban_cooldown_ms": 1800000,
+    "score": {
+      "target_rate_bps": 65536,
+      "required_progress_delta": 0.02,
+      "progress_rate_scale_start": 2.0,
+      "progress_rate_scale_end": 16.0,
+      "progress_rate_min_scale": 0.25,
+      "weight_rate": 0.35,
+      "weight_progress": 0.65,
+      "rate_risk_floor": 0.4,
+      "ban_threshold": 1.6,
+      "clear_threshold": 0.8,
+      "sustain_duration_ms": 120000,
+      "decay_per_second": 0.02,
+      "min_observation_duration_ms": 120000,
+      "max_score": 5.0,
+      "churn_enabled": true,
+      "churn_reconnect_window_ms": 1800000,
+      "churn_min_reconnects": 2,
+      "churn_max_amplifier": 1.0,
+      "churn_decay_per_second": 0.002
+    },
+    "ban_ladder_duration_ms": [3600000, 21600000, 86400000, 604800000]
+  },
+  "guardrail_inputs": {
+    "exemption_reason": {
+      "reason_code": "near_complete",
+      "progress": 0.97,
+      "threshold": 0.95
+    },
+    "allowlisted_peer": false,
+    "active_ban": false,
+    "reban_cooldown_remaining_ms": null,
+    "offence_history": {
+      "offence_count": 0,
+      "last_ban_expires_at": null
+    }
+  },
+  "decision_output": {
+    "disposition": {
+      "disposition": "exempt",
+      "reason": {
+        "reason_code": "near_complete",
+        "progress": 0.97,
+        "threshold": 0.95
+      }
+    },
+    "is_bad_sample": false,
+    "is_bannable": false,
+    "progress_delta": 0.01,
+    "sample_score_risk": 0.0,
+    "effective_sample_score_risk": 0.0
+  },
+  "simulator_hints": {
+    "peer_observation_identity": {
+      "torrent_hash": "torrent-exempt",
+      "peer_ip": "198.51.100.10",
+      "peer_port": 51413
+    },
+    "peer_behaviour_identity": {
+      "torrent_hash": "torrent-exempt",
+      "peer_ip": "198.51.100.10"
+    },
+    "sample_duration_ms": 60000,
+    "sample_up_rate_bps": 98304,
+    "current_rate_band": {
+      "band": "meets_target",
+      "up_rate_bps": 98304,
+      "target_rate_bps": 65536,
+      "target_ratio": 1.5
+    },
+    "band_at_ban": null
+  }
+}

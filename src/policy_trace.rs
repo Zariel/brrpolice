@@ -564,6 +564,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schema_v1_fixtures_are_stable() {
+        assert_fixture(
+            include_str!("../testdata/policy-trace/v1-exempt-peer.json"),
+            "peer_observation",
+            "exempt",
+        );
+        assert_fixture(
+            include_str!("../testdata/policy-trace/v1-not-bannable-peer.json"),
+            "peer_observation",
+            "not_bannable_yet",
+        );
+        assert_fixture(
+            include_str!("../testdata/policy-trace/v1-ban-decision.json"),
+            "peer_observation",
+            "ban",
+        );
+    }
+
+    fn assert_fixture(raw: &str, record_type: &str, disposition: &str) {
+        let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(expected["schema_version"], POLICY_TRACE_SCHEMA_VERSION);
+        assert_eq!(expected["record_type"], record_type);
+        assert_eq!(
+            expected["decision_output"]["disposition"]["disposition"],
+            disposition
+        );
+
+        let record: PolicyTraceRecord = serde_json::from_value(expected.clone()).unwrap();
+        let actual = serde_json::to_value(record).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
     fn sample_session(last_seen_at: std::time::SystemTime) -> PeerSessionState {
         let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
         PeerSessionState {
