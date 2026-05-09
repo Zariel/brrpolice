@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/score-simulator"]
-default-members = ["."]
+default-members = [".", "crates/score-simulator"]
 
 [package]
 name = "brrpolice"

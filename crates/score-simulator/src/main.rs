@@ -62,23 +62,12 @@ impl OffenceKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SimulatorConfig {
     inputs: Vec<PathBuf>,
     candidate_policy: PolicyConfig,
     candidate_overrides: Vec<PolicyOverride>,
     peer_ip: Option<IpAddr>,
-}
-
-impl Default for SimulatorConfig {
-    fn default() -> Self {
-        Self {
-            inputs: Vec::new(),
-            candidate_policy: PolicyConfig::default(),
-            candidate_overrides: Vec::new(),
-            peer_ip: None,
-        }
-    }
 }
 
 impl SimulatorConfig {
