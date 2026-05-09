@@ -292,7 +292,7 @@ The output keeps replay fidelity separate from policy research deltas:
 
 Future scoring-policy ADRs should use reproduced trace corpora as their evidence pipeline. Operator logs are no longer supported as policy-research replay input.
 
-The local sanitized corpus check and command history are recorded in [`docs/adr-0004-trace-corpus.md`](docs/adr-0004-trace-corpus.md).
+The local sanitized corpus check and command history are recorded in [`docs/adr-0004-trace-corpus.md`](docs/adr-0004-trace-corpus.md). The final ADR-0004 rollout gate evidence is recorded in [`docs/adr-0004-rollout-verification.md`](docs/adr-0004-rollout-verification.md).
 
 ## Grafana Dashboard
 
