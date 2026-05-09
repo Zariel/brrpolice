@@ -125,6 +125,81 @@ For peer observation records, include:
 The first implementation may emit a compact schema, but it must preserve replay-critical state.
 Fields may be added in later schema versions, but existing field meanings must not change silently.
 
+### Schema Version 1 Semantics
+
+`schema_version = 1` records are replay records, not operator logs. Field names and meanings are
+part of the simulator contract; adding optional fields is acceptable, but changing the meaning,
+unit, identity scope, or enum semantics of an existing field requires a new schema version.
+
+Top-level metadata:
+
+- `record_type` is `peer_observation` for policy evaluation records.
+- `observed_at` is the evaluation timestamp in RFC3339 form.
+- `service_version` identifies the producing `brrpolice` build.
+- `policy_trace_id` is a stable per-record identifier for diagnostics.
+- `config_fingerprint` identifies the full runtime policy/config surface used by production.
+
+Identity and observation fields:
+
+- `torrent.hash` is the replay identity for the torrent. `torrent.name`, `tracker`, `category`,
+  `tags`, and `total_size_bytes` are operational context and may be redacted or absent where noted.
+- `torrent.total_seeders` and `torrent.in_scope` are policy inputs, not display-only metadata.
+- `peer.ip`, `peer.port`, `peer.progress`, and `peer.up_rate_bps` are the peer observation passed
+  to policy evaluation. `peer.ip` may be `null` only when peer-IP redaction is enabled; redacted
+  records are not simulator-replayable because offence and observation identities require IP.
+
+Session state:
+
+- `prior_session` is the persisted or carry-over session state used as input to evaluation. It is
+  `null` for a first observation with no carry-over.
+- `evaluated_session` is the session state immediately after evaluation and before any later
+  persistence side effects outside policy evaluation.
+- `observation_id` is `torrent_hash + peer_ip + peer_port` and tracks the connected endpoint.
+- `offence_identity` is `torrent_hash + peer_ip` and intentionally ignores peer port so reconnects
+  on a new port preserve behaviour history.
+- Duration fields use milliseconds. Timestamp fields use RFC3339 strings. Floating-point score and
+  progress fields are serialized as JSON numbers and should be compared by the simulator as the
+  trace contract defines for the current implementation.
+
+Policy and guardrail inputs:
+
+- `policy_inputs` records the policy values needed to reproduce scoring: grace period, decay
+  window, near-complete threshold, minimum seeder count, re-ban cooldown, score settings, churn
+  settings, and ban ladder durations.
+- `guardrail_inputs.exemption_reason` records the exemption classified during evaluation, if any.
+- `guardrail_inputs.allowlisted_peer`, `active_ban`, `reban_cooldown_remaining_ms`, and
+  `offence_history` capture the non-score guardrails used to decide whether a bannable peer can be
+  acted on.
+
+Decision output:
+
+- `decision_output.disposition` is the final policy disposition: exempt, not bannable yet,
+  re-ban cooldown, duplicate suppressed, or ban.
+- Ban dispositions include selected peer endpoint, offence number, TTL in milliseconds, reason
+  code, and reason details.
+- `is_bad_sample`, `is_bannable`, `progress_delta`, `sample_score_risk`, and
+  `effective_sample_score_risk` are the evaluated scoring outputs used for reproduction and
+  candidate-policy comparison.
+
+Simulator hints:
+
+- `peer_observation_identity` and `peer_behaviour_identity` repeat the exact identities the
+  simulator should use when rebuilding replay state.
+- `sample_duration_ms` and `sample_up_rate_bps` capture the sample window used by the policy
+  engine.
+- `current_rate_band` describes the observed rate band for the sample; `band_at_ban` is present
+  when the record reached a bannable state.
+
+Redaction:
+
+- `redact_torrent_name` removes torrent names but keeps replay-critical hashes, tracker/category/tag
+  fields, and policy state.
+- `redact_peer_ip` clears peer IPs from peer, session identity, simulator hint identity, and ban
+  decision fields. Use it only for non-replay inspection because the simulator rejects IP-redacted
+  traces.
+- Trace files remain sensitive even with redaction because they can include torrent hashes,
+  trackers, categories, tags, policy state, offence history, and active-ban state.
+
 ## Replay Contract
 
 The simulator must move to a trace-input model that consumes policy trace JSONL. The existing
