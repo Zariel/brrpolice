@@ -1312,8 +1312,8 @@ mod tests {
 
     use crate::{
         config::{
-            AppConfig, BanLadderConfig, DatabaseConfig, FiltersConfig, HttpConfig, LoggingConfig,
-            PolicyConfig, QbittorrentConfig, RetentionConfig,
+            AppConfig, BanLadderConfig, DatabaseConfig, DebugConfig, FiltersConfig, HttpConfig,
+            LoggingConfig, PolicyConfig, QbittorrentConfig, RetentionConfig,
         },
         metrics::AppMetrics,
         persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence},
@@ -2491,6 +2491,7 @@ mod tests {
                 level: "info".to_string(),
                 format: "plain".to_string(),
             },
+            debug: DebugConfig::default(),
         }
     }
 

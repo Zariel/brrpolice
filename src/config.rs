@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub http: HttpConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 impl AppConfig {
@@ -98,6 +100,14 @@ impl AppConfig {
             .set_default("http.port", 9090_u16)?
             .set_default("logging.level", "warn")?
             .set_default("logging.format", "json")?
+            .set_default("debug.policy_trace.enabled", false)?
+            .set_default("debug.policy_trace.host", "127.0.0.1")?
+            .set_default("debug.policy_trace.port", 9091_u16)?
+            .set_default("debug.policy_trace.max_clients", 1_u32)?
+            .set_default("debug.policy_trace.max_duration", "10m")?
+            .set_default("debug.policy_trace.default_sample_rate", 1.0_f64)?
+            .set_default("debug.policy_trace.redact_peer_ip", false)?
+            .set_default("debug.policy_trace.redact_torrent_name", true)?
             .add_source(
                 File::new(path.to_string_lossy().as_ref(), FileFormat::Toml).required(require_file),
             )
@@ -182,7 +192,15 @@ impl AppConfig {
                 "http.host={}\n",
                 "http.port={}\n",
                 "logging.level={}\n",
-                "logging.format={}\n"
+                "logging.format={}\n",
+                "debug.policy_trace.enabled={}\n",
+                "debug.policy_trace.host={}\n",
+                "debug.policy_trace.port={}\n",
+                "debug.policy_trace.max_clients={}\n",
+                "debug.policy_trace.max_duration={}\n",
+                "debug.policy_trace.default_sample_rate={:.6}\n",
+                "debug.policy_trace.redact_peer_ip={}\n",
+                "debug.policy_trace.redact_torrent_name={}\n"
             ),
             self.qbittorrent.base_url,
             self.qbittorrent.username,
@@ -243,6 +261,14 @@ impl AppConfig {
             self.http.port,
             self.logging.level,
             self.logging.format,
+            self.debug.policy_trace.enabled,
+            self.debug.policy_trace.host,
+            self.debug.policy_trace.port,
+            self.debug.policy_trace.max_clients,
+            self.debug.policy_trace.max_duration.as_secs(),
+            self.debug.policy_trace.default_sample_rate,
+            self.debug.policy_trace.redact_peer_ip,
+            self.debug.policy_trace.redact_torrent_name,
         )
     }
 
@@ -398,6 +424,20 @@ impl AppConfig {
         self.http.bind_addr()?;
         if self.http.port == 0 {
             bail!("http.port must be between 1 and 65535");
+        }
+        self.debug.policy_trace.bind_addr()?;
+        if self.debug.policy_trace.port == 0 {
+            bail!("debug.policy_trace.port must be between 1 and 65535");
+        }
+        if self.debug.policy_trace.max_clients == 0 {
+            bail!("debug.policy_trace.max_clients must be at least 1");
+        }
+        require_positive_duration(
+            self.debug.policy_trace.max_duration,
+            "debug.policy_trace.max_duration",
+        )?;
+        if !(0.0..=1.0).contains(&self.debug.policy_trace.default_sample_rate) {
+            bail!("debug.policy_trace.default_sample_rate must be between 0.0 and 1.0");
         }
         require_positive_duration(self.database.busy_timeout, "database.busy_timeout")?;
         validate_ip_allowlists(&self.filters)?;
@@ -692,6 +732,48 @@ impl Default for LoggingConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DebugConfig {
+    #[serde(default)]
+    pub policy_trace: DebugPolicyTraceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebugPolicyTraceConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub max_clients: u32,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub max_duration: Duration,
+    pub default_sample_rate: f64,
+    pub redact_peer_ip: bool,
+    pub redact_torrent_name: bool,
+}
+
+impl Default for DebugPolicyTraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".to_string(),
+            port: 9091,
+            max_clients: 1,
+            max_duration: Duration::from_secs(600),
+            default_sample_rate: 1.0,
+            redact_peer_ip: false,
+            redact_torrent_name: true,
+        }
+    }
+}
+
+impl DebugPolicyTraceConfig {
+    pub fn bind_addr(&self) -> Result<SocketAddr> {
+        format!("{}:{}", self.host, self.port)
+            .parse::<SocketAddr>()
+            .context("failed to parse debug.policy_trace.host/debug.policy_trace.port")
+    }
+}
+
 fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -848,6 +930,21 @@ mod tests {
                 Duration::from_secs(604_800)
             ]
         );
+        assert!(!config.debug.policy_trace.enabled);
+        assert_eq!(config.debug.policy_trace.host, "127.0.0.1");
+        assert_eq!(config.debug.policy_trace.port, 9091);
+        assert_eq!(config.debug.policy_trace.max_clients, 1);
+        assert_eq!(
+            config.debug.policy_trace.max_duration,
+            Duration::from_secs(600)
+        );
+        assert_eq!(config.debug.policy_trace.default_sample_rate, 1.0);
+        assert!(!config.debug.policy_trace.redact_peer_ip);
+        assert!(config.debug.policy_trace.redact_torrent_name);
+        assert_eq!(
+            config.debug.policy_trace.bind_addr().unwrap().to_string(),
+            "127.0.0.1:9091"
+        );
     }
 
     #[test]
@@ -921,6 +1018,16 @@ port = 9292
 [logging]
 level = "debug"
 format = "plain"
+
+[debug.policy_trace]
+enabled = true
+host = "127.0.0.1"
+port = 9191
+max_clients = 2
+max_duration = "5m"
+default_sample_rate = 0.25
+redact_peer_ip = true
+redact_torrent_name = false
 "#,
         );
 
@@ -945,6 +1052,21 @@ format = "plain"
             "127.0.0.1:9292"
         );
         assert_eq!(config.logging.format, "plain");
+        assert!(config.debug.policy_trace.enabled);
+        assert_eq!(config.debug.policy_trace.host, "127.0.0.1");
+        assert_eq!(config.debug.policy_trace.port, 9191);
+        assert_eq!(config.debug.policy_trace.max_clients, 2);
+        assert_eq!(
+            config.debug.policy_trace.max_duration,
+            Duration::from_secs(300)
+        );
+        assert_eq!(config.debug.policy_trace.default_sample_rate, 0.25);
+        assert!(config.debug.policy_trace.redact_peer_ip);
+        assert!(!config.debug.policy_trace.redact_torrent_name);
+        assert_eq!(
+            config.debug.policy_trace.bind_addr().unwrap().to_string(),
+            "127.0.0.1:9191"
+        );
         assert!(config.policy.score.churn.enabled);
         assert_eq!(
             config.policy.score.churn.reconnect_window,
@@ -1008,6 +1130,30 @@ allowlist_peer_ips = ["127.0.0.1"]
                 ("BRRPOLICE_HTTP__PORT".to_string(), "10090".to_string()),
                 ("BRRPOLICE_HTTP__HOST".to_string(), "127.0.0.1".to_string()),
                 (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__ENABLED".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__PORT".to_string(),
+                    "10091".to_string(),
+                ),
+                (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__MAX_CLIENTS".to_string(),
+                    "3".to_string(),
+                ),
+                (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__MAX_DURATION".to_string(),
+                    "2m".to_string(),
+                ),
+                (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__DEFAULT_SAMPLE_RATE".to_string(),
+                    "0.5".to_string(),
+                ),
+                (
+                    "BRRPOLICE_DEBUG__POLICY_TRACE__REDACT_PEER_IP".to_string(),
+                    "true".to_string(),
+                ),
+                (
                     "BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS".to_string(),
                     "192.168.1.10,192.168.1.11".to_string(),
                 ),
@@ -1024,6 +1170,17 @@ allowlist_peer_ips = ["127.0.0.1"]
         assert_eq!(config.retention.vacuum.mode.as_str(), "off");
         assert_eq!(config.http.host, "127.0.0.1");
         assert_eq!(config.http.port, 10090);
+        assert!(config.debug.policy_trace.enabled);
+        assert_eq!(config.debug.policy_trace.host, "127.0.0.1");
+        assert_eq!(config.debug.policy_trace.port, 10091);
+        assert_eq!(config.debug.policy_trace.max_clients, 3);
+        assert_eq!(
+            config.debug.policy_trace.max_duration,
+            Duration::from_secs(120)
+        );
+        assert_eq!(config.debug.policy_trace.default_sample_rate, 0.5);
+        assert!(config.debug.policy_trace.redact_peer_ip);
+        assert!(config.debug.policy_trace.redact_torrent_name);
         assert_eq!(
             config.http.bind_addr().unwrap().to_string(),
             "127.0.0.1:10090"
@@ -1143,6 +1300,66 @@ pool_idle_timeout = "0s"
 
         let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("pool_idle_timeout"));
+    }
+
+    #[test]
+    fn rejects_invalid_debug_policy_trace_values() {
+        for (toml, expected) in [
+            (
+                r#"
+[debug.policy_trace]
+host = "not an ip address"
+"#,
+                "debug.policy_trace.host/debug.policy_trace.port",
+            ),
+            (
+                r#"
+[debug.policy_trace]
+port = 0
+"#,
+                "debug.policy_trace.port",
+            ),
+            (
+                r#"
+[debug.policy_trace]
+max_clients = 0
+"#,
+                "debug.policy_trace.max_clients",
+            ),
+            (
+                r#"
+[debug.policy_trace]
+max_duration = "0s"
+"#,
+                "debug.policy_trace.max_duration",
+            ),
+            (
+                r#"
+[debug.policy_trace]
+default_sample_rate = 1.5
+"#,
+                "debug.policy_trace.default_sample_rate",
+            ),
+            (
+                r#"
+[debug.policy_trace]
+default_sample_rate = -0.1
+"#,
+                "debug.policy_trace.default_sample_rate",
+            ),
+        ] {
+            let temp_dir = tempdir().unwrap();
+            let config_path = write_config(temp_dir.path(), toml);
+
+            let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{}` in `{}`",
+                expected,
+                error
+            );
+        }
     }
 
     #[test]
