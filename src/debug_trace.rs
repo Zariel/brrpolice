@@ -122,6 +122,7 @@ async fn stream_policy_trace(
                     &serde_json::json!({
                         "record_type": "dropped_records",
                         "schema_version": 1,
+                        "client_id": client_id,
                         "dropped_count": dropped_count,
                     })
                     .to_string(),
@@ -244,6 +245,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn stream_reports_dropped_records_for_slow_clients() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 1));
+        let app = super::build_router(test_config(Duration::from_millis(50)), publisher.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?duration=50ms")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let record = sample_record();
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            crate::trace_publisher::PublishOutcome::Published {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            crate::trace_publisher::PublishOutcome::Published {
+                delivered: 0,
+                dropped: 1
+            }
+        );
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let notice: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(notice["record_type"], "dropped_records");
+        assert_eq!(notice["schema_version"], 1);
+        assert_eq!(notice["client_id"], 1);
+        assert_eq!(notice["dropped_count"], 1);
+        let delivered: PolicyTraceRecord = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(delivered.policy_trace_id, "debug-http-test");
     }
 
     #[tokio::test]
