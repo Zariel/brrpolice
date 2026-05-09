@@ -2145,6 +2145,7 @@ mod tests {
                 durations: vec![Duration::from_secs(3600)],
             },
         };
+        config.debug.policy_trace.redact_peer_ip = true;
         let config = Arc::new(config);
         let qbittorrent = Arc::new(
             crate::qbittorrent::QbittorrentClient::new(
@@ -2213,13 +2214,23 @@ mod tests {
         let trace: PolicyTraceRecord = serde_json::from_str(&trace_payload).unwrap();
         assert_eq!(trace.torrent.hash, "abc123");
         assert_eq!(trace.torrent.name, None);
+        assert_eq!(trace.peer.ip, None);
         assert!(trace.prior_session.is_some());
+        assert_eq!(
+            trace.prior_session.as_ref().unwrap().observation_id.peer_ip,
+            None
+        );
+        assert_eq!(trace.evaluated_session.observation_id.peer_ip, None);
+        assert_eq!(
+            trace.simulator_hints.peer_observation_identity.peer_ip,
+            None
+        );
         assert_eq!(trace.evaluated_session.latest_progress, 0.1005);
         assert_eq!(trace.guardrail_inputs.offence_history.offence_count, 0);
-        assert!(matches!(
-            trace.decision_output.disposition,
-            TraceBanDisposition::Ban { .. }
-        ));
+        match &trace.decision_output.disposition {
+            TraceBanDisposition::Ban { decision } => assert_eq!(decision.peer_ip, None),
+            other => panic!("expected ban disposition, got {other:?}"),
+        }
 
         server.await.unwrap();
     }
