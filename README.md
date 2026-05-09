@@ -173,6 +173,21 @@ qBittorrent auth rule:
 | `logging.level` | `BRRPOLICE_LOGGING__LEVEL` | `warn` | Log level filter (for example `trace`, `debug`, `info`, `warn`, `error`). At `info`, peer policy decisions are emitted; at `warn`, non-fatal errors and peer bans are emitted. |
 | `logging.format` | `BRRPOLICE_LOGGING__FORMAT` | `json` | Output format: `json`, `plain`, or `text`. |
 
+### Debug Policy Trace Settings
+
+The policy trace stream is disabled by default. Enable it only for short, deliberate capture windows because trace records can contain peer IPs, torrent metadata, policy state, and decision details.
+
+| Setting | Env Var | Default | Impact |
+|---|---|---|---|
+| `debug.policy_trace.enabled` | `BRRPOLICE_DEBUG__POLICY_TRACE__ENABLED` | `false` | Enables the separate debug listener for `/debug/policy-trace/stream`. |
+| `debug.policy_trace.host` | `BRRPOLICE_DEBUG__POLICY_TRACE__HOST` | `127.0.0.1` | Bind host for the debug trace listener. Keep loopback unless access is protected by port-forwarding or a tightly scoped internal service. |
+| `debug.policy_trace.port` | `BRRPOLICE_DEBUG__POLICY_TRACE__PORT` | `9091` | Bind port for the debug trace listener. |
+| `debug.policy_trace.max_clients` | `BRRPOLICE_DEBUG__POLICY_TRACE__MAX_CLIENTS` | `1` | Maximum concurrent trace stream subscribers. Extra clients receive `503`. |
+| `debug.policy_trace.max_duration` | `BRRPOLICE_DEBUG__POLICY_TRACE__MAX_DURATION` | `10m` | Server-side cap for any trace stream, even when a shorter query duration is requested. |
+| `debug.policy_trace.default_sample_rate` | `BRRPOLICE_DEBUG__POLICY_TRACE__DEFAULT_SAMPLE_RATE` | `1.0` | Default per-stream sampling rate. |
+| `debug.policy_trace.redact_peer_ip` | `BRRPOLICE_DEBUG__POLICY_TRACE__REDACT_PEER_IP` | `false` | Redacts peer IPs from trace records. Redacted traces cannot be replayed by the simulator. |
+| `debug.policy_trace.redact_torrent_name` | `BRRPOLICE_DEBUG__POLICY_TRACE__REDACT_TORRENT_NAME` | `true` | Redacts torrent names while keeping replay-critical hashes and policy state. |
+
 ## Environment Overrides
 
 Any setting can be overridden with env vars using:
@@ -213,6 +228,35 @@ curl -fsS http://127.0.0.1:9090/healthz
 curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
+
+## Policy Trace Debug Capture
+
+Policy trace capture uses a separate debug listener instead of the normal `/healthz`, `/readyz`, and `/metrics` listener. This keeps replay-grade trace data off the public service surface and lets Kubernetes network policy treat trace capture differently from ordinary monitoring.
+
+Minimal config for local capture:
+
+```toml
+[debug.policy_trace]
+enabled = true
+host = "127.0.0.1"
+port = 9091
+max_clients = 1
+max_duration = "10m"
+redact_peer_ip = false
+redact_torrent_name = true
+```
+
+At startup, logs state whether the debug policy trace endpoint is disabled or listening. When enabled, expect a log line that includes the bound address, for example `127.0.0.1:9091`.
+
+For Kubernetes, prefer port-forwarding to the pod or to a tightly scoped internal debug Service:
+
+```bash
+kubectl port-forward pod/brrpolice-abc123 9091:9091
+curl -N 'http://127.0.0.1:9091/debug/policy-trace/stream?duration=5m' > policy-trace.jsonl
+cargo run -p score-simulator -- --input policy-trace.jsonl
+```
+
+Do not expose `/debug/policy-trace/stream` through public ingress. If a Kubernetes Service is used, keep it internal-only and protect it with network policy that limits access to trusted operators. Treat captured `.jsonl` files as sensitive operational data and do not commit them.
 
 ## Grafana Dashboard
 
