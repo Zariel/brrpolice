@@ -16,8 +16,9 @@ use brrpolice::{
     policy::PolicyEngine,
     policy_trace::{
         POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceDecisionOutput,
-        TraceExemptionReason, TracePeerBehaviourIdentity, TracePeerObservationIdentity,
-        TracePeerSessionState, TracePolicyInputs,
+        TraceExemptionReason, TraceGuardrailInputs, TraceOffenceHistory,
+        TracePeerBehaviourIdentity, TracePeerObservationIdentity, TracePeerSessionState,
+        TracePolicyInputs, duration_millis,
     },
     types::{
         BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
@@ -101,6 +102,12 @@ struct Summary {
     churn_max_reconnect_count: u32,
     dropped_trace_records: u64,
     reproduction_problems: Vec<String>,
+    decision_deltas: u64,
+    decision_delta_reports: Vec<String>,
+    score_state_deltas: u64,
+    score_state_delta_reports: Vec<String>,
+    guardrail_deltas: u64,
+    guardrail_delta_reports: Vec<String>,
 }
 
 impl Summary {
@@ -112,6 +119,41 @@ impl Summary {
         self.reproduction_failures += 1;
         if self.reproduction_problems.len() < 20 {
             self.reproduction_problems.push(problem);
+        }
+    }
+
+    fn record_trace_replay_deltas(
+        &mut self,
+        decision_deltas: Vec<String>,
+        score_state_deltas: Vec<String>,
+        guardrail_deltas: Vec<String>,
+    ) {
+        if decision_deltas.is_empty()
+            && score_state_deltas.is_empty()
+            && guardrail_deltas.is_empty()
+        {
+            self.record_reproduction_pass();
+            return;
+        }
+
+        self.reproduction_failures += 1;
+        for delta in decision_deltas {
+            self.decision_deltas += 1;
+            if self.decision_delta_reports.len() < 20 {
+                self.decision_delta_reports.push(delta);
+            }
+        }
+        for delta in score_state_deltas {
+            self.score_state_deltas += 1;
+            if self.score_state_delta_reports.len() < 20 {
+                self.score_state_delta_reports.push(delta);
+            }
+        }
+        for delta in guardrail_deltas {
+            self.guardrail_deltas += 1;
+            if self.guardrail_delta_reports.len() < 20 {
+                self.guardrail_delta_reports.push(delta);
+            }
         }
     }
 
@@ -347,6 +389,7 @@ fn process_trace_record(
         &record,
         &evaluation,
         &disposition,
+        &history,
         summary,
         line_context,
     );
@@ -421,6 +464,7 @@ fn check_current_policy_reproduction(
     record: &PolicyTraceRecord,
     evaluation: &brrpolice::types::PeerEvaluation,
     disposition: &BanDisposition,
+    history: &OffenceHistory,
     summary: &mut Summary,
     line_context: TraceLineContext<'_>,
 ) {
@@ -428,37 +472,102 @@ fn check_current_policy_reproduction(
     let replayed_session = TracePeerSessionState::from(&evaluation.session);
     let replayed_decision_output =
         TraceDecisionOutput::from_evaluation_and_disposition(evaluation, disposition);
+    let replayed_guardrail_inputs = trace_guardrail_inputs(evaluation, disposition, history);
+    let context = trace_report_context(record, line_context);
 
-    let mut mismatches = Vec::new();
+    let mut reproduction_problems = Vec::new();
+    let mut decision_deltas = Vec::new();
+    let mut score_state_deltas = Vec::new();
+    let mut guardrail_deltas = Vec::new();
     if record.policy_inputs != replayed_policy_inputs {
-        mismatches.push(format!(
-            "policy_inputs recorded={} replayed={}",
+        reproduction_problems.push(format!(
+            "{context} policy_inputs recorded={} replayed={}",
             abbrev_debug(&record.policy_inputs),
             abbrev_debug(&replayed_policy_inputs)
         ));
     }
     if record.evaluated_session != replayed_session {
-        mismatches.push(format!(
-            "evaluated_session recorded={} replayed={}",
+        score_state_deltas.push(format!(
+            "{context} evaluated_session recorded={} replayed={}",
             abbrev_debug(&record.evaluated_session),
             abbrev_debug(&replayed_session)
         ));
     }
     if record.decision_output != replayed_decision_output {
-        mismatches.push(format!(
-            "decision_output recorded={} replayed={}",
+        decision_deltas.push(format!(
+            "{context} decision_output recorded={} replayed={}",
             abbrev_debug(&record.decision_output),
             abbrev_debug(&replayed_decision_output)
         ));
     }
-
-    if mismatches.is_empty() {
-        summary.record_reproduction_pass();
-        return;
+    if record.guardrail_inputs != replayed_guardrail_inputs {
+        guardrail_deltas.push(format!(
+            "{context} guardrail_inputs recorded={} replayed={}",
+            abbrev_debug(&record.guardrail_inputs),
+            abbrev_debug(&replayed_guardrail_inputs)
+        ));
     }
 
-    summary.record_reproduction_problem(format!(
-        "{}:{} trace_id={} torrent_hash={} peer={}:{} mismatches: {}",
+    if reproduction_problems.is_empty() {
+        summary.record_trace_replay_deltas(decision_deltas, score_state_deltas, guardrail_deltas);
+    } else {
+        summary.reproduction_failures += 1;
+        for problem in reproduction_problems {
+            if summary.reproduction_problems.len() < 20 {
+                summary.reproduction_problems.push(problem);
+            }
+        }
+        for delta in decision_deltas {
+            summary.decision_deltas += 1;
+            if summary.decision_delta_reports.len() < 20 {
+                summary.decision_delta_reports.push(delta);
+            }
+        }
+        for delta in score_state_deltas {
+            summary.score_state_deltas += 1;
+            if summary.score_state_delta_reports.len() < 20 {
+                summary.score_state_delta_reports.push(delta);
+            }
+        }
+        for delta in guardrail_deltas {
+            summary.guardrail_deltas += 1;
+            if summary.guardrail_delta_reports.len() < 20 {
+                summary.guardrail_delta_reports.push(delta);
+            }
+        }
+    }
+}
+
+fn trace_guardrail_inputs(
+    evaluation: &brrpolice::types::PeerEvaluation,
+    disposition: &BanDisposition,
+    history: &OffenceHistory,
+) -> TraceGuardrailInputs {
+    TraceGuardrailInputs {
+        exemption_reason: evaluation
+            .session
+            .last_exemption_reason
+            .as_ref()
+            .map(Into::into),
+        allowlisted_peer: matches!(
+            evaluation.session.last_exemption_reason,
+            Some(ExemptionReason::AllowlistedPeer)
+        ),
+        active_ban: matches!(
+            evaluation.session.last_exemption_reason,
+            Some(ExemptionReason::AlreadyBanned)
+        ),
+        reban_cooldown_remaining_ms: match disposition {
+            BanDisposition::RebanCooldown { remaining } => Some(duration_millis(*remaining)),
+            _ => None,
+        },
+        offence_history: TraceOffenceHistory::from(history),
+    }
+}
+
+fn trace_report_context(record: &PolicyTraceRecord, line_context: TraceLineContext<'_>) -> String {
+    format!(
+        "{}:{} trace_id={} torrent_hash={} peer={}:{}",
         line_context.source_name,
         line_context.line_number,
         record.policy_trace_id,
@@ -468,9 +577,8 @@ fn check_current_policy_reproduction(
             .ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "<redacted>".to_string()),
-        record.peer.port,
-        mismatches.join("; ")
-    ));
+        record.peer.port
+    )
 }
 
 fn abbrev_debug<T: std::fmt::Debug>(value: &T) -> String {
@@ -654,8 +762,35 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
         summary.churn_max_amplifier,
         summary.churn_max_reconnect_count
     );
+    println!(
+        "current_policy_reproduction: passes={} failures={} data_problems={}",
+        summary.reproduction_passes,
+        summary.reproduction_failures,
+        summary.reproduction_problems.len()
+    );
     for problem in &summary.reproduction_problems {
         println!("reproduction_failure {problem}");
+    }
+    println!(
+        "candidate_decision_deltas: count={}",
+        summary.decision_deltas
+    );
+    for delta in &summary.decision_delta_reports {
+        println!("decision_delta {delta}");
+    }
+    println!(
+        "candidate_score_state_deltas: count={}",
+        summary.score_state_deltas
+    );
+    for delta in &summary.score_state_delta_reports {
+        println!("score_state_delta {delta}");
+    }
+    println!(
+        "guardrail_or_exemption_deltas: count={}",
+        summary.guardrail_deltas
+    );
+    for delta in &summary.guardrail_delta_reports {
+        println!("guardrail_delta {delta}");
     }
 
     let mut interesting: Vec<(&SessionKey, &u32)> = state
@@ -1102,6 +1237,53 @@ mod tests {
         assert_eq!(summary.reproduction_failures, 1);
         assert!(summary.reproduction_problems[0].contains("policy_inputs"));
         assert!(summary.reproduction_problems[0].contains("torrent_hash="));
+    }
+
+    #[test]
+    fn trace_reader_buckets_replay_deltas_by_kind() {
+        let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let mut decision_record = replayable_trace_record(&config, &policy);
+        decision_record.policy_trace_id = "decision-delta".to_string();
+        decision_record.decision_output.is_bad_sample =
+            !decision_record.decision_output.is_bad_sample;
+
+        let mut score_record = replayable_trace_record(&config, &policy);
+        score_record.policy_trace_id = "score-state-delta".to_string();
+        score_record.evaluated_session.ban_score += 1.0;
+
+        let mut guardrail_record = replayable_trace_record(&config, &policy);
+        guardrail_record.policy_trace_id = "guardrail-delta".to_string();
+        guardrail_record.guardrail_inputs.allowlisted_peer = true;
+
+        let replay = Cursor::new(format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&decision_record).unwrap(),
+            serde_json::to_string(&score_record).unwrap(),
+            serde_json::to_string(&guardrail_record).unwrap()
+        ));
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+
+        process_reader(
+            &policy,
+            &config,
+            replay,
+            "deltas".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 0);
+        assert_eq!(summary.reproduction_failures, 3);
+        assert_eq!(summary.decision_deltas, 1);
+        assert_eq!(summary.score_state_deltas, 1);
+        assert_eq!(summary.guardrail_deltas, 1);
+        assert!(summary.reproduction_problems.is_empty());
+        assert!(summary.decision_delta_reports[0].contains("decision-delta"));
+        assert!(summary.score_state_delta_reports[0].contains("score-state-delta"));
+        assert!(summary.guardrail_delta_reports[0].contains("guardrail-delta"));
     }
 
     #[test]
