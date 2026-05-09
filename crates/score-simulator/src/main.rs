@@ -201,8 +201,9 @@ impl Summary {
 
 #[derive(Default)]
 struct ReplayState {
-    sessions: HashMap<SessionKey, PeerSessionState>,
-    offences: HashMap<OffenceKey, OffenceHistory>,
+    recorded_sessions: HashMap<SessionKey, PeerSessionState>,
+    candidate_sessions: HashMap<SessionKey, PeerSessionState>,
+    candidate_offences: HashMap<OffenceKey, OffenceHistory>,
     recorded_active_bans: HashMap<ActiveBanKey, SystemTime>,
     candidate_active_bans: HashMap<ActiveBanKey, SystemTime>,
     ban_events: HashMap<SessionKey, u32>,
@@ -364,12 +365,15 @@ fn process_trace_record(
     let observation_id =
         observation_id_from_trace(&record.simulator_hints.peer_observation_identity)?;
     let session_key = SessionKey::from_observation_id(&observation_id);
+    let offence_identity =
+        offence_identity_from_trace(&record.simulator_hints.peer_behaviour_identity)?;
+    let offence_key = OffenceKey::from_offence_identity(&offence_identity);
     let existing = record
         .prior_session
         .as_ref()
         .map(session_from_trace)
         .transpose()?;
-    if !state.sessions.contains_key(&session_key) && existing.is_none() {
+    if !state.recorded_sessions.contains_key(&session_key) && existing.is_none() {
         summary.peers_seen += 1;
     }
 
@@ -428,6 +432,15 @@ fn process_trace_record(
             .transpose()
             .context("parsing trace offence_history.last_ban_expires_at")?,
     };
+    let candidate_existing = state
+        .candidate_sessions
+        .get(&session_key)
+        .or(existing.as_ref());
+    let candidate_history = state
+        .candidate_offences
+        .get(&offence_key)
+        .cloned()
+        .unwrap_or_else(|| history.clone());
 
     let replay_policy = policy_config_from_trace(&record.policy_inputs);
     let current = evaluate_trace(
@@ -455,11 +468,17 @@ fn process_trace_record(
         &candidate_policy,
         &peer_context,
         candidate_has_active_ban,
-        existing.as_ref(),
-        &history,
+        candidate_existing,
+        &candidate_history,
     );
     if current_reproduced {
-        record_candidate_deltas(&record, &candidate, &history, summary, line_context);
+        record_candidate_deltas(
+            &record,
+            &candidate,
+            &candidate_history,
+            summary,
+            line_context,
+        );
     }
 
     if candidate.evaluation.session.churn_amplifier > 0.0 {
@@ -472,6 +491,7 @@ fn process_trace_record(
         .churn_max_reconnect_count
         .max(candidate.evaluation.session.churn_reconnect_count);
 
+    let mut candidate_session = candidate.evaluation.session.clone();
     match &candidate.disposition {
         BanDisposition::Ban(decision) => {
             summary.simulated_bans += 1;
@@ -488,8 +508,9 @@ fn process_trace_record(
                 },
                 expires_at,
             );
-            state.offences.insert(
-                OffenceKey::from_offence_identity(&candidate.evaluation.session.offence_identity),
+            candidate_session.last_ban_decision_at = Some(observed_at);
+            state.candidate_offences.insert(
+                OffenceKey::from_offence_identity(&candidate_session.offence_identity),
                 OffenceHistory {
                     offence_count: decision.offence_number,
                     last_ban_expires_at: Some(expires_at),
@@ -499,15 +520,23 @@ fn process_trace_record(
         BanDisposition::Exempt(_)
         | BanDisposition::NotBannableYet { .. }
         | BanDisposition::RebanCooldown { .. }
-        | BanDisposition::DuplicateSuppressed => {}
+        | BanDisposition::DuplicateSuppressed => {
+            state
+                .candidate_offences
+                .entry(offence_key)
+                .or_insert(candidate_history);
+        }
     }
+    state
+        .candidate_sessions
+        .insert(session_key.clone(), candidate_session);
 
     if let TraceBanDisposition::Ban { decision } = &record.decision_output.disposition {
         summary.actual_bans += 1;
         record_recorded_ban(state, decision, &record.torrent.hash, observed_at)?;
     }
     state
-        .sessions
+        .recorded_sessions
         .insert(session_key, session_from_trace(&record.evaluated_session)?);
     Ok(())
 }
@@ -783,16 +812,6 @@ fn record_recorded_ban(
         },
         expires_at,
     );
-    state.offences.insert(
-        OffenceKey {
-            torrent_hash: torrent_hash.to_string(),
-            peer_ip,
-        },
-        OffenceHistory {
-            offence_count: decision.offence_number,
-            last_ban_expires_at: Some(expires_at),
-        },
-    );
     Ok(())
 }
 
@@ -991,7 +1010,7 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
     interesting.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
     for (observation_id, count) in interesting.into_iter().take(20) {
         let final_score = state
-            .sessions
+            .candidate_sessions
             .get(observation_id)
             .map(|session| session.ban_score)
             .unwrap_or(0.0);
@@ -1003,12 +1022,12 @@ fn print_summary(config: &SimulatorConfig, summary: &Summary, state: &ReplayStat
             count,
             final_score,
             state
-                .sessions
+                .candidate_sessions
                 .get(observation_id)
                 .map(|session| session.churn_amplifier)
                 .unwrap_or(0.0),
             state
-                .sessions
+                .candidate_sessions
                 .get(observation_id)
                 .map(|session| session.churn_reconnect_count)
                 .unwrap_or(0),
@@ -1259,7 +1278,7 @@ mod tests {
         io::Cursor,
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
-        time::{Duration, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{Summary, parse_args, process_reader};
@@ -1270,7 +1289,7 @@ mod tests {
             TraceDecisionOutput, TraceGuardrailInputs, TraceOffenceHistory, TracePeer,
             TracePolicyInputs, TraceSimulatorHints, TraceTorrent, trace_timestamp,
         },
-        types::{OffenceHistory, PeerContext, PeerSnapshot, TorrentScope},
+        types::{OffenceHistory, PeerContext, PeerSessionState, PeerSnapshot, TorrentScope},
     };
 
     #[test]
@@ -1366,7 +1385,7 @@ mod tests {
         );
         assert_eq!(summary.actual_bans, 1);
         assert_eq!(summary.peers_seen, 1);
-        assert!(state.sessions.len() >= 3);
+        assert!(state.recorded_sessions.len() >= 3);
     }
 
     #[test]
@@ -1646,6 +1665,82 @@ mod tests {
     }
 
     #[test]
+    fn candidate_replay_carries_state_across_records() {
+        let mut trace_config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
+        trace_config.candidate_policy.score.ban_threshold = 10.0;
+        let trace_policy =
+            PolicyEngine::new(trace_config.candidate_policy.clone(), &Default::default());
+        let first_observed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let first_record = replayable_slow_trace_record_at(
+            &trace_config,
+            &trace_policy,
+            first_observed_at,
+            None,
+            OffenceHistory {
+                offence_count: 0,
+                last_ban_expires_at: None,
+            },
+            "candidate-carry-1",
+        );
+        let first_session = super::session_from_trace(&first_record.evaluated_session).unwrap();
+        let second_record = replayable_slow_trace_record_at(
+            &trace_config,
+            &trace_policy,
+            first_observed_at + Duration::from_secs(3_700),
+            Some(&first_session),
+            OffenceHistory {
+                offence_count: 0,
+                last_ban_expires_at: None,
+            },
+            "candidate-carry-2",
+        );
+        let config = parse_args(vec![
+            "--input".into(),
+            "dummy".into(),
+            "--ban-threshold".into(),
+            "0.9".into(),
+        ])
+        .unwrap();
+        let mut state = super::ReplayState::default();
+        let mut summary = Summary::default();
+        let replay = Cursor::new(format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_record).unwrap(),
+            serde_json::to_string(&second_record).unwrap()
+        ));
+
+        process_reader(
+            &config,
+            replay,
+            "candidate-state".to_string(),
+            &mut state,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(summary.reproduction_passes, 2);
+        assert_eq!(summary.reproduction_failures, 0);
+        assert_eq!(summary.simulated_bans, 1);
+        assert!(summary.decision_deltas >= 2);
+        assert!(
+            summary
+                .decision_delta_reports
+                .iter()
+                .any(|report| report.contains("candidate-carry-2")
+                    && report.contains("RebanCooldown"))
+        );
+        assert_eq!(state.candidate_sessions.len(), 1);
+        assert_eq!(
+            state
+                .candidate_offences
+                .values()
+                .map(|history| history.offence_count)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn run_fails_when_reproduction_gate_fails() {
         let path = std::env::temp_dir().join(format!(
             "score-simulator-dropped-{}-{}.jsonl",
@@ -1751,6 +1846,27 @@ mod tests {
         policy: &PolicyEngine,
     ) -> PolicyTraceRecord {
         let observed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        replayable_slow_trace_record_at(
+            config,
+            policy,
+            observed_at,
+            None,
+            OffenceHistory {
+                offence_count: 0,
+                last_ban_expires_at: None,
+            },
+            "generated-slow-trace-1",
+        )
+    }
+
+    fn replayable_slow_trace_record_at(
+        config: &super::SimulatorConfig,
+        policy: &PolicyEngine,
+        observed_at: SystemTime,
+        existing: Option<&PeerSessionState>,
+        history: OffenceHistory,
+        policy_trace_id: &str,
+    ) -> PolicyTraceRecord {
         let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 45));
         let torrent = TorrentScope {
             hash: "generated-slow-trace".to_string(),
@@ -1770,15 +1886,13 @@ mod tests {
         let peer_context = PeerContext {
             torrent: torrent.clone(),
             peer: peer.clone(),
-            first_seen_at: observed_at - Duration::from_secs(180),
+            first_seen_at: existing
+                .map(|session| session.first_seen_at)
+                .unwrap_or(observed_at - Duration::from_secs(180)),
             observed_at,
             has_active_ban: false,
         };
-        let evaluation = policy.evaluate_peer(&peer_context, None);
-        let history = OffenceHistory {
-            offence_count: 0,
-            last_ban_expires_at: None,
-        };
+        let evaluation = policy.evaluate_peer(&peer_context, existing);
         let disposition = policy.decide_ban(&peer_context, &evaluation, &history);
 
         PolicyTraceRecord {
@@ -1786,7 +1900,7 @@ mod tests {
             schema_version: POLICY_TRACE_SCHEMA_VERSION,
             observed_at: trace_timestamp(observed_at),
             service_version: "0.1.0-test".to_string(),
-            policy_trace_id: "generated-slow-trace-1".to_string(),
+            policy_trace_id: policy_trace_id.to_string(),
             config_fingerprint: "generated-fingerprint".to_string(),
             torrent: TraceTorrent::from(&torrent),
             peer: TracePeer {
@@ -1795,7 +1909,7 @@ mod tests {
                 progress: peer.progress,
                 up_rate_bps: peer.up_rate_bps,
             },
-            prior_session: None,
+            prior_session: existing.map(Into::into),
             evaluated_session: (&evaluation.session).into(),
             policy_inputs: TracePolicyInputs::from(&config.candidate_policy),
             guardrail_inputs: TraceGuardrailInputs {
