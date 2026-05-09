@@ -256,6 +256,8 @@ curl -N 'http://127.0.0.1:9091/debug/policy-trace/stream?duration=5m' > policy-t
 cargo run -p score-simulator -- --input policy-trace.jsonl
 ```
 
+Use query parameters to narrow a capture window: `duration=5m`, `peer_ip=203.0.113.10`, `torrent_hash=<hash>`, `sample=0.25`, and `include_names=true`. Query duration is capped by `debug.policy_trace.max_duration`, sample must be between `0.0` and `1.0`, and name inclusion must not bypass configured redaction.
+
 Do not expose `/debug/policy-trace/stream` through public ingress. If a Kubernetes Service is used, keep it internal-only and protect it with network policy that limits access to trusted operators. Treat captured `.jsonl` files as sensitive operational data and do not commit them.
 
 ## Policy Trace Data Handling

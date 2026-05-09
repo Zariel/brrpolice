@@ -1,8 +1,13 @@
 #![allow(dead_code)]
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    net::IpAddr,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -61,6 +66,13 @@ impl PolicyTracePublisher {
     }
 
     pub fn subscribe(&self) -> std::result::Result<PolicyTraceSubscription, SubscribeError> {
+        self.subscribe_with_filter(TraceSubscriptionFilter::default())
+    }
+
+    pub fn subscribe_with_filter(
+        &self,
+        filter: TraceSubscriptionFilter,
+    ) -> std::result::Result<PolicyTraceSubscription, SubscribeError> {
         if !self.is_enabled() {
             return Err(SubscribeError::Disabled);
         }
@@ -79,6 +91,7 @@ impl PolicyTracePublisher {
             id: client_id,
             tx,
             dropped: 0,
+            filter,
         });
 
         Ok(PolicyTraceSubscription {
@@ -100,11 +113,21 @@ impl PolicyTracePublisher {
             }
         }
 
+        {
+            let clients = self.clients.lock().expect("trace client lock poisoned");
+            if !clients.iter().any(|client| client.filter.matches(record)) {
+                return Ok(PublishOutcome::Published {
+                    delivered: 0,
+                    dropped: 0,
+                });
+            }
+        }
+
         let payload = serde_json::to_string(record)?;
-        Ok(self.publish_serialized(payload))
+        Ok(self.publish_serialized(record, payload))
     }
 
-    fn publish_serialized(&self, payload: String) -> PublishOutcome {
+    fn publish_serialized(&self, record: &PolicyTraceRecord, payload: String) -> PublishOutcome {
         let mut clients = self.clients.lock().expect("trace client lock poisoned");
         prune_closed_clients(&mut clients);
         if clients.is_empty() {
@@ -113,17 +136,22 @@ impl PolicyTracePublisher {
 
         let mut delivered = 0;
         let mut dropped = 0;
-        clients.retain_mut(|client| match client.tx.try_send(payload.clone()) {
-            Ok(()) => {
-                delivered += 1;
-                true
+        clients.retain_mut(|client| {
+            if !client.filter.matches(record) {
+                return true;
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                client.dropped = client.dropped.saturating_add(1);
-                dropped += 1;
-                true
+            match client.tx.try_send(payload.clone()) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    client.dropped = client.dropped.saturating_add(1);
+                    dropped += 1;
+                    true
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
 
         if dropped > 0 {
@@ -148,6 +176,52 @@ struct TraceClient {
     id: u64,
     tx: mpsc::Sender<String>,
     dropped: u64,
+    filter: TraceSubscriptionFilter,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceSubscriptionFilter {
+    pub peer_ip: Option<IpAddr>,
+    pub torrent_hash: Option<String>,
+    pub sample_rate: f64,
+}
+
+impl Default for TraceSubscriptionFilter {
+    fn default() -> Self {
+        Self {
+            peer_ip: None,
+            torrent_hash: None,
+            sample_rate: 1.0,
+        }
+    }
+}
+
+impl TraceSubscriptionFilter {
+    fn matches(&self, record: &PolicyTraceRecord) -> bool {
+        if let Some(peer_ip) = self.peer_ip
+            && record.peer.ip != Some(peer_ip)
+        {
+            return false;
+        }
+        if let Some(torrent_hash) = &self.torrent_hash
+            && record.torrent.hash != *torrent_hash
+        {
+            return false;
+        }
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        record.policy_trace_id.hash(&mut hasher);
+        record.torrent.hash.hash(&mut hasher);
+        record.peer.port.hash(&mut hasher);
+        let threshold = (self.sample_rate * u64::MAX as f64) as u64;
+        hasher.finish() <= threshold
+    }
 }
 
 #[derive(Debug)]

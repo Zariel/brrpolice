@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::IpAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::{
     config::{AppConfig, DebugPolicyTraceConfig},
-    trace_publisher::{PolicyTracePublisher, SubscribeError},
+    trace_publisher::{PolicyTracePublisher, SubscribeError, TraceSubscriptionFilter},
 };
 
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -80,18 +80,23 @@ fn build_router(config: DebugPolicyTraceConfig, publisher: Arc<PolicyTracePublis
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     duration: Option<String>,
+    peer_ip: Option<IpAddr>,
+    torrent_hash: Option<String>,
+    sample: Option<f64>,
+    include_names: Option<bool>,
 }
 
 async fn stream_policy_trace(
     State(state): State<DebugTraceState>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
-    let duration = match stream_duration(&state.config, query.duration.as_deref()) {
-        Ok(duration) => duration,
+    let options = match stream_options(&state.config, query) {
+        Ok(options) => options,
         Err((status, message)) => return (status, message).into_response(),
     };
+    let _include_names_requested = options.include_names;
 
-    let subscription = match state.publisher.subscribe() {
+    let subscription = match state.publisher.subscribe_with_filter(options.filter) {
         Ok(subscription) => subscription,
         Err(SubscribeError::Disabled) => {
             return (
@@ -112,7 +117,7 @@ async fn stream_policy_trace(
     let client_id = subscription.client_id;
     let publisher = state.publisher;
     let stream = ReceiverStream::new(subscription.receiver)
-        .take_until(tokio::time::sleep(duration))
+        .take_until(tokio::time::sleep(options.duration))
         .map(move |record| {
             let mut payload = String::new();
             if let Some(dropped_count) = publisher.take_dropped_for_client(client_id)
@@ -162,6 +167,39 @@ fn stream_duration(
     }
 
     Ok(requested.min(config.max_duration))
+}
+
+struct StreamOptions {
+    duration: Duration,
+    filter: TraceSubscriptionFilter,
+    include_names: bool,
+}
+
+fn stream_options(
+    config: &DebugPolicyTraceConfig,
+    query: StreamQuery,
+) -> std::result::Result<StreamOptions, (StatusCode, String)> {
+    let duration = stream_duration(config, query.duration.as_deref())?;
+    let sample_rate = query.sample.unwrap_or(config.default_sample_rate);
+    if !sample_rate.is_finite() || !(0.0..=1.0).contains(&sample_rate) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "sample query parameter must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+
+    Ok(StreamOptions {
+        duration,
+        filter: TraceSubscriptionFilter {
+            peer_ip: query.peer_ip,
+            torrent_hash: query
+                .torrent_hash
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            sample_rate,
+        },
+        include_names: query.include_names.unwrap_or(false),
+    })
 }
 
 #[cfg(test)]
@@ -245,6 +283,145 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn stream_filters_by_peer_ip() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let app = super::build_router(test_config(Duration::from_millis(50)), publisher.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?duration=50ms&peer_ip=203.0.113.10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut other = sample_record();
+        other.peer.ip = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)));
+        publisher.publish(&other).unwrap();
+        publisher.publish(&sample_record()).unwrap();
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let record: PolicyTraceRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            record.peer.ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_filters_by_torrent_hash() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let app = super::build_router(test_config(Duration::from_millis(50)), publisher.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?duration=50ms&torrent_hash=torrent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut other = sample_record();
+        other.torrent.hash = "other".to_string();
+        publisher.publish(&other).unwrap();
+        publisher.publish(&sample_record()).unwrap();
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let record: PolicyTraceRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record.torrent.hash, "torrent");
+    }
+
+    #[tokio::test]
+    async fn stream_sample_zero_filters_all_records() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let app = super::build_router(test_config(Duration::from_millis(20)), publisher.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?duration=20ms&sample=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        publisher.publish(&sample_record()).unwrap();
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_invalid_filter_queries() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let app = super::build_router(test_config(Duration::from_millis(50)), publisher.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?sample=1.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?peer_ip=not-an-ip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stream_include_names_does_not_override_configured_redaction() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let mut config = test_config(Duration::from_millis(50));
+        config.redact_torrent_name = true;
+        let app = super::build_router(config, publisher.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/policy-trace/stream?duration=50ms&include_names=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut record = sample_record();
+        record.torrent.name = None;
+        publisher.publish(&record).unwrap();
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let delivered: PolicyTraceRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(delivered.torrent.name, None);
     }
 
     #[tokio::test]
