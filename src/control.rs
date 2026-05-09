@@ -8,15 +8,21 @@ use tracing::{debug, info, warn};
 
 use crate::{
     backoff::jittered_exponential_backoff,
-    config::AppConfig,
+    config::{AppConfig, DebugPolicyTraceConfig},
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
     policy::PolicyEngine,
+    policy_trace::{
+        POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, PolicyTraceRecordType, TraceDecisionOutput,
+        TraceGuardrailInputs, TraceOffenceHistory, TracePeer, TracePeerSessionState,
+        TracePolicyInputs, TraceSimulatorHints, duration_millis, trace_timestamp,
+    },
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
+    trace_publisher::PolicyTracePublisher,
     types::{
-        BanDecision, BanDisposition, ExemptionReason, OffenceIdentity, PeerContext, PeerEvaluation,
-        PeerObservationId, PeerSessionState, TorrentScope,
+        BanDecision, BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
+        PeerEvaluation, PeerObservationId, PeerSessionState, PeerSnapshot, TorrentScope,
     },
 };
 
@@ -107,6 +113,7 @@ pub struct ControlLoop {
     policy: Arc<PolicyEngine>,
     service_state: Arc<ServiceState>,
     metrics: Arc<AppMetrics>,
+    trace_publisher: Arc<PolicyTracePublisher>,
     shutdown: watch::Receiver<bool>,
     peer_decision_log_states: HashMap<String, PeerDecisionLogState>,
     last_retention_prune_at: Option<std::time::SystemTime>,
@@ -127,6 +134,16 @@ struct PendingBanAction {
     decision: BanDecision,
     evaluation: PeerEvaluation,
     pending_intent: PendingBanIntentRecord,
+}
+
+struct PolicyTracePublishContext<'a> {
+    torrent: &'a TorrentScope,
+    peer: &'a PeerSnapshot,
+    prior_session: Option<&'a PeerSessionState>,
+    evaluation: &'a PeerEvaluation,
+    history: &'a OffenceHistory,
+    disposition: &'a BanDisposition,
+    observed_at: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,10 +187,16 @@ impl ControlLoop {
             policy,
             service_state,
             metrics,
+            trace_publisher: Arc::new(PolicyTracePublisher::disabled()),
             shutdown,
             peer_decision_log_states: HashMap::new(),
             last_retention_prune_at: None,
         }
+    }
+
+    pub fn with_trace_publisher(mut self, trace_publisher: Arc<PolicyTracePublisher>) -> Self {
+        self.trace_publisher = trace_publisher;
+        self
     }
 
     pub async fn recover_startup_state(&self) -> Result<RecoverySnapshot> {
@@ -403,8 +426,19 @@ impl ControlLoop {
                     .await?;
                 let peer_key = peer_log_state_key(&evaluation.session.offence_identity);
                 seen_peer_keys.insert(peer_key.clone());
+                let prior_session = existing.as_ref().or(carryover.as_ref());
+                let disposition = self.policy.decide_ban(&peer_context, &evaluation, &history);
+                self.publish_policy_trace(PolicyTracePublishContext {
+                    torrent: &torrent_scope,
+                    peer: &peer.peer,
+                    prior_session,
+                    evaluation: &evaluation,
+                    history: &history,
+                    disposition: &disposition,
+                    observed_at,
+                });
 
-                match self.policy.decide_ban(&peer_context, &evaluation, &history) {
+                match disposition {
                     BanDisposition::Ban(decision) => {
                         self.metrics.record_policy_ban_decision();
                         let state = PeerDecisionLogState::BanPending;
@@ -657,6 +691,71 @@ impl ControlLoop {
             peer_count,
             ban_count,
         })
+    }
+
+    fn publish_policy_trace(&self, trace: PolicyTracePublishContext<'_>) {
+        if !self.trace_publisher.should_publish() {
+            return;
+        }
+
+        let mut record = PolicyTraceRecord {
+            record_type: PolicyTraceRecordType::PeerObservation,
+            schema_version: POLICY_TRACE_SCHEMA_VERSION,
+            observed_at: trace_timestamp(trace.observed_at),
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+            policy_trace_id: trace_policy_record_id(
+                &trace.evaluation.session.observation_id,
+                trace.observed_at,
+            ),
+            config_fingerprint: self.config.fingerprint(),
+            torrent: trace.torrent.into(),
+            peer: TracePeer {
+                ip: Some(trace.peer.ip),
+                port: trace.peer.port,
+                progress: trace.peer.progress,
+                up_rate_bps: trace.peer.up_rate_bps,
+            },
+            prior_session: trace.prior_session.map(Into::into),
+            evaluated_session: (&trace.evaluation.session).into(),
+            policy_inputs: TracePolicyInputs::from(&self.config.policy),
+            guardrail_inputs: TraceGuardrailInputs {
+                exemption_reason: trace
+                    .evaluation
+                    .session
+                    .last_exemption_reason
+                    .as_ref()
+                    .map(Into::into),
+                allowlisted_peer: matches!(
+                    trace.evaluation.session.last_exemption_reason,
+                    Some(ExemptionReason::AllowlistedPeer)
+                ),
+                active_ban: matches!(
+                    trace.evaluation.session.last_exemption_reason,
+                    Some(ExemptionReason::AlreadyBanned)
+                ),
+                reban_cooldown_remaining_ms: match trace.disposition {
+                    BanDisposition::RebanCooldown { remaining } => {
+                        Some(duration_millis(*remaining))
+                    }
+                    _ => None,
+                },
+                offence_history: TraceOffenceHistory::from(trace.history),
+            },
+            decision_output: TraceDecisionOutput::from_evaluation_and_disposition(
+                trace.evaluation,
+                trace.disposition,
+            ),
+            simulator_hints: TraceSimulatorHints::from_evaluation(
+                trace.evaluation,
+                &self.config.policy,
+            ),
+        };
+
+        apply_trace_redaction(&mut record, &self.config.debug.policy_trace);
+
+        if let Err(error) = self.trace_publisher.publish(&record) {
+            warn!(error = ?error, "failed to publish policy trace record");
+        }
     }
 
     fn should_log_peer_decision_state_change(
@@ -1228,6 +1327,50 @@ fn format_timestamp(value: std::time::SystemTime) -> String {
     humantime::format_rfc3339_millis(value).to_string()
 }
 
+fn trace_policy_record_id(
+    observation_id: &PeerObservationId,
+    observed_at: std::time::SystemTime,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        observation_id.torrent_hash,
+        observation_id.peer_ip,
+        observation_id.peer_port,
+        observed_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
+}
+
+fn apply_trace_redaction(record: &mut PolicyTraceRecord, config: &DebugPolicyTraceConfig) {
+    if config.redact_torrent_name {
+        record.torrent.name = None;
+    }
+
+    if !config.redact_peer_ip {
+        return;
+    }
+
+    record.peer.ip = None;
+    redact_trace_session(&mut record.evaluated_session);
+    if let Some(prior_session) = &mut record.prior_session {
+        redact_trace_session(prior_session);
+    }
+    record.simulator_hints.peer_observation_identity.peer_ip = None;
+    record.simulator_hints.peer_behaviour_identity.peer_ip = None;
+    if let crate::policy_trace::TraceBanDisposition::Ban { decision } =
+        &mut record.decision_output.disposition
+    {
+        decision.peer_ip = None;
+    }
+}
+
+fn redact_trace_session(session: &mut TracePeerSessionState) {
+    session.observation_id.peer_ip = None;
+    session.offence_identity.peer_ip = None;
+}
+
 async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
     loop {
         match shutdown.changed().await {
@@ -1318,7 +1461,9 @@ mod tests {
         metrics::AppMetrics,
         persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence},
         policy::PolicyEngine,
+        policy_trace::{PolicyTraceRecord, TraceBanDisposition},
         runtime::ServiceState,
+        trace_publisher::PolicyTracePublisher,
         types::{OffenceIdentity, PeerObservationId, PeerSessionState},
     };
 
@@ -2013,6 +2158,8 @@ mod tests {
         );
         let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
+        let trace_publisher = Arc::new(PolicyTracePublisher::new(true, 1, 4));
+        let mut trace_subscription = trace_publisher.subscribe().unwrap();
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
@@ -2021,7 +2168,8 @@ mod tests {
             state,
             metrics,
             shutdown_rx,
-        );
+        )
+        .with_trace_publisher(trace_publisher);
 
         let result = control.run_poll_cycle().await.unwrap();
         assert_eq!(
@@ -2061,6 +2209,17 @@ mod tests {
                 .last_ban_decision_at
                 .is_some()
         );
+        let trace_payload = trace_subscription.receiver.try_recv().unwrap();
+        let trace: PolicyTraceRecord = serde_json::from_str(&trace_payload).unwrap();
+        assert_eq!(trace.torrent.hash, "abc123");
+        assert_eq!(trace.torrent.name, None);
+        assert!(trace.prior_session.is_some());
+        assert_eq!(trace.evaluated_session.latest_progress, 0.1005);
+        assert_eq!(trace.guardrail_inputs.offence_history.offence_count, 0);
+        assert!(matches!(
+            trace.decision_output.disposition,
+            TraceBanDisposition::Ban { .. }
+        ));
 
         server.await.unwrap();
     }

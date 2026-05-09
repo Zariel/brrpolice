@@ -56,6 +56,10 @@ impl PolicyTracePublisher {
         self.total_dropped.load(Ordering::Relaxed)
     }
 
+    pub fn should_publish(&self) -> bool {
+        self.is_enabled() && self.active_client_count() > 0
+    }
+
     pub fn subscribe(&self) -> std::result::Result<PolicyTraceSubscription, SubscribeError> {
         if !self.is_enabled() {
             return Err(SubscribeError::Disabled);
