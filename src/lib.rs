@@ -8,4 +8,5 @@ pub mod policy;
 pub mod policy_trace;
 pub mod qbittorrent;
 pub mod runtime;
+pub mod trace_publisher;
 pub mod types;
