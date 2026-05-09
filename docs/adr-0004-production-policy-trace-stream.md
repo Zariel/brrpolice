@@ -31,6 +31,11 @@ The trace facility will expose an on-demand HTTP streaming endpoint that emits n
 JSON policy trace records while a client is connected. It is intended for short, explicit capture
 windows through Kubernetes port-forwarding or a tightly scoped internal debug service.
 
+Trace data will replace operator-log replay as the simulator's research input. The existing
+log-based replay path should be removed once trace ingestion and current-policy reproduction are in
+place. Future scoring-policy comparisons should be driven from trace JSONL, not from enriched
+application logs.
+
 Initial endpoint shape:
 
 ```text
@@ -53,6 +58,7 @@ observation.
 
 - collect high-fidelity production observations without permanently increasing log volume
 - make policy research independent of operator log formatting
+- replace simulator log replay with trace replay
 - let the simulator replay current production behavior exactly before comparing candidate policies
 - support Kubernetes-friendly ad hoc capture through `kubectl port-forward`
 - keep sensitive trace data away from default logs and public ingress paths
@@ -121,7 +127,8 @@ Fields may be added in later schema versions, but existing field meanings must n
 
 ## Replay Contract
 
-The simulator must gain a trace-input mode that consumes policy trace JSONL.
+The simulator must move to a trace-input model that consumes policy trace JSONL. The existing
+operator-log replay input mode should be deleted rather than kept as a parallel research path.
 
 The core correctness gate is:
 
@@ -129,7 +136,8 @@ The core correctness gate is:
   evaluation state and decision outcome
 
 Only after that fidelity check passes should the simulator compare candidate models against the same
-trace observations.
+trace observations. Candidate comparison commands should fail fast if given operator logs instead of
+policy traces.
 
 Trace replay reports should separate:
 
@@ -139,6 +147,10 @@ Trace replay reports should separate:
 - guardrail or exemption differences
 
 This keeps data quality failures from being mistaken for policy behavior.
+
+Removing log replay is part of the replay contract. Keeping both replay sources would make future
+research ambiguous because log replay and trace replay would have different fidelity, identity, and
+guardrail semantics.
 
 ## Runtime Behavior
 
@@ -191,6 +203,15 @@ Rejected as the primary research path. It is simple and works with existing log 
 mixes high-cardinality research payloads into operator logs and still leaves replay coupled to log
 formatting choices.
 
+The simulator should not keep this as a supported candidate-evaluation input after trace replay
+lands.
+
+### Keep log replay as a compatibility path
+
+Rejected. A compatibility path would preserve the weaker data source and make it too easy to keep
+making policy decisions from incomplete inputs. Historical logs can remain useful as old evidence,
+but the simulator's policy-research path should require trace records.
+
 ### Write trace files inside the container
 
 Rejected for the first iteration. Files are useful for long captures, but they add lifecycle,
@@ -221,6 +242,8 @@ on-demand stream and does not remove the need for a versioned trace schema.
 - trace records can expose sensitive operational data if enabled carelessly
 - simulator and trace schema versioning become part of the policy research workflow
 - the control loop needs a non-blocking trace publication path
+- historical log corpora will need to be recollected as traces before they can drive future
+  candidate decisions
 
 ## Rollout Plan
 
@@ -229,7 +252,8 @@ on-demand stream and does not remove the need for a versioned trace schema.
 3. Emit policy trace records from the control loop after each peer evaluation.
 4. Add simulator support for trace JSONL input.
 5. Add a reproduction check that compares recorded current-policy decisions with replayed decisions.
-6. Use trace replay as the gate for future scoring-policy research.
+6. Remove simulator log-replay parsing, flags, reports, and documentation.
+7. Use trace replay as the gate for future scoring-policy research.
 
 ## Acceptance Gates
 
@@ -240,9 +264,11 @@ No policy research decision should depend on production traces until all of thes
 - slow or disconnected clients cannot block policy evaluation
 - trace replay reproduces current-policy decisions for a captured trace corpus
 - the simulator reports reproduction failures separately from candidate deltas
+- the simulator no longer accepts operator logs as policy-research replay input
 - documentation clearly marks trace files as sensitive data
 
 ## Relationship to Scoring-Policy Research
 
 This ADR changes the evidence pipeline for future scoring-policy changes. Candidate selection should
-be driven by dedicated policy traces rather than ordinary operator-log replay alone.
+be driven by dedicated policy traces, and ordinary operator-log replay should be removed from the
+simulator research workflow.
