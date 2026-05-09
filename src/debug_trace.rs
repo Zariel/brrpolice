@@ -9,17 +9,18 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, stream};
 use humantime::parse_duration;
 use serde::Deserialize;
 use tokio::sync::watch;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::{
     config::{AppConfig, DebugPolicyTraceConfig},
     policy_trace::{PolicyTraceRecord, TraceBanDisposition, TracePeerSessionState},
-    trace_publisher::{PolicyTracePublisher, SubscribeError, TraceSubscriptionFilter},
+    trace_publisher::{
+        PolicyTracePublisher, PolicyTraceSubscription, SubscribeError, TraceSubscriptionFilter,
+    },
 };
 
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -114,41 +115,99 @@ async fn stream_policy_trace(
         }
     };
 
-    let client_id = subscription.client_id;
-    let publisher = state.publisher;
-    let redaction_config = state.config;
-    let include_names = options.include_names;
-    let stream = ReceiverStream::new(subscription.receiver)
-        .take_until(tokio::time::sleep(options.duration))
-        .map(move |mut record| {
-            let mut payload = String::new();
-            if let Some(dropped_count) = publisher.take_dropped_for_client(client_id)
-                && dropped_count > 0
-            {
-                payload.push_str(
-                    &serde_json::json!({
-                        "record_type": "dropped_records",
-                        "schema_version": 1,
-                        "client_id": client_id,
-                        "dropped_count": dropped_count,
-                    })
-                    .to_string(),
-                );
-                payload.push('\n');
-            }
-            apply_stream_redaction(&mut record, &redaction_config, include_names);
-            payload.push_str(
-                &serde_json::to_string(&record).expect("policy trace record serializes to JSON"),
-            );
-            payload.push('\n');
-            Ok::<Bytes, Infallible>(Bytes::from(payload))
-        });
+    let stream = trace_stream(
+        subscription,
+        state.publisher,
+        state.config,
+        options.include_names,
+        options.duration,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, NDJSON_CONTENT_TYPE)
         .body(Body::from_stream(stream))
         .expect("trace stream response is valid")
+}
+
+fn trace_stream(
+    subscription: PolicyTraceSubscription,
+    publisher: Arc<PolicyTracePublisher>,
+    redaction_config: DebugPolicyTraceConfig,
+    include_names: bool,
+    duration: Duration,
+) -> impl Stream<Item = std::result::Result<Bytes, Infallible>> {
+    let deadline = tokio::time::Instant::now() + duration;
+    stream::unfold(
+        TraceStreamState {
+            subscription,
+            publisher,
+            redaction_config,
+            include_names,
+            deadline,
+        },
+        |mut state| async move {
+            if tokio::time::Instant::now() >= state.deadline {
+                return state
+                    .final_dropped_payload()
+                    .map(|payload| (Ok(Bytes::from(payload)), state));
+            }
+            tokio::select! {
+                record = state.subscription.receiver.recv() => {
+                    match record {
+                        Some(record) => Some((Ok(Bytes::from(state.record_payload(record))), state)),
+                        None => state.final_dropped_payload().map(|payload| (Ok(Bytes::from(payload)), state)),
+                    }
+                }
+                _ = tokio::time::sleep_until(state.deadline) => {
+                    state.final_dropped_payload().map(|payload| (Ok(Bytes::from(payload)), state))
+                }
+            }
+        },
+    )
+}
+
+struct TraceStreamState {
+    subscription: PolicyTraceSubscription,
+    publisher: Arc<PolicyTracePublisher>,
+    redaction_config: DebugPolicyTraceConfig,
+    include_names: bool,
+    deadline: tokio::time::Instant,
+}
+
+impl TraceStreamState {
+    fn record_payload(&self, mut record: PolicyTraceRecord) -> String {
+        let mut payload = self.dropped_payload().unwrap_or_default();
+        apply_stream_redaction(&mut record, &self.redaction_config, self.include_names);
+        payload.push_str(
+            &serde_json::to_string(&record).expect("policy trace record serializes to JSON"),
+        );
+        payload.push('\n');
+        payload
+    }
+
+    fn final_dropped_payload(&self) -> Option<String> {
+        self.dropped_payload()
+    }
+
+    fn dropped_payload(&self) -> Option<String> {
+        let dropped_count = self
+            .publisher
+            .take_dropped_for_client(self.subscription.client_id)?;
+        if dropped_count == 0 {
+            return None;
+        }
+
+        let mut payload = serde_json::json!({
+            "record_type": "dropped_records",
+            "schema_version": 1,
+            "client_id": self.subscription.client_id,
+            "dropped_count": dropped_count,
+        })
+        .to_string();
+        payload.push('\n');
+        Some(payload)
+    }
 }
 
 fn apply_stream_redaction(
@@ -249,6 +308,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use futures_util::{StreamExt as _, pin_mut};
     use tokio::sync::watch;
     use tower::ServiceExt;
 
@@ -616,6 +676,60 @@ mod tests {
         assert_eq!(notice["dropped_count"], 1);
         let delivered: PolicyTraceRecord = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(delivered.policy_trace_id, "debug-http-test");
+    }
+
+    #[tokio::test]
+    async fn stream_reports_tail_drops_when_duration_expires_without_later_record() {
+        let publisher = Arc::new(PolicyTracePublisher::new(true, 1, 1));
+        let subscription = publisher.subscribe().unwrap();
+        let stream = super::trace_stream(
+            subscription,
+            publisher.clone(),
+            test_config(Duration::from_millis(30)),
+            false,
+            Duration::from_millis(30),
+        );
+        pin_mut!(stream);
+
+        let record = sample_record();
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            crate::trace_publisher::PublishOutcome::Published {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+        let first = stream.next().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert_eq!(first.lines().count(), 1);
+        let delivered: PolicyTraceRecord =
+            serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        assert_eq!(delivered.policy_trace_id, "debug-http-test");
+
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            crate::trace_publisher::PublishOutcome::Published {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(
+            publisher.publish(&record).unwrap(),
+            crate::trace_publisher::PublishOutcome::Published {
+                delivered: 0,
+                dropped: 1
+            }
+        );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let tail = stream.next().await.unwrap().unwrap();
+        let tail = std::str::from_utf8(&tail).unwrap();
+        let lines = tail.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let notice: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(notice["record_type"], "dropped_records");
+        assert_eq!(notice["dropped_count"], 1);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
