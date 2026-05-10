@@ -283,6 +283,8 @@ cargo run -p score-simulator -- --input policy-trace.jsonl
 
 Repeat `--input` to combine multiple trace files from the same policy/config capture set. The simulator first runs a current-policy reproduction gate: each trace observation is replayed through the configured policy and compared with the recorded evaluated session, guardrails, and decision output. A run exits nonzero if the trace cannot be reproduced, if the trace reports dropped records, or if the simulator config does not match the recorded trace policy inputs.
 
+Policy trace JSONL must match `schemas/policy-trace/v1.schema.json`. The Rust trace DTOs are generated from that schema during the normal cargo gates, and the simulator validates each JSONL line against the schema before decoding it.
+
 The output keeps replay fidelity separate from policy research deltas:
 
 - `current_policy_reproduction` and `reproduction_failure` identify data-quality, schema, config, or dropped-record problems.

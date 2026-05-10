@@ -2199,7 +2199,7 @@ mod tests {
         assert_eq!(trace.evaluated_session.latest_progress, 0.1005);
         assert_eq!(trace.guardrail_inputs.offence_history.offence_count, 0);
         match &trace.decision_output.disposition {
-            TraceBanDisposition::Ban { decision } => {
+            TraceBanDisposition::Ban { decision, .. } => {
                 assert_eq!(decision.peer_ip, Some("10.0.0.10".parse().unwrap()));
             }
             other => panic!("expected ban disposition, got {other:?}"),

@@ -17,7 +17,10 @@ use tracing::info;
 
 use crate::{
     config::{AppConfig, DebugPolicyTraceConfig},
-    policy_trace::{PolicyTraceRecord, TraceBanDisposition, TracePeerSessionState},
+    policy_trace::{
+        POLICY_TRACE_SCHEMA_VERSION, PolicyTraceDroppedRecordType, PolicyTraceDroppedRecords,
+        PolicyTraceRecord, TraceBanDisposition, TracePeerSessionState,
+    },
     trace_publisher::{
         PolicyTracePublisher, PolicyTraceSubscription, SubscribeError, TraceSubscriptionFilter,
     },
@@ -198,13 +201,14 @@ impl TraceStreamState {
             return None;
         }
 
-        let mut payload = serde_json::json!({
-            "record_type": "dropped_records",
-            "schema_version": 1,
-            "client_id": self.subscription.client_id,
-            "dropped_count": dropped_count,
-        })
-        .to_string();
+        let notice = PolicyTraceDroppedRecords {
+            record_type: PolicyTraceDroppedRecordType::DroppedRecords,
+            schema_version: POLICY_TRACE_SCHEMA_VERSION,
+            client_id: self.subscription.client_id,
+            dropped_count,
+        };
+        let mut payload =
+            serde_json::to_string(&notice).expect("dropped policy trace notice serializes to JSON");
         payload.push('\n');
         Some(payload)
     }
@@ -230,7 +234,7 @@ fn apply_stream_redaction(
     }
     record.simulator_hints.peer_observation_identity.peer_ip = None;
     record.simulator_hints.peer_behaviour_identity.peer_ip = None;
-    if let TraceBanDisposition::Ban { decision } = &mut record.decision_output.disposition {
+    if let TraceBanDisposition::Ban { decision, .. } = &mut record.decision_output.disposition {
         decision.peer_ip = None;
     }
 }

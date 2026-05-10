@@ -125,6 +125,11 @@ For peer observation records, include:
 The first implementation may emit a compact schema, but it must preserve replay-critical state.
 Fields may be added in later schema versions, but existing field meanings must not change silently.
 
+The source schema for version 1 lives at `schemas/policy-trace/v1.schema.json`. The Rust trace DTOs
+used by the debug stream and simulator are generated from that schema by `typify` during the normal
+`cargo check`, `cargo build`, and `cargo test` gates; there is no separate checked-in generated file.
+Run `cargo check` after schema edits to regenerate and type-check the macro expansion.
+
 ### Schema Version 1 Semantics
 
 `schema_version = 1` records are replay records, not operator logs. Field names and meanings are

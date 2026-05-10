@@ -1,0 +1,560 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zariel.example/schemas/brrpolice/policy-trace/v1.schema.json",
+  "title": "PolicyTraceLine",
+  "description": "ADR-0004 policy trace JSONL line. Objects intentionally allow additive fields for forward compatibility.",
+  "oneOf": [
+    { "$ref": "#/$defs/PolicyTraceRecord" },
+    { "$ref": "#/$defs/PolicyTraceDroppedRecords" }
+  ],
+  "$defs": {
+    "IpAddr": {
+      "title": "IpAddr",
+      "type": "string"
+    },
+    "U16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "U32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "U64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "PolicyTraceRecordType": {
+      "title": "PolicyTraceRecordType",
+      "type": "string",
+      "enum": ["peer_observation"]
+    },
+    "PolicyTraceDroppedRecordType": {
+      "title": "PolicyTraceDroppedRecordType",
+      "type": "string",
+      "enum": ["dropped_records"]
+    },
+    "PolicyTraceRecord": {
+      "title": "PolicyTraceRecord",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "record_type",
+        "schema_version",
+        "observed_at",
+        "service_version",
+        "policy_trace_id",
+        "config_fingerprint",
+        "torrent",
+        "peer",
+        "prior_session",
+        "evaluated_session",
+        "policy_inputs",
+        "guardrail_inputs",
+        "decision_output",
+        "simulator_hints"
+      ],
+      "properties": {
+        "record_type": { "$ref": "#/$defs/PolicyTraceRecordType" },
+        "schema_version": { "$ref": "#/$defs/U16" },
+        "observed_at": { "type": "string" },
+        "service_version": { "type": "string" },
+        "policy_trace_id": { "type": "string" },
+        "config_fingerprint": { "type": "string" },
+        "torrent": { "$ref": "#/$defs/TraceTorrent" },
+        "peer": { "$ref": "#/$defs/TracePeer" },
+        "prior_session": {
+          "oneOf": [
+            { "$ref": "#/$defs/TracePeerSessionState" },
+            { "type": "null" }
+          ]
+        },
+        "evaluated_session": { "$ref": "#/$defs/TracePeerSessionState" },
+        "policy_inputs": { "$ref": "#/$defs/TracePolicyInputs" },
+        "guardrail_inputs": { "$ref": "#/$defs/TraceGuardrailInputs" },
+        "decision_output": { "$ref": "#/$defs/TraceDecisionOutput" },
+        "simulator_hints": { "$ref": "#/$defs/TraceSimulatorHints" }
+      }
+    },
+    "PolicyTraceDroppedRecords": {
+      "title": "PolicyTraceDroppedRecords",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["record_type", "schema_version", "client_id", "dropped_count"],
+      "properties": {
+        "record_type": { "$ref": "#/$defs/PolicyTraceDroppedRecordType" },
+        "schema_version": { "$ref": "#/$defs/U16" },
+        "client_id": { "$ref": "#/$defs/U64" },
+        "dropped_count": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "TraceTorrent": {
+      "title": "TraceTorrent",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["hash", "name", "tracker", "total_size_bytes", "category", "tags", "total_seeders", "in_scope"],
+      "properties": {
+        "hash": { "type": "string" },
+        "name": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "tracker": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "total_size_bytes": {
+          "oneOf": [
+            { "$ref": "#/$defs/U64" },
+            { "type": "null" }
+          ]
+        },
+        "category": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "total_seeders": { "$ref": "#/$defs/U32" },
+        "in_scope": { "type": "boolean" }
+      }
+    },
+    "TracePeer": {
+      "title": "TracePeer",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["ip", "port", "progress", "up_rate_bps"],
+      "properties": {
+        "ip": {
+          "oneOf": [
+            { "$ref": "#/$defs/IpAddr" },
+            { "type": "null" }
+          ]
+        },
+        "port": { "$ref": "#/$defs/U16" },
+        "progress": { "type": "number" },
+        "up_rate_bps": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "TracePeerObservationIdentity": {
+      "title": "TracePeerObservationIdentity",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["torrent_hash", "peer_ip", "peer_port"],
+      "properties": {
+        "torrent_hash": { "type": "string" },
+        "peer_ip": {
+          "oneOf": [
+            { "$ref": "#/$defs/IpAddr" },
+            { "type": "null" }
+          ]
+        },
+        "peer_port": { "$ref": "#/$defs/U16" }
+      }
+    },
+    "TracePeerBehaviourIdentity": {
+      "title": "TracePeerBehaviourIdentity",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["torrent_hash", "peer_ip"],
+      "properties": {
+        "torrent_hash": { "type": "string" },
+        "peer_ip": {
+          "oneOf": [
+            { "$ref": "#/$defs/IpAddr" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "TracePeerSessionState": {
+      "title": "TracePeerSessionState",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "observation_id",
+        "offence_identity",
+        "first_seen_at",
+        "last_seen_at",
+        "baseline_progress",
+        "latest_progress",
+        "rolling_avg_up_rate_bps",
+        "observed_duration_ms",
+        "bad_duration_ms",
+        "ban_score",
+        "ban_score_above_threshold_duration_ms",
+        "churn_reconnect_count",
+        "churn_window_started_at",
+        "churn_amplifier",
+        "sample_count",
+        "last_torrent_seeder_count",
+        "last_exemption_reason",
+        "bannable_since",
+        "last_ban_decision_at"
+      ],
+      "properties": {
+        "observation_id": { "$ref": "#/$defs/TracePeerObservationIdentity" },
+        "offence_identity": { "$ref": "#/$defs/TracePeerBehaviourIdentity" },
+        "first_seen_at": { "type": "string" },
+        "last_seen_at": { "type": "string" },
+        "baseline_progress": { "type": "number" },
+        "latest_progress": { "type": "number" },
+        "rolling_avg_up_rate_bps": { "$ref": "#/$defs/U64" },
+        "observed_duration_ms": { "$ref": "#/$defs/U64" },
+        "bad_duration_ms": { "$ref": "#/$defs/U64" },
+        "ban_score": { "type": "number" },
+        "ban_score_above_threshold_duration_ms": { "$ref": "#/$defs/U64" },
+        "churn_reconnect_count": { "$ref": "#/$defs/U32" },
+        "churn_window_started_at": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "churn_amplifier": { "type": "number" },
+        "sample_count": { "$ref": "#/$defs/U32" },
+        "last_torrent_seeder_count": { "$ref": "#/$defs/U32" },
+        "last_exemption_reason": {
+          "oneOf": [
+            { "$ref": "#/$defs/TraceExemptionReason" },
+            { "type": "null" }
+          ]
+        },
+        "bannable_since": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "last_ban_decision_at": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "TracePolicyInputs": {
+      "title": "TracePolicyInputs",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "new_peer_grace_period_ms",
+        "decay_window_ms",
+        "ignore_peer_progress_at_or_above",
+        "min_total_seeders",
+        "reban_cooldown_ms",
+        "score",
+        "ban_ladder_duration_ms"
+      ],
+      "properties": {
+        "new_peer_grace_period_ms": { "$ref": "#/$defs/U64" },
+        "decay_window_ms": { "$ref": "#/$defs/U64" },
+        "ignore_peer_progress_at_or_above": { "type": "number" },
+        "min_total_seeders": { "$ref": "#/$defs/U32" },
+        "reban_cooldown_ms": { "$ref": "#/$defs/U64" },
+        "score": { "$ref": "#/$defs/TraceScorePolicyInputs" },
+        "ban_ladder_duration_ms": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/U64" }
+        }
+      }
+    },
+    "TraceScorePolicyInputs": {
+      "title": "TraceScorePolicyInputs",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "target_rate_bps",
+        "required_progress_delta",
+        "progress_rate_scale_start",
+        "progress_rate_scale_end",
+        "progress_rate_min_scale",
+        "weight_rate",
+        "weight_progress",
+        "rate_risk_floor",
+        "ban_threshold",
+        "clear_threshold",
+        "sustain_duration_ms",
+        "decay_per_second",
+        "min_observation_duration_ms",
+        "max_score",
+        "churn_enabled",
+        "churn_reconnect_window_ms",
+        "churn_min_reconnects",
+        "churn_max_amplifier",
+        "churn_decay_per_second"
+      ],
+      "properties": {
+        "target_rate_bps": { "$ref": "#/$defs/U64" },
+        "required_progress_delta": { "type": "number" },
+        "progress_rate_scale_start": { "type": "number" },
+        "progress_rate_scale_end": { "type": "number" },
+        "progress_rate_min_scale": { "type": "number" },
+        "weight_rate": { "type": "number" },
+        "weight_progress": { "type": "number" },
+        "rate_risk_floor": { "type": "number" },
+        "ban_threshold": { "type": "number" },
+        "clear_threshold": { "type": "number" },
+        "sustain_duration_ms": { "$ref": "#/$defs/U64" },
+        "decay_per_second": { "type": "number" },
+        "min_observation_duration_ms": { "$ref": "#/$defs/U64" },
+        "max_score": { "type": "number" },
+        "churn_enabled": { "type": "boolean" },
+        "churn_reconnect_window_ms": { "$ref": "#/$defs/U64" },
+        "churn_min_reconnects": { "$ref": "#/$defs/U32" },
+        "churn_max_amplifier": { "type": "number" },
+        "churn_decay_per_second": { "type": "number" }
+      }
+    },
+    "TraceGuardrailInputs": {
+      "title": "TraceGuardrailInputs",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "exemption_reason",
+        "allowlisted_peer",
+        "active_ban",
+        "reban_cooldown_remaining_ms",
+        "offence_history"
+      ],
+      "properties": {
+        "exemption_reason": {
+          "oneOf": [
+            { "$ref": "#/$defs/TraceExemptionReason" },
+            { "type": "null" }
+          ]
+        },
+        "allowlisted_peer": { "type": "boolean" },
+        "active_ban": { "type": "boolean" },
+        "reban_cooldown_remaining_ms": {
+          "oneOf": [
+            { "$ref": "#/$defs/U64" },
+            { "type": "null" }
+          ]
+        },
+        "offence_history": { "$ref": "#/$defs/TraceOffenceHistory" }
+      }
+    },
+    "TraceOffenceHistory": {
+      "title": "TraceOffenceHistory",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["offence_count", "last_ban_expires_at"],
+      "properties": {
+        "offence_count": { "$ref": "#/$defs/U32" },
+        "last_ban_expires_at": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "TraceDecisionOutput": {
+      "title": "TraceDecisionOutput",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "disposition",
+        "is_bad_sample",
+        "is_bannable",
+        "progress_delta",
+        "sample_score_risk",
+        "effective_sample_score_risk"
+      ],
+      "properties": {
+        "disposition": { "$ref": "#/$defs/TraceBanDisposition" },
+        "is_bad_sample": { "type": "boolean" },
+        "is_bannable": { "type": "boolean" },
+        "progress_delta": { "type": "number" },
+        "sample_score_risk": { "type": "number" },
+        "effective_sample_score_risk": { "type": "number" }
+      }
+    },
+    "TraceSimulatorHints": {
+      "title": "TraceSimulatorHints",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "peer_observation_identity",
+        "peer_behaviour_identity",
+        "sample_duration_ms",
+        "sample_up_rate_bps",
+        "current_rate_band",
+        "band_at_ban"
+      ],
+      "properties": {
+        "peer_observation_identity": { "$ref": "#/$defs/TracePeerObservationIdentity" },
+        "peer_behaviour_identity": { "$ref": "#/$defs/TracePeerBehaviourIdentity" },
+        "sample_duration_ms": { "$ref": "#/$defs/U64" },
+        "sample_up_rate_bps": { "$ref": "#/$defs/U64" },
+        "current_rate_band": { "$ref": "#/$defs/TraceRateBand" },
+        "band_at_ban": {
+          "oneOf": [
+            { "$ref": "#/$defs/TraceRateBand" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "TraceRateBand": {
+      "title": "TraceRateBand",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["band", "up_rate_bps", "target_rate_bps", "target_ratio"],
+      "properties": {
+        "band": { "$ref": "#/$defs/TraceRateBandName" },
+        "up_rate_bps": { "$ref": "#/$defs/U64" },
+        "target_rate_bps": { "$ref": "#/$defs/U64" },
+        "target_ratio": { "type": "number" }
+      }
+    },
+    "TraceRateBandName": {
+      "title": "TraceRateBandName",
+      "type": "string",
+      "enum": ["meets_target", "moderate_deficit", "severe_deficit"]
+    },
+    "TraceExemptionReason": {
+      "title": "TraceExemptionReason",
+      "oneOf": [
+        {
+          "title": "TorrentExcluded",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["reason_code"],
+          "properties": {
+            "reason_code": { "type": "string", "enum": ["torrent_excluded"] }
+          }
+        },
+        {
+          "title": "AllowlistedPeer",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["reason_code"],
+          "properties": {
+            "reason_code": { "type": "string", "enum": ["allowlisted_peer"] }
+          }
+        },
+        {
+          "title": "NearComplete",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["reason_code", "progress", "threshold"],
+          "properties": {
+            "reason_code": { "type": "string", "enum": ["near_complete"] },
+            "progress": { "type": "number" },
+            "threshold": { "type": "number" }
+          }
+        },
+        {
+          "title": "NewPeerGracePeriod",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["reason_code", "age_ms", "grace_period_ms"],
+          "properties": {
+            "reason_code": { "type": "string", "enum": ["new_peer_grace_period"] },
+            "age_ms": { "$ref": "#/$defs/U64" },
+            "grace_period_ms": { "$ref": "#/$defs/U64" }
+          }
+        },
+        {
+          "title": "AlreadyBanned",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["reason_code"],
+          "properties": {
+            "reason_code": { "type": "string", "enum": ["already_banned"] }
+          }
+        }
+      ]
+    },
+    "TraceBanDisposition": {
+      "title": "TraceBanDisposition",
+      "oneOf": [
+        {
+          "title": "Exempt",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["disposition", "reason"],
+          "properties": {
+            "disposition": { "type": "string", "enum": ["exempt"] },
+            "reason": { "$ref": "#/$defs/TraceExemptionReason" }
+          }
+        },
+        {
+          "title": "NotBannableYet",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["disposition", "observed_duration_ms", "required_observation_ms", "bad_duration_ms", "required_bad_duration_ms"],
+          "properties": {
+            "disposition": { "type": "string", "enum": ["not_bannable_yet"] },
+            "observed_duration_ms": { "$ref": "#/$defs/U64" },
+            "required_observation_ms": { "$ref": "#/$defs/U64" },
+            "bad_duration_ms": { "$ref": "#/$defs/U64" },
+            "required_bad_duration_ms": { "$ref": "#/$defs/U64" }
+          }
+        },
+        {
+          "title": "RebanCooldown",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["disposition", "remaining_ms"],
+          "properties": {
+            "disposition": { "type": "string", "enum": ["reban_cooldown"] },
+            "remaining_ms": { "$ref": "#/$defs/U64" }
+          }
+        },
+        {
+          "title": "DuplicateSuppressed",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["disposition"],
+          "properties": {
+            "disposition": { "type": "string", "enum": ["duplicate_suppressed"] }
+          }
+        },
+        {
+          "title": "Ban",
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["disposition", "decision"],
+          "properties": {
+            "disposition": { "type": "string", "enum": ["ban"] },
+            "decision": { "$ref": "#/$defs/TraceBanDecision" }
+          }
+        }
+      ]
+    },
+    "TraceBanDecision": {
+      "title": "TraceBanDecision",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["peer_ip", "peer_port", "offence_number", "ttl_ms", "reason_code", "reason_details"],
+      "properties": {
+        "peer_ip": {
+          "oneOf": [
+            { "$ref": "#/$defs/IpAddr" },
+            { "type": "null" }
+          ]
+        },
+        "peer_port": { "$ref": "#/$defs/U16" },
+        "offence_number": { "$ref": "#/$defs/U32" },
+        "ttl_ms": { "$ref": "#/$defs/U64" },
+        "reason_code": { "type": "string" },
+        "reason_details": { "type": "string" }
+      }
+    }
+  }
+}

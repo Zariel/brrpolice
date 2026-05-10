@@ -18,7 +18,7 @@ use brrpolice::{
         POLICY_TRACE_SCHEMA_VERSION, PolicyTraceRecord, TraceBanDisposition, TraceDecisionOutput,
         TraceExemptionReason, TraceGuardrailInputs, TraceOffenceHistory,
         TracePeerBehaviourIdentity, TracePeerObservationIdentity, TracePeerSessionState,
-        TracePolicyInputs, duration_millis,
+        TracePolicyInputs, duration_millis, validate_policy_trace_v1_value,
     },
     types::{
         BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
@@ -319,6 +319,7 @@ fn parse_trace_line(line: &str) -> Result<TraceInputLine> {
     if schema_version != u64::from(POLICY_TRACE_SCHEMA_VERSION) {
         bail!("unsupported policy trace schema_version `{schema_version}`");
     }
+    validate_policy_trace_v1_value(&value).context("policy trace v1 schema validation")?;
 
     match record_type {
         "peer_observation" => Ok(TraceInputLine::PeerObservation(Box::new(
@@ -531,7 +532,7 @@ fn process_trace_record(
         .candidate_sessions
         .insert(session_key.clone(), candidate_session);
 
-    if let TraceBanDisposition::Ban { decision } = &record.decision_output.disposition {
+    if let TraceBanDisposition::Ban { decision, .. } = &record.decision_output.disposition {
         summary.actual_bans += 1;
         record_recorded_ban(state, decision, &record.torrent.hash, observed_at)?;
     }
@@ -883,11 +884,12 @@ fn offence_identity_from_trace(value: &TracePeerBehaviourIdentity) -> Result<Off
 
 fn exemption_from_trace(value: &TraceExemptionReason) -> Result<ExemptionReason> {
     Ok(match value {
-        TraceExemptionReason::TorrentExcluded => ExemptionReason::TorrentExcluded,
-        TraceExemptionReason::AllowlistedPeer => ExemptionReason::AllowlistedPeer,
+        TraceExemptionReason::TorrentExcluded { .. } => ExemptionReason::TorrentExcluded,
+        TraceExemptionReason::AllowlistedPeer { .. } => ExemptionReason::AllowlistedPeer,
         TraceExemptionReason::NearComplete {
             progress,
             threshold,
+            ..
         } => ExemptionReason::NearComplete {
             progress: *progress,
             threshold: *threshold,
@@ -895,11 +897,12 @@ fn exemption_from_trace(value: &TraceExemptionReason) -> Result<ExemptionReason>
         TraceExemptionReason::NewPeerGracePeriod {
             age_ms,
             grace_period_ms,
+            ..
         } => ExemptionReason::NewPeerGracePeriod {
             age: Duration::from_millis(*age_ms),
             grace_period: Duration::from_millis(*grace_period_ms),
         },
-        TraceExemptionReason::AlreadyBanned => ExemptionReason::AlreadyBanned,
+        TraceExemptionReason::AlreadyBanned { .. } => ExemptionReason::AlreadyBanned,
     })
 }
 

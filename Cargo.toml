@@ -15,6 +15,7 @@ config = { version = "0.15.18", default-features = false, features = ["toml"] }
 futures-util = "0.3.32"
 humantime = "2.3.0"
 ipnet = "2.11.0"
+jsonschema = { version = "0.46.4", default-features = false }
 prometheus-client = "0.24.0"
 reqwest = { version = "0.12.24", default-features = false, features = ["cookies", "json", "rustls-tls"] }
 secrecy = "0.10.3"
@@ -29,6 +30,7 @@ toml = "0.9.8"
 tower = { version = "0.5.2", features = ["util"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+typify = "0.6.2"
 
 [dev-dependencies]
 proptest = "1.9.0"

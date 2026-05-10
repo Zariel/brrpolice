@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
 use std::{
-    net::IpAddr,
+    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 
 use crate::{
     config::{PolicyConfig, ScorePolicyConfig},
@@ -16,42 +17,55 @@ use crate::{
 };
 
 pub const POLICY_TRACE_SCHEMA_VERSION: u16 = 1;
+pub const POLICY_TRACE_V1_SCHEMA_JSON: &str =
+    include_str!("../schemas/policy-trace/v1.schema.json");
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PolicyTraceRecord {
-    pub record_type: PolicyTraceRecordType,
-    pub schema_version: u16,
-    pub observed_at: String,
-    pub service_version: String,
-    pub policy_trace_id: String,
-    pub config_fingerprint: String,
-    pub torrent: TraceTorrent,
-    pub peer: TracePeer,
-    pub prior_session: Option<TracePeerSessionState>,
-    pub evaluated_session: TracePeerSessionState,
-    pub policy_inputs: TracePolicyInputs,
-    pub guardrail_inputs: TraceGuardrailInputs,
-    pub decision_output: TraceDecisionOutput,
-    pub simulator_hints: TraceSimulatorHints,
+static POLICY_TRACE_V1_VALIDATOR: LazyLock<Result<jsonschema::Validator, String>> =
+    LazyLock::new(|| {
+        let schema: Value = serde_json::from_str(POLICY_TRACE_V1_SCHEMA_JSON)
+            .map_err(|error| format!("invalid embedded policy trace schema: {error}"))?;
+        jsonschema::draft202012::options()
+            .build(&schema)
+            .map_err(|error| format!("failed to compile policy trace schema: {error}"))
+    });
+
+pub fn validate_policy_trace_v1_value(value: &Value) -> Result<()> {
+    let validator = POLICY_TRACE_V1_VALIDATOR
+        .as_ref()
+        .map_err(|error| anyhow!(error.clone()))?;
+    if let Err(error) = validator.validate(value) {
+        bail!("policy trace v1 schema validation failed: {error}");
+    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyTraceRecordType {
-    PeerObservation,
+pub fn validate_policy_trace_v1_json(raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw).context("invalid JSON trace line")?;
+    validate_policy_trace_v1_value(&value)?;
+    Ok(value)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceTorrent {
-    pub hash: String,
-    pub name: Option<String>,
-    pub tracker: Option<String>,
-    pub total_size_bytes: Option<u64>,
-    pub category: Option<String>,
-    pub tags: Vec<String>,
-    pub total_seeders: u32,
-    pub in_scope: bool,
+mod generated {
+    typify::import_types!(
+        schema = "schemas/policy-trace/v1.schema.json",
+        derives = [PartialEq],
+        replace = {
+            IpAddr = std::net::IpAddr,
+            U16 = u16,
+            U32 = u32,
+            U64 = u64,
+        }
+    );
 }
+
+pub use generated::{
+    PolicyTraceDroppedRecordType, PolicyTraceDroppedRecords, PolicyTraceRecord,
+    PolicyTraceRecordType, TraceBanDecision, TraceBanDisposition, TraceDecisionOutput,
+    TraceExemptionReason, TraceGuardrailInputs, TraceOffenceHistory, TracePeer,
+    TracePeerBehaviourIdentity, TracePeerObservationIdentity, TracePeerSessionState,
+    TracePolicyInputs, TraceRateBand, TraceRateBandName, TraceScorePolicyInputs,
+    TraceSimulatorHints, TraceTorrent,
+};
 
 impl From<&TorrentScope> for TraceTorrent {
     fn from(value: &TorrentScope) -> Self {
@@ -66,37 +80,6 @@ impl From<&TorrentScope> for TraceTorrent {
             in_scope: value.in_scope,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TracePeer {
-    pub ip: Option<IpAddr>,
-    pub port: u16,
-    pub progress: f64,
-    pub up_rate_bps: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TracePeerSessionState {
-    pub observation_id: TracePeerObservationIdentity,
-    pub offence_identity: TracePeerBehaviourIdentity,
-    pub first_seen_at: String,
-    pub last_seen_at: String,
-    pub baseline_progress: f64,
-    pub latest_progress: f64,
-    pub rolling_avg_up_rate_bps: u64,
-    pub observed_duration_ms: u64,
-    pub bad_duration_ms: u64,
-    pub ban_score: f64,
-    pub ban_score_above_threshold_duration_ms: u64,
-    pub churn_reconnect_count: u32,
-    pub churn_window_started_at: Option<String>,
-    pub churn_amplifier: f64,
-    pub sample_count: u32,
-    pub last_torrent_seeder_count: u32,
-    pub last_exemption_reason: Option<TraceExemptionReason>,
-    pub bannable_since: Option<String>,
-    pub last_ban_decision_at: Option<String>,
 }
 
 impl From<&PeerSessionState> for TracePeerSessionState {
@@ -127,13 +110,6 @@ impl From<&PeerSessionState> for TracePeerSessionState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TracePeerObservationIdentity {
-    pub torrent_hash: String,
-    pub peer_ip: Option<IpAddr>,
-    pub peer_port: u16,
-}
-
 impl From<&PeerObservationId> for TracePeerObservationIdentity {
     fn from(value: &PeerObservationId) -> Self {
         Self {
@@ -144,12 +120,6 @@ impl From<&PeerObservationId> for TracePeerObservationIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TracePeerBehaviourIdentity {
-    pub torrent_hash: String,
-    pub peer_ip: Option<IpAddr>,
-}
-
 impl From<&OffenceIdentity> for TracePeerBehaviourIdentity {
     fn from(value: &OffenceIdentity) -> Self {
         Self {
@@ -157,17 +127,6 @@ impl From<&OffenceIdentity> for TracePeerBehaviourIdentity {
             peer_ip: Some(value.peer_ip),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TracePolicyInputs {
-    pub new_peer_grace_period_ms: u64,
-    pub decay_window_ms: u64,
-    pub ignore_peer_progress_at_or_above: f64,
-    pub min_total_seeders: u32,
-    pub reban_cooldown_ms: u64,
-    pub score: TraceScorePolicyInputs,
-    pub ban_ladder_duration_ms: Vec<u64>,
 }
 
 impl From<&PolicyConfig> for TracePolicyInputs {
@@ -188,29 +147,6 @@ impl From<&PolicyConfig> for TracePolicyInputs {
                 .collect(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceScorePolicyInputs {
-    pub target_rate_bps: u64,
-    pub required_progress_delta: f64,
-    pub progress_rate_scale_start: f64,
-    pub progress_rate_scale_end: f64,
-    pub progress_rate_min_scale: f64,
-    pub weight_rate: f64,
-    pub weight_progress: f64,
-    pub rate_risk_floor: f64,
-    pub ban_threshold: f64,
-    pub clear_threshold: f64,
-    pub sustain_duration_ms: u64,
-    pub decay_per_second: f64,
-    pub min_observation_duration_ms: u64,
-    pub max_score: f64,
-    pub churn_enabled: bool,
-    pub churn_reconnect_window_ms: u64,
-    pub churn_min_reconnects: u32,
-    pub churn_max_amplifier: f64,
-    pub churn_decay_per_second: f64,
 }
 
 impl From<&ScorePolicyConfig> for TraceScorePolicyInputs {
@@ -239,21 +175,6 @@ impl From<&ScorePolicyConfig> for TraceScorePolicyInputs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceGuardrailInputs {
-    pub exemption_reason: Option<TraceExemptionReason>,
-    pub allowlisted_peer: bool,
-    pub active_ban: bool,
-    pub reban_cooldown_remaining_ms: Option<u64>,
-    pub offence_history: TraceOffenceHistory,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TraceOffenceHistory {
-    pub offence_count: u32,
-    pub last_ban_expires_at: Option<String>,
-}
-
 impl From<&OffenceHistory> for TraceOffenceHistory {
     fn from(value: &OffenceHistory) -> Self {
         Self {
@@ -261,16 +182,6 @@ impl From<&OffenceHistory> for TraceOffenceHistory {
             last_ban_expires_at: value.last_ban_expires_at.map(trace_timestamp),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceDecisionOutput {
-    pub disposition: TraceBanDisposition,
-    pub is_bad_sample: bool,
-    pub is_bannable: bool,
-    pub progress_delta: f64,
-    pub sample_score_risk: f64,
-    pub effective_sample_score_risk: f64,
 }
 
 impl TraceDecisionOutput {
@@ -289,16 +200,6 @@ impl TraceDecisionOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceSimulatorHints {
-    pub peer_observation_identity: TracePeerObservationIdentity,
-    pub peer_behaviour_identity: TracePeerBehaviourIdentity,
-    pub sample_duration_ms: u64,
-    pub sample_up_rate_bps: u64,
-    pub current_rate_band: TraceRateBand,
-    pub band_at_ban: Option<TraceRateBand>,
-}
-
 impl TraceSimulatorHints {
     pub fn from_evaluation(evaluation: &PeerEvaluation, policy: &PolicyConfig) -> Self {
         let current_rate_band =
@@ -314,14 +215,6 @@ impl TraceSimulatorHints {
             band_at_ban,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceRateBand {
-    pub band: TraceRateBandName,
-    pub up_rate_bps: u64,
-    pub target_rate_bps: u64,
-    pub target_ratio: f64,
 }
 
 impl TraceRateBand {
@@ -348,70 +241,40 @@ impl TraceRateBand {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TraceRateBandName {
-    MeetsTarget,
-    ModerateDeficit,
-    SevereDeficit,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "reason_code", rename_all = "snake_case")]
-pub enum TraceExemptionReason {
-    TorrentExcluded,
-    AllowlistedPeer,
-    NearComplete { progress: f64, threshold: f64 },
-    NewPeerGracePeriod { age_ms: u64, grace_period_ms: u64 },
-    AlreadyBanned,
-}
-
 impl From<&ExemptionReason> for TraceExemptionReason {
     fn from(value: &ExemptionReason) -> Self {
         match value {
-            ExemptionReason::TorrentExcluded => Self::TorrentExcluded,
-            ExemptionReason::AllowlistedPeer => Self::AllowlistedPeer,
+            ExemptionReason::TorrentExcluded => Self::TorrentExcluded {
+                reason_code: generated::TorrentExcludedReasonCode::TorrentExcluded,
+            },
+            ExemptionReason::AllowlistedPeer => Self::AllowlistedPeer {
+                reason_code: generated::AllowlistedPeerReasonCode::AllowlistedPeer,
+            },
             ExemptionReason::NearComplete {
                 progress,
                 threshold,
             } => Self::NearComplete {
+                reason_code: generated::NearCompleteReasonCode::NearComplete,
                 progress: *progress,
                 threshold: *threshold,
             },
             ExemptionReason::NewPeerGracePeriod { age, grace_period } => Self::NewPeerGracePeriod {
+                reason_code: generated::NewPeerGracePeriodReasonCode::NewPeerGracePeriod,
                 age_ms: duration_millis(*age),
                 grace_period_ms: duration_millis(*grace_period),
             },
-            ExemptionReason::AlreadyBanned => Self::AlreadyBanned,
+            ExemptionReason::AlreadyBanned => Self::AlreadyBanned {
+                reason_code: generated::AlreadyBannedReasonCode::AlreadyBanned,
+            },
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "disposition", rename_all = "snake_case")]
-pub enum TraceBanDisposition {
-    Exempt {
-        reason: TraceExemptionReason,
-    },
-    NotBannableYet {
-        observed_duration_ms: u64,
-        required_observation_ms: u64,
-        bad_duration_ms: u64,
-        required_bad_duration_ms: u64,
-    },
-    RebanCooldown {
-        remaining_ms: u64,
-    },
-    DuplicateSuppressed,
-    Ban {
-        decision: TraceBanDecision,
-    },
 }
 
 impl From<&BanDisposition> for TraceBanDisposition {
     fn from(value: &BanDisposition) -> Self {
         match value {
             BanDisposition::Exempt(reason) => Self::Exempt {
+                disposition: generated::ExemptDisposition::Exempt,
                 reason: reason.into(),
             },
             BanDisposition::NotBannableYet {
@@ -420,30 +283,25 @@ impl From<&BanDisposition> for TraceBanDisposition {
                 bad_duration,
                 required_bad_duration,
             } => Self::NotBannableYet {
+                disposition: generated::NotBannableYetDisposition::NotBannableYet,
                 observed_duration_ms: duration_millis(*observed_duration),
                 required_observation_ms: duration_millis(*required_observation),
                 bad_duration_ms: duration_millis(*bad_duration),
                 required_bad_duration_ms: duration_millis(*required_bad_duration),
             },
             BanDisposition::RebanCooldown { remaining } => Self::RebanCooldown {
+                disposition: generated::RebanCooldownDisposition::RebanCooldown,
                 remaining_ms: duration_millis(*remaining),
             },
-            BanDisposition::DuplicateSuppressed => Self::DuplicateSuppressed,
+            BanDisposition::DuplicateSuppressed => Self::DuplicateSuppressed {
+                disposition: generated::DuplicateSuppressedDisposition::DuplicateSuppressed,
+            },
             BanDisposition::Ban(decision) => Self::Ban {
+                disposition: generated::BanDisposition::Ban,
                 decision: decision.into(),
             },
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TraceBanDecision {
-    pub peer_ip: Option<IpAddr>,
-    pub peer_port: u16,
-    pub offence_number: u32,
-    pub ttl_ms: u64,
-    pub reason_code: String,
-    pub reason_details: String,
 }
 
 impl From<&BanDecision> for TraceBanDecision {
@@ -552,12 +410,14 @@ mod tests {
         };
 
         let json = serde_json::to_string(&record).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert!(json.contains(r#""record_type":"peer_observation""#));
         assert!(json.contains(r#""schema_version":1"#));
         assert!(json.contains(r#""observed_duration_ms":30000"#));
         assert!(!json.contains("SystemTime"));
         assert!(!json.contains("Duration"));
+        validate_policy_trace_v1_value(&value).unwrap();
         assert_eq!(
             serde_json::from_str::<PolicyTraceRecord>(&json).unwrap(),
             record
@@ -583,6 +443,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schema_v1_replay_corpus_is_valid() {
+        for line in include_str!("../testdata/policy-trace/v1-replay-corpus.jsonl").lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            validate_policy_trace_v1_value(&value).unwrap();
+        }
+    }
+
+    #[test]
+    fn dropped_record_notice_validates_against_schema() {
+        let notice = PolicyTraceDroppedRecords {
+            record_type: PolicyTraceDroppedRecordType::DroppedRecords,
+            schema_version: POLICY_TRACE_SCHEMA_VERSION,
+            client_id: 7,
+            dropped_count: 3,
+        };
+        let value = serde_json::to_value(notice).unwrap();
+
+        validate_policy_trace_v1_value(&value).unwrap();
+        assert_eq!(value["record_type"], "dropped_records");
+    }
+
+    #[test]
+    fn schema_v1_allows_additive_fields() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/policy-trace/v1-exempt-peer.json"))
+                .unwrap();
+        value["future_top_level"] = serde_json::json!("allowed");
+        value["torrent"]["future_torrent_field"] = serde_json::json!({"nested": true});
+        value["decision_output"]["disposition"]["future_disposition_field"] = serde_json::json!(42);
+
+        validate_policy_trace_v1_value(&value).unwrap();
+        serde_json::from_value::<PolicyTraceRecord>(value).unwrap();
+    }
+
     fn assert_fixture(raw: &str, record_type: &str, disposition: &str) {
         let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert_eq!(expected["schema_version"], POLICY_TRACE_SCHEMA_VERSION);
@@ -591,6 +486,7 @@ mod tests {
             expected["decision_output"]["disposition"]["disposition"],
             disposition
         );
+        validate_policy_trace_v1_value(&expected).unwrap();
 
         let record: PolicyTraceRecord = serde_json::from_value(expected.clone()).unwrap();
         let actual = serde_json::to_value(record).unwrap();
