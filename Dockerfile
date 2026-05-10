@@ -30,6 +30,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY migrations ./migrations
+COPY schemas ./schemas
 COPY src ./src
 COPY crates/score-simulator/src crates/score-simulator/src
 
