@@ -48,9 +48,7 @@ async fn main() -> Result<()> {
     metrics.set_sqlite_size_bytes(persistence.sqlite_size_bytes().await?);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let qb_password = if config.qbittorrent.username.trim().is_empty() {
-        SecretString::from(String::new())
-    } else {
+    let qb_password = if config.qbittorrent.auth_mode_name() == "cookie" {
         SecretString::from(
             std::env::var(&config.qbittorrent.password_env).with_context(|| {
                 format!(
@@ -59,6 +57,8 @@ async fn main() -> Result<()> {
                 )
             })?,
         )
+    } else {
+        SecretString::from(String::new())
     };
 
     let qbittorrent = Arc::new(QbittorrentClient::new(

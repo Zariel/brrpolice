@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -23,7 +24,6 @@ use crate::{
 const AUTH_LOGIN_PATH: &str = "api/v2/auth/login";
 #[cfg(test)]
 const APP_VERSION_PATH: &str = "api/v2/app/version";
-#[cfg(test)]
 const WEBAPI_VERSION_PATH: &str = "api/v2/app/webapiVersion";
 const APP_PREFERENCES_PATH: &str = "api/v2/app/preferences";
 const APP_SET_PREFERENCES_PATH: &str = "api/v2/app/setPreferences";
@@ -37,12 +37,24 @@ const REQUEST_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct QbittorrentClient {
     config: QbittorrentConfig,
-    password: SecretString,
+    auth: QbittorrentAuth,
     filters: FiltersConfig,
     min_total_seeders: u32,
     metrics: Arc<AppMetrics>,
     client: Client,
     base_url: Url,
+}
+
+#[derive(Clone)]
+enum QbittorrentAuth {
+    None,
+    Cookie {
+        username: String,
+        password: SecretString,
+    },
+    ApiKey {
+        value: HeaderValue,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,9 +77,11 @@ impl QbittorrentClient {
             .pool_idle_timeout(config.pool_idle_timeout)
             .build()?;
 
+        let auth = QbittorrentAuth::from_config(&config, password.into())?;
+
         Ok(Self {
             config,
-            password: password.into(),
+            auth,
             filters,
             min_total_seeders,
             metrics,
@@ -77,47 +91,72 @@ impl QbittorrentClient {
     }
 
     pub async fn authenticate(&self) -> Result<()> {
-        if !self.auth_enabled() {
-            return Ok(());
+        match &self.auth {
+            QbittorrentAuth::None => Ok(()),
+            QbittorrentAuth::Cookie { username, password } => {
+                let login_url = self.api_url(AUTH_LOGIN_PATH)?;
+                let response = self
+                    .execute_request(&|| {
+                        self.client.post(login_url.clone()).form(&[
+                            ("username", username.as_str()),
+                            ("password", password.expose_secret()),
+                        ])
+                    })
+                    .await
+                    .context("qbittorrent login request failed")?;
+                let status = response.status();
+                let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
+                    .await
+                    .context("failed to read qbittorrent login response")?;
+                if status != StatusCode::OK || body.trim() != "Ok." {
+                    self.metrics.record_qbittorrent_api_error();
+                    warn!(
+                        status = %status,
+                        response_body = body.trim(),
+                        base_url = %self.base_url,
+                        username = username,
+                        "qbittorrent authentication failed"
+                    );
+                    bail!(
+                        "qbittorrent login failed: status={} body={}",
+                        status,
+                        body.trim()
+                    );
+                }
+                info!(
+                    login_url = %self.api_url(AUTH_LOGIN_PATH)?,
+                    base_url = %self.base_url,
+                    username = username,
+                    "qbittorrent authentication succeeded"
+                );
+                Ok(())
+            }
+            QbittorrentAuth::ApiKey { .. } => {
+                let version_url = self.api_url(WEBAPI_VERSION_PATH)?;
+                let response = self
+                    .execute_request(&|| self.apply_auth(self.client.get(version_url.clone())))
+                    .await
+                    .context("qbittorrent api-key authentication probe failed")?;
+                let status = response.status();
+                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    self.metrics.record_qbittorrent_api_error();
+                    let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
+                        .await
+                        .unwrap_or_else(|_| "<unavailable>".to_string());
+                    bail!(
+                        "qbittorrent api-key authentication failed: qBittorrent 5.2+ with a valid configured API key is required (status={} body={})",
+                        status,
+                        body.trim()
+                    );
+                }
+                Self::ensure_success(response).await?;
+                info!(
+                    base_url = %self.base_url,
+                    "qbittorrent api-key authentication probe succeeded"
+                );
+                Ok(())
+            }
         }
-
-        let username = self.config.username.trim();
-        let login_url = self.api_url(AUTH_LOGIN_PATH)?;
-        let response = self
-            .execute_request(&|| {
-                self.client.post(login_url.clone()).form(&[
-                    ("username", username),
-                    ("password", self.password.expose_secret()),
-                ])
-            })
-            .await
-            .context("qbittorrent login request failed")?;
-        let status = response.status();
-        let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
-            .await
-            .context("failed to read qbittorrent login response")?;
-        if status != StatusCode::OK || body.trim() != "Ok." {
-            self.metrics.record_qbittorrent_api_error();
-            warn!(
-                status = %status,
-                response_body = body.trim(),
-                base_url = %self.base_url,
-                username = username,
-                "qbittorrent authentication failed"
-            );
-            bail!(
-                "qbittorrent login failed: status={} body={}",
-                status,
-                body.trim()
-            );
-        }
-        info!(
-            login_url = %self.api_url(AUTH_LOGIN_PATH)?,
-            base_url = %self.base_url,
-            username = username,
-            "qbittorrent authentication succeeded"
-        );
-        Ok(())
     }
 
     pub async fn list_in_scope_torrents(&self) -> Result<Vec<TorrentSummary>> {
@@ -216,17 +255,24 @@ impl QbittorrentClient {
     where
         F: Fn() -> RequestBuilder,
     {
-        let response = self.execute_request(&build).await?;
-        if response.status() == StatusCode::FORBIDDEN && self.auth_enabled() {
+        let response = self.execute_request(&|| self.apply_auth(build())).await?;
+        if response.status() == StatusCode::FORBIDDEN && self.auth_retries_with_login() {
             self.authenticate().await?;
             let retried = self
-                .execute_request(&build)
+                .execute_request(&|| self.apply_auth(build()))
                 .await
                 .context("qbittorrent authenticated retry failed")?;
             return Self::ensure_success(retried).await;
         }
 
         Self::ensure_success(response).await
+    }
+
+    fn apply_auth(&self, request: RequestBuilder) -> RequestBuilder {
+        match &self.auth {
+            QbittorrentAuth::ApiKey { value } => request.header(AUTHORIZATION, value.clone()),
+            QbittorrentAuth::None | QbittorrentAuth::Cookie { .. } => request,
+        }
     }
 
     async fn execute_request<F>(&self, build: &F) -> Result<reqwest::Response>
@@ -463,7 +509,13 @@ impl QbittorrentClient {
         let mut normalized = peers
             .peers
             .into_iter()
-            .map(|(peer_key, peer)| self.normalize_peer(torrent_hash, &peer_key, peer))
+            .filter_map(|(peer_key, peer)| {
+                match self.normalize_peer(torrent_hash, &peer_key, peer) {
+                    Ok(Some(peer)) => Some(Ok(peer)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         normalized.sort_by(|left, right| {
             left.observation_id
@@ -483,28 +535,43 @@ impl QbittorrentClient {
         torrent_hash: &str,
         peer_key: &str,
         peer: QbPeer,
-    ) -> Result<TorrentPeer> {
-        let ip = peer
+    ) -> Result<Option<TorrentPeer>> {
+        if peer.i2p_dest.is_some() && (peer.ip.is_none() || peer.port.is_none()) {
+            debug!(
+                torrent_hash = %torrent_hash,
+                peer_key = %peer_key,
+                "skipping qbittorrent i2p peer without ip/port"
+            );
+            return Ok(None);
+        }
+
+        let ip_text = peer
             .ip
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("peer `{peer_key}` is missing ip"))?;
+        let port = peer
+            .port
+            .ok_or_else(|| anyhow::anyhow!("peer `{peer_key}` is missing port"))?;
+        let ip = ip_text
             .parse::<IpAddr>()
-            .with_context(|| format!("invalid peer ip `{}`", peer.ip))?;
+            .with_context(|| format!("invalid peer ip `{ip_text}`"))?;
         if let Some(address) = parse_peer_key(peer_key)
-            && (address.ip() != ip || address.port() != peer.port)
+            && (address.ip() != ip || address.port() != port)
         {
             bail!(
                 "peer key `{peer_key}` does not match body endpoint `{ip}:{}`",
-                peer.port
+                port
             );
         }
         let client_name = empty_string_to_none(peer.client.trim().to_string());
         let peer = PeerSnapshot {
             ip,
-            port: peer.port,
+            port,
             progress: peer.progress.clamp(0.0, 1.0),
             up_rate_bps: peer.up_speed,
         };
 
-        Ok(TorrentPeer {
+        Ok(Some(TorrentPeer {
             observation_id: PeerObservationId {
                 torrent_hash: torrent_hash.to_string(),
                 peer_ip: peer.ip,
@@ -512,7 +579,7 @@ impl QbittorrentClient {
             },
             peer,
             client_name,
-        })
+        }))
     }
 
     fn encode_ban_peers(&self, peers: &[(IpAddr, u16)]) -> String {
@@ -603,8 +670,29 @@ impl QbittorrentClient {
         })
     }
 
-    fn auth_enabled(&self) -> bool {
-        !self.config.username.trim().is_empty() && !self.config.password_env.trim().is_empty()
+    fn auth_retries_with_login(&self) -> bool {
+        matches!(self.auth, QbittorrentAuth::Cookie { .. })
+    }
+}
+
+impl QbittorrentAuth {
+    fn from_config(config: &QbittorrentConfig, password: SecretString) -> Result<Self> {
+        if !config.api_key.trim().is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", config.api_key.trim()))
+                .context(
+                    "qbittorrent.api_key contains characters that are invalid in an HTTP header",
+                )?;
+            return Ok(Self::ApiKey { value });
+        }
+
+        if !config.username.trim().is_empty() && !config.password_env.trim().is_empty() {
+            return Ok(Self::Cookie {
+                username: config.username.trim().to_string(),
+                password,
+            });
+        }
+
+        Ok(Self::None)
     }
 }
 
@@ -650,8 +738,9 @@ struct QbPeer {
     flags: Option<String>,
     flags_desc: Option<String>,
     host_name: Option<String>,
-    ip: String,
-    port: u16,
+    ip: Option<String>,
+    port: Option<u16>,
+    i2p_dest: Option<String>,
     progress: f64,
     relevance: Option<f64>,
     downloaded: Option<u64>,
@@ -1019,8 +1108,9 @@ mod tests {
                         flags: Some("D".to_string()),
                         flags_desc: Some("remote interested".to_string()),
                         host_name: Some("example.test".to_string()),
-                        ip: "10.0.0.10".to_string(),
-                        port: 51413,
+                        ip: Some("10.0.0.10".to_string()),
+                        port: Some(51413),
+                        i2p_dest: None,
                         progress: 0.42,
                         relevance: Some(0.91),
                         downloaded: Some(1048576),
@@ -1047,7 +1137,46 @@ mod tests {
         assert_eq!(peers.rid, 23);
         assert_eq!(peers.peers.len(), 2);
         assert_eq!(peers.peers["10.0.0.10:51413"].up_speed, 65536);
-        assert_eq!(peers.peers["[2001:db8::5]:51413"].ip, "2001:db8::5");
+        assert_eq!(
+            peers.peers["[2001:db8::5]:51413"].ip.as_deref(),
+            Some("2001:db8::5")
+        );
+    }
+
+    #[test]
+    fn normalizes_qbittorrent_5_2_peers_and_skips_i2p_without_ip_port() {
+        let client = test_client();
+        let peers = client
+            .normalize_torrent_peers(
+                "abc123",
+                include_str!("../testdata/qbittorrent/v5.2/torrent-peers.json"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| peer.observation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "10.0.0.20".parse().unwrap(),
+                    peer_port: 51413,
+                },
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "198.51.100.20".parse().unwrap(),
+                    peer_port: 51415,
+                },
+                PeerObservationId {
+                    torrent_hash: "abc123".to_string(),
+                    peer_ip: "2001:db8::20".parse().unwrap(),
+                    peer_port: 51414,
+                },
+            ]
+        );
+        assert_eq!(peers.len(), 3);
     }
 
     #[test]
@@ -1256,6 +1385,7 @@ mod tests {
                 base_url: base_url.to_string(),
                 username: "admin".to_string(),
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
+                api_key: String::new(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
                 pool_idle_timeout: std::time::Duration::from_secs(5),
@@ -1306,6 +1436,136 @@ mod tests {
         let server = MockServer::start().await;
         let client = network_test_client_without_auth(&server.uri());
         client.authenticate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_authentication_probes_webapi_version_with_bearer_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/webapiVersion"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("2.11.4"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = network_test_client_with_api_key(&server.uri());
+        client.authenticate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_authentication_failure_reports_compatibility_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/webapiVersion"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = network_test_client_with_api_key(&server.uri());
+        let error = client.authenticate().await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("qbittorrent api-key authentication failed"));
+        assert!(message.contains("qBittorrent 5.2+"));
+        assert!(message.contains("valid configured API key"));
+    }
+
+    #[tokio::test]
+    async fn api_key_mode_sends_bearer_to_protected_endpoints_without_login() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/webapiVersion"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("2.11.4"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("filter", "active"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"[{"hash":"abc123","name":"Example","category":"tv","tags":"public","num_complete":5,"amount_left":0}]"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/torrentPeers"))
+            .and(query_param("hash", "abc123"))
+            .and(query_param("rid", "0"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"rid":15,"peers":{"10.0.0.10:51413":{"client":"qBittorrent/5.2.0","ip":"10.0.0.10","port":51413,"progress":0.42,"dl_speed":32768,"up_speed":65536}},"peers_removed":[]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/transfer/banPeers"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .and(body_string_contains("peers=10.0.0.10%3A51413"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"banned_IPs":""}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .and(body_string_contains("json="))
+            .and(body_string_contains("10.0.0.10"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = network_test_client_with_api_key(&server.uri());
+        client.authenticate().await.unwrap();
+        let torrents = client.list_in_scope_torrents().await.unwrap();
+        let peers = client.list_torrent_peers("abc123").await.unwrap();
+        let ban_result = client
+            .apply_peer_ban(&active_ban("10.0.0.10", 51413, "torrent:abc123"), &[])
+            .await
+            .unwrap();
+
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            ban_result,
+            BanSyncResult {
+                banned_ips: vec!["10.0.0.10".parse::<IpAddr>().unwrap()],
+            }
+        );
     }
 
     #[tokio::test]
@@ -1827,6 +2087,27 @@ mod tests {
                 base_url: format!("{}/", base_url.trim_end_matches('/')),
                 username: String::new(),
                 password_env: String::new(),
+                api_key: String::new(),
+                poll_interval: std::time::Duration::from_secs(30),
+                request_timeout: std::time::Duration::from_secs(5),
+                pool_idle_timeout: std::time::Duration::from_secs(5),
+                transient_retries: 10,
+            },
+            String::new(),
+            FiltersConfig::default(),
+            3,
+            Arc::new(AppMetrics::new()),
+        )
+        .unwrap()
+    }
+
+    fn network_test_client_with_api_key(base_url: &str) -> QbittorrentClient {
+        QbittorrentClient::new(
+            QbittorrentConfig {
+                base_url: format!("{}/", base_url.trim_end_matches('/')),
+                username: String::new(),
+                password_env: String::new(),
+                api_key: "test-api-key".to_string(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(5),
                 pool_idle_timeout: std::time::Duration::from_secs(5),
@@ -1846,6 +2127,7 @@ mod tests {
                 base_url: base_url.to_string(),
                 username: "admin".to_string(),
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
+                api_key: String::new(),
                 poll_interval: std::time::Duration::from_secs(30),
                 request_timeout: std::time::Duration::from_secs(10),
                 pool_idle_timeout: std::time::Duration::from_secs(5),

@@ -36,6 +36,7 @@ Create a `config.toml`:
 base_url = "http://qbittorrent:8080"
 username = ""
 password_env = ""
+api_key = ""
 
 [database]
 path = "/data/brrpolice.sqlite"
@@ -51,7 +52,7 @@ docker run --rm -p 9090:9090 \
   brrpolice:latest
 ```
 
-If qBittorrent auth is enabled, set both `qbittorrent.username` and `qbittorrent.password_env`, then pass the password env var:
+If qBittorrent 5.1 username/password auth is enabled, set both `qbittorrent.username` and `qbittorrent.password_env`, then pass the password env var:
 
 ```bash
 docker run --rm -p 9090:9090 \
@@ -93,7 +94,8 @@ Duration values use human-readable strings such as `30s`, `5m`, `1h`.
 
 qBittorrent auth rule:
 
-- `qbittorrent.username` and `qbittorrent.password_env` must both be set, or both be unset.
+- Use exactly one auth mode: unauthenticated local access, cookie auth with both `qbittorrent.username` and `qbittorrent.password_env`, or qBittorrent 5.2+ API-key auth with `qbittorrent.api_key`.
+- `qbittorrent.api_key` cannot be combined with `qbittorrent.username` or `qbittorrent.password_env`.
 
 ### qBittorrent Settings
 
@@ -102,6 +104,7 @@ qBittorrent auth rule:
 | `qbittorrent.base_url` | `BRRPOLICE_QBITTORRENT__BASE_URL` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. |
 | `qbittorrent.username` | `BRRPOLICE_QBITTORRENT__USERNAME` | `""` | Enables authenticated API mode when set together with `password_env`. |
 | `qbittorrent.password_env` | `BRRPOLICE_QBITTORRENT__PASSWORD_ENV` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
+| `qbittorrent.api_key` | `BRRPOLICE_QBITTORRENT__API_KEY` | `""` | qBittorrent 5.2+ API key sent as `Authorization: Bearer ...`. Mutually exclusive with username/password cookie auth. |
 | `qbittorrent.poll_interval` | `BRRPOLICE_QBITTORRENT__POLL_INTERVAL` | `10s` | Control loop polling frequency. Lower values react faster but increase API/database load. |
 | `qbittorrent.request_timeout` | `BRRPOLICE_QBITTORRENT__REQUEST_TIMEOUT` | `10s` | Timeout per qBittorrent API request. Must be `<= poll_interval`. |
 | `qbittorrent.pool_idle_timeout` | `BRRPOLICE_QBITTORRENT__POOL_IDLE_TIMEOUT` | `5s` | Maximum idle lifetime for pooled qBittorrent HTTP connections before closing and reopening. |

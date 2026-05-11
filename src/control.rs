@@ -2461,6 +2461,7 @@ mod tests {
                 base_url: base_url.to_string(),
                 username: "admin".to_string(),
                 password_env: "QBITTORRENT_PASSWORD".to_string(),
+                api_key: String::new(),
                 poll_interval: Duration::from_secs(15),
                 request_timeout: Duration::from_secs(10),
                 pool_idle_timeout: Duration::from_secs(5),

@@ -51,6 +51,7 @@ impl AppConfig {
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
             .set_default("qbittorrent.username", "")?
             .set_default("qbittorrent.password_env", "")?
+            .set_default("qbittorrent.api_key", "")?
             .set_default("qbittorrent.poll_interval", "10s")?
             .set_default("qbittorrent.request_timeout", "10s")?
             .set_default("qbittorrent.pool_idle_timeout", "5s")?
@@ -131,8 +132,7 @@ impl AppConfig {
         format!(
             concat!(
                 "qb.base_url={}\n",
-                "qb.username={}\n",
-                "qb.password_env={}\n",
+                "qb.auth_mode={}\n",
                 "qb.poll_interval={}\n",
                 "qb.request_timeout={}\n",
                 "qb.pool_idle_timeout={}\n",
@@ -185,8 +185,7 @@ impl AppConfig {
                 "logging.format={}\n"
             ),
             self.qbittorrent.base_url,
-            self.qbittorrent.username,
-            self.qbittorrent.password_env,
+            self.qbittorrent.auth_mode_name(),
             self.qbittorrent.poll_interval.as_secs(),
             self.qbittorrent.request_timeout.as_secs(),
             self.qbittorrent.pool_idle_timeout.as_secs(),
@@ -262,6 +261,12 @@ impl AppConfig {
 
         let username = self.qbittorrent.username.trim();
         let password_env = self.qbittorrent.password_env.trim();
+        let api_key = self.qbittorrent.api_key.trim();
+        if !api_key.is_empty() && (!username.is_empty() || !password_env.is_empty()) {
+            bail!(
+                "qbittorrent.api_key cannot be set together with qbittorrent.username or qbittorrent.password_env"
+            );
+        }
         match (username.is_empty(), password_env.is_empty()) {
             (true, true) => {}
             (false, false) => validate_env_var_name(password_env)?,
@@ -418,6 +423,7 @@ pub struct QbittorrentConfig {
     pub base_url: String,
     pub username: String,
     pub password_env: String,
+    pub api_key: String,
     #[serde(deserialize_with = "deserialize_duration")]
     pub poll_interval: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -427,12 +433,25 @@ pub struct QbittorrentConfig {
     pub transient_retries: u32,
 }
 
+impl QbittorrentConfig {
+    pub fn auth_mode_name(&self) -> &'static str {
+        if !self.api_key.trim().is_empty() {
+            "api_key"
+        } else if !self.username.trim().is_empty() && !self.password_env.trim().is_empty() {
+            "cookie"
+        } else {
+            "none"
+        }
+    }
+}
+
 impl Default for QbittorrentConfig {
     fn default() -> Self {
         Self {
             base_url: "http://qbittorrent:8080".to_string(),
             username: String::new(),
             password_env: String::new(),
+            api_key: String::new(),
             poll_interval: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(5),
@@ -802,6 +821,8 @@ mod tests {
         assert_eq!(config.qbittorrent.base_url, "http://qbittorrent:8080");
         assert_eq!(config.qbittorrent.username, "");
         assert_eq!(config.qbittorrent.password_env, "");
+        assert_eq!(config.qbittorrent.api_key, "");
+        assert_eq!(config.qbittorrent.auth_mode_name(), "none");
         assert_eq!(config.qbittorrent.poll_interval, Duration::from_secs(10));
         assert_eq!(config.qbittorrent.pool_idle_timeout, Duration::from_secs(5));
         assert_eq!(config.qbittorrent.transient_retries, 10);
@@ -871,6 +892,7 @@ mod tests {
 base_url = "https://qb.example.internal"
 username = "alice"
 password_env = "QB_PASSWORD"
+api_key = ""
 poll_interval = "45s"
 request_timeout = "5s"
 pool_idle_timeout = "7s"
@@ -1019,6 +1041,7 @@ allowlist_peer_ips = ["127.0.0.1"]
         assert_eq!(config.qbittorrent.password_env, "QB_PASSWORD");
         assert_eq!(config.qbittorrent.pool_idle_timeout, Duration::from_secs(3));
         assert_eq!(config.qbittorrent.transient_retries, 12);
+        assert_eq!(config.qbittorrent.api_key, "");
         assert_eq!(config.policy.score.target_rate_bps, 4096);
         assert_eq!(config.retention.max_rows_per_run, 12_000);
         assert_eq!(config.retention.vacuum.mode.as_str(), "off");
@@ -1032,6 +1055,24 @@ allowlist_peer_ips = ["127.0.0.1"]
             config.filters.allowlist_peer_ips,
             vec!["192.168.1.10", "192.168.1.11"]
         );
+    }
+
+    #[test]
+    fn environment_can_set_qbittorrent_api_key() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = load_test_config(
+            &config_path,
+            HashMap::from([(
+                "BRRPOLICE_QBITTORRENT__API_KEY".to_string(),
+                "api-key-from-env".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(config.qbittorrent.api_key, "api-key-from-env");
+        assert_eq!(config.qbittorrent.auth_mode_name(), "api_key");
     }
 
     #[test]
@@ -1237,6 +1278,27 @@ password_env = "QBITTORRENT_PASSWORD"
     }
 
     #[test]
+    fn rejects_api_key_with_cookie_credentials() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+username = "admin"
+password_env = "QBITTORRENT_PASSWORD"
+api_key = "secret-api-key"
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("qbittorrent.api_key cannot be set together")
+        );
+    }
+
+    #[test]
     fn rejects_base_url_with_embedded_credentials() {
         let temp_dir = tempdir().unwrap();
         let config_path = write_config(
@@ -1316,6 +1378,27 @@ format = "yaml"
                 .fingerprint()
         );
         assert_ne!(baseline.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_records_auth_mode_without_secret_values() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+api_key = "super-secret-key"
+"#,
+        );
+
+        let fingerprint = load_test_config(&config_path, HashMap::new())
+            .unwrap()
+            .fingerprint();
+
+        assert!(fingerprint.contains("qb.auth_mode=api_key"));
+        assert!(!fingerprint.contains("super-secret-key"));
+        assert!(!fingerprint.contains("qb.username="));
+        assert!(!fingerprint.contains("qb.password_env="));
     }
 
     #[test]

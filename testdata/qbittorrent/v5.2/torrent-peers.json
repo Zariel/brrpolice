@@ -1,0 +1,72 @@
+{
+  "rid": 42,
+  "full_update": true,
+  "show_flags": true,
+  "peers": {
+    "10.0.0.20:51413": {
+      "client": "qBittorrent/5.2.0",
+      "peer_id_client": "qBittorrent",
+      "connection": "BT",
+      "country": "United Kingdom",
+      "country_code": "gb",
+      "dl_speed": 1024,
+      "files": "0 (100%)",
+      "flags": "D",
+      "flags_desc": "remote interested",
+      "host_name": "ipv4.example.test",
+      "ip": "10.0.0.20",
+      "port": 51413,
+      "progress": 0.62,
+      "relevance": 0.91,
+      "downloaded": 1048576,
+      "uploaded": 524288,
+      "up_speed": 65536
+    },
+    "[2001:db8::20]:51414": {
+      "client": "Transmission/4.0.0",
+      "peer_id_client": "Transmission",
+      "connection": "uTP",
+      "country": "Germany",
+      "country_code": "de",
+      "dl_speed": 2048,
+      "files": "0 (100%)",
+      "flags": "D",
+      "flags_desc": "remote interested",
+      "host_name": "",
+      "ip": "2001:db8::20",
+      "port": 51414,
+      "progress": 0.75,
+      "relevance": 0.8,
+      "downloaded": 2097152,
+      "uploaded": 1048576,
+      "up_speed": 32768
+    },
+    "rdns.example.test:51415": {
+      "client": "libtorrent/2.0",
+      "peer_id_client": "libtorrent",
+      "connection": "BT",
+      "country": "United States",
+      "country_code": "us",
+      "dl_speed": 512,
+      "files": "0 (100%)",
+      "flags": "D",
+      "flags_desc": "remote interested",
+      "host_name": "rdns.example.test",
+      "ip": "198.51.100.20",
+      "port": 51415,
+      "progress": 0.44,
+      "relevance": 0.5,
+      "downloaded": 524288,
+      "uploaded": 262144,
+      "up_speed": 16384
+    },
+    "i2p-peer.example": {
+      "client": "I2P",
+      "i2p_dest": "exampledestination.b32.i2p",
+      "dl_speed": 0,
+      "progress": 0.1,
+      "up_speed": 0
+    }
+  },
+  "peers_removed": []
+}
