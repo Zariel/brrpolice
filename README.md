@@ -120,6 +120,10 @@ Two ban policies are active by default:
 
 Shared exemptions apply before either policy can ban: out-of-scope torrents, allowlisted peers, near-complete peers, new-peer grace period, and peers already under an active brrpolice ban.
 
+Policy construction is controlled by the per-policy `enabled` flags. Enabled policies are evaluated independently for new peer samples. Startup replay still recognizes known policies even if they are currently disabled, so a pending pre-restart ban intent can finish or record its retry error instead of being silently dropped.
+
+Existing score-policy config remains compatible. The legacy `policy.reban_cooldown` and `policy.ban_ladder.durations` keys still configure the score policy unless the nested `policy.score.*` keys are set. New deployments should prefer the nested `policy.score.*` and `policy.receive_idle.*` sections.
+
 | Setting | Env Var | Default | Impact |
 |---|---|---|---|
 | `policy.new_peer_grace_period` | `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD` | `60s` | New peers are exempt during this initial age window. |
@@ -227,7 +231,7 @@ Examples:
 ```bash
 BRRPOLICE_QBITTORRENT__BASE_URL=http://qbittorrent.svc:8080
 BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS=5
-BRRPOLICE_POLICY__BAN_LADDER__DURATIONS=1h,12h,48h
+BRRPOLICE_POLICY__SCORE__BAN_LADDER__DURATIONS=1h,12h,48h
 BRRPOLICE_FILTERS__EXCLUDE_TAGS=private,restricted
 BRRPOLICE_HTTP__HOST=0.0.0.0
 BRRPOLICE_HTTP__PORT=9090

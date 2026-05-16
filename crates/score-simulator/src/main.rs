@@ -875,7 +875,7 @@ mod tests {
             "--input".into(),
             "dummy".into(),
             "--target-rate-bps".into(),
-            "1".into(),
+            "10".into(),
             "--weight-rate".into(),
             "1.0".into(),
             "--weight-progress".into(),
@@ -897,9 +897,9 @@ mod tests {
         let mut summary = Summary::default();
 
         let replay = Cursor::new(concat!(
-            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":300}}\n",
-            "{\"timestamp\":\"2026-03-12T10:01:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:01:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":360}}\n",
-            "{\"timestamp\":\"2026-03-12T10:02:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:02:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":0,\"observed_duration_seconds\":420}}\n"
+            "{\"timestamp\":\"2026-03-12T10:00:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:00:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":1,\"observed_duration_seconds\":300}}\n",
+            "{\"timestamp\":\"2026-03-12T10:01:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:01:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":1,\"observed_duration_seconds\":360}}\n",
+            "{\"timestamp\":\"2026-03-12T10:02:00Z\",\"fields\":{\"message\":\"peer not bannable yet decision\",\"peer_ip\":\"1.2.3.4\",\"peer_port\":51413,\"torrent_hash\":\"abc\",\"observed_at\":\"2026-03-12T10:02:00Z\",\"progress_delta\":0.0,\"average_upload_rate_bps\":1,\"observed_duration_seconds\":420}}\n"
         ));
 
         process_reader(

@@ -1094,6 +1094,30 @@ mod tests {
         assert_eq!(config.policy.score.progress_rate_scale_start, 2.0);
         assert_eq!(config.policy.score.progress_rate_scale_end, 16.0);
         assert_eq!(config.policy.score.progress_rate_min_scale, 0.25);
+        assert!(config.policy.receive_idle.enabled);
+        assert_eq!(
+            config.policy.receive_idle.min_observation_duration,
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            config.policy.receive_idle.sustain_duration,
+            Duration::from_secs(120)
+        );
+        assert_eq!(config.policy.receive_idle.max_upload_rate_bps, 0);
+        assert_eq!(config.policy.receive_idle.max_uploaded_delta_bytes, 0);
+        assert_eq!(
+            config.policy.receive_idle.reban_cooldown,
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            config.policy.receive_idle.ban_ladder.durations,
+            vec![
+                Duration::from_secs(600),
+                Duration::from_secs(1_800),
+                Duration::from_secs(7_200),
+                Duration::from_secs(21_600)
+            ]
+        );
         assert_eq!(
             config.policy.score.churn.reconnect_window,
             Duration::from_secs(1_800)
@@ -1337,6 +1361,48 @@ allowlist_peer_ips = ["127.0.0.1"]
                 Duration::from_secs(2_700),
                 Duration::from_secs(10_800),
             ]
+        );
+    }
+
+    #[test]
+    fn loads_receive_idle_policy_from_toml_file() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.receive_idle]
+enabled = false
+min_observation_duration = "7m"
+sustain_duration = "4m"
+max_upload_rate_bps = 128
+max_uploaded_delta_bytes = 4096
+reban_cooldown = "22m"
+
+[policy.receive_idle.ban_ladder]
+durations = ["11m", "33m"]
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert!(!config.policy.receive_idle.enabled);
+        assert_eq!(
+            config.policy.receive_idle.min_observation_duration,
+            Duration::from_secs(420)
+        );
+        assert_eq!(
+            config.policy.receive_idle.sustain_duration,
+            Duration::from_secs(240)
+        );
+        assert_eq!(config.policy.receive_idle.max_upload_rate_bps, 128);
+        assert_eq!(config.policy.receive_idle.max_uploaded_delta_bytes, 4_096);
+        assert_eq!(
+            config.policy.receive_idle.reban_cooldown,
+            Duration::from_secs(1_320)
+        );
+        assert_eq!(
+            config.policy.receive_idle.ban_ladder.durations,
+            vec![Duration::from_secs(660), Duration::from_secs(1_980)]
         );
     }
 
@@ -1736,6 +1802,25 @@ durations = []
             error
                 .to_string()
                 .contains("ban_ladder.durations must not be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_receive_idle_ban_ladder() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.receive_idle.ban_ladder]
+durations = []
+"#,
+        );
+
+        let error = load_test_config(&config_path, HashMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("policy.receive_idle.ban_ladder.durations must not be empty")
         );
     }
 
