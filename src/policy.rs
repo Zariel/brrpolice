@@ -138,11 +138,11 @@ impl PolicySessionSnapshot for ScoreSessionSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct GenericSessionSnapshot {
+struct ReceiveIdleSessionSnapshot {
     session: PeerPolicySessionState,
 }
 
-impl PolicySessionSnapshot for GenericSessionSnapshot {
+impl PolicySessionSnapshot for ReceiveIdleSessionSnapshot {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -164,8 +164,10 @@ fn score_session_snapshot(session: PeerSessionState) -> Box<dyn PolicySessionSna
     Box::new(ScoreSessionSnapshot { session })
 }
 
-fn generic_session_snapshot(session: PeerPolicySessionState) -> Box<dyn PolicySessionSnapshot> {
-    Box::new(GenericSessionSnapshot { session })
+fn receive_idle_session_snapshot(
+    session: PeerPolicySessionState,
+) -> Box<dyn PolicySessionSnapshot> {
+    Box::new(ReceiveIdleSessionSnapshot { session })
 }
 
 #[derive(Default)]
@@ -331,11 +333,11 @@ impl PolicyEvaluation for ScoreAssessmentEvaluation {
 }
 
 #[derive(Debug, Clone)]
-struct GenericAssessmentEvaluation {
+struct ReceiveIdleAssessmentEvaluation {
     evaluation: PeerPolicyEvaluation,
 }
 
-impl PolicyEvaluation for GenericAssessmentEvaluation {
+impl PolicyEvaluation for ReceiveIdleAssessmentEvaluation {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -382,13 +384,13 @@ fn score_evaluation(assessment: &PeerPolicyAssessment) -> Result<&PeerEvaluation
         .ok_or_else(|| anyhow::anyhow!("score assessment carried non-score state"))
 }
 
-fn generic_evaluation(assessment: &PeerPolicyAssessment) -> Result<&PeerPolicyEvaluation> {
+fn receive_idle_evaluation(assessment: &PeerPolicyAssessment) -> Result<&PeerPolicyEvaluation> {
     assessment
         .evaluation
         .as_any()
-        .downcast_ref::<GenericAssessmentEvaluation>()
+        .downcast_ref::<ReceiveIdleAssessmentEvaluation>()
         .map(|state| &state.evaluation)
-        .ok_or_else(|| anyhow::anyhow!("receive-idle assessment carried non-generic state"))
+        .ok_or_else(|| anyhow::anyhow!("receive-idle assessment carried non-receive-idle state"))
 }
 
 fn score_previous_session(
@@ -405,16 +407,16 @@ fn score_previous_session(
         .transpose()
 }
 
-fn generic_previous_session(
+fn receive_idle_previous_session(
     previous: Option<&dyn PolicySessionSnapshot>,
 ) -> Result<Option<&PeerPolicySessionState>> {
     previous
         .map(|session| {
             let session = session
                 .as_any()
-                .downcast_ref::<GenericSessionSnapshot>()
+                .downcast_ref::<ReceiveIdleSessionSnapshot>()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("receive-idle assessment carried non-generic session")
+                    anyhow::anyhow!("receive-idle assessment carried non-receive-idle session")
                 })?;
             validate_receive_idle_session_payload(&session.session)?;
             Ok(&session.session)
@@ -674,7 +676,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
                 self.name(),
                 session.observation_id.clone(),
                 session.last_seen_at,
-                generic_session_snapshot(session),
+                receive_idle_session_snapshot(session),
             );
         }
         Ok(())
@@ -704,7 +706,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
     }
 
     fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
-        let previous = generic_previous_session(input.previous_session)?;
+        let previous = receive_idle_previous_session(input.previous_session)?;
         let evaluation = self.engine.evaluate_receive_idle_peer(input.peer, previous);
         let disposition =
             self.engine
@@ -734,7 +736,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         ];
         Ok(PeerPolicyAssessment {
             policy_name: self.name(),
-            evaluation: Box::new(GenericAssessmentEvaluation { evaluation }),
+            evaluation: Box::new(ReceiveIdleAssessmentEvaluation { evaluation }),
             disposition,
             diagnostics,
         })
@@ -745,7 +747,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         persistence: &Persistence,
         assessment: &PeerPolicyAssessment,
     ) -> Result<()> {
-        let evaluation = generic_evaluation(assessment)?;
+        let evaluation = receive_idle_evaluation(assessment)?;
         validate_receive_idle_session_payload(&evaluation.session)?;
         persistence
             .upsert_peer_policy_session(&evaluation.session, POLICY_VERSION)
@@ -759,7 +761,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         decision: &BanDecision,
         enforced_at: SystemTime,
     ) -> Result<EnforcementWriteResult> {
-        let evaluation = generic_evaluation(assessment)?;
+        let evaluation = receive_idle_evaluation(assessment)?;
         persistence
             .record_policy_ban_enforcement(evaluation, decision, enforced_at)
             .await
@@ -1982,8 +1984,8 @@ mod tests {
     };
 
     use super::{
-        GenericSessionSnapshot, PeerPolicy, PolicyEngine, RECEIVE_IDLE_POLICY_NAME,
-        ReceiveIdlePeerPolicy, SCORE_POLICY_NAME, ScorePeerPolicy,
+        PeerPolicy, PolicyEngine, RECEIVE_IDLE_POLICY_NAME, ReceiveIdlePeerPolicy,
+        ReceiveIdleSessionSnapshot, SCORE_POLICY_NAME, ScorePeerPolicy,
     };
 
     proptest! {
@@ -3036,7 +3038,7 @@ mod tests {
         let policy = ReceiveIdlePeerPolicy { engine };
         let history = empty_history();
         let peer = seeded_peer_with_uploaded(210, 0);
-        let previous = GenericSessionSnapshot { session: previous };
+        let previous = ReceiveIdleSessionSnapshot { session: previous };
         let error = policy
             .assess_peer(PeerPolicyInput {
                 peer: &peer,
@@ -3046,6 +3048,28 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("unsupported receive-idle"));
+    }
+
+    #[test]
+    fn receive_idle_rejects_incompatible_session_policy_name() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let mut previous = first.session.clone();
+        previous.policy_name = SCORE_POLICY_NAME.to_string();
+
+        let policy = ReceiveIdlePeerPolicy { engine };
+        let history = empty_history();
+        let peer = seeded_peer_with_uploaded(210, 0);
+        let previous = ReceiveIdleSessionSnapshot { session: previous };
+        let error = policy
+            .assess_peer(PeerPolicyInput {
+                peer: &peer,
+                previous_session: Some(&previous),
+                offence_history: &history,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("received `score` session"));
     }
 
     #[test]
@@ -3105,7 +3129,7 @@ mod tests {
         };
         let peer = seeded_peer(180, 0.10, 500);
         let previous = engine.begin_receive_idle_session(&peer, None);
-        let previous = GenericSessionSnapshot { session: previous };
+        let previous = ReceiveIdleSessionSnapshot { session: previous };
         let history = empty_history();
         let error = policy
             .assess_peer(PeerPolicyInput {
@@ -3132,7 +3156,7 @@ mod tests {
             engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
         let direct_disposition =
             engine.decide_receive_idle_ban(&second_peer, &direct_evaluation, &history);
-        let previous = GenericSessionSnapshot {
+        let previous = ReceiveIdleSessionSnapshot {
             session: first.session,
         };
         let adapter_assessment = policy
