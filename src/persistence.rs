@@ -866,6 +866,7 @@ impl Persistence {
                         FROM peer_offences newer
                         WHERE newer.torrent_hash = po.torrent_hash
                             AND newer.peer_ip = po.peer_ip
+                            AND newer.policy_name = po.policy_name
                             AND (
                                 newer.banned_at > po.banned_at
                                 OR (newer.banned_at = po.banned_at AND newer.rowid > po.rowid)
@@ -3223,6 +3224,91 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].offence_number, 2);
         assert_eq!(remaining[0].torrent_hash, "stale-continuity");
+    }
+
+    #[tokio::test]
+    async fn retention_prune_keeps_latest_stale_offence_per_policy() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(31_000_000);
+        let peer_ip: IpAddr = "10.0.0.102".parse().unwrap();
+        let torrent_hash = "policy-stale-continuity";
+
+        let mut old_receive_idle = sample_peer_offence(1, 1);
+        old_receive_idle.torrent_hash = torrent_hash.to_string();
+        old_receive_idle.peer_ip = peer_ip;
+        old_receive_idle.peer_port = 12000;
+        old_receive_idle.policy_name = crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string();
+        old_receive_idle.reason_code = "receive_idle".to_string();
+        old_receive_idle.banned_at = now - Duration::from_secs(140 * 24 * 3600);
+        old_receive_idle.ban_expires_at = now - Duration::from_secs(139 * 24 * 3600);
+        old_receive_idle.ban_revoked_at = Some(now - Duration::from_secs(138 * 24 * 3600));
+
+        let mut old_score = sample_peer_offence(1, 1);
+        old_score.torrent_hash = torrent_hash.to_string();
+        old_score.peer_ip = peer_ip;
+        old_score.peer_port = 12001;
+        old_score.banned_at = now - Duration::from_secs(130 * 24 * 3600);
+        old_score.ban_expires_at = now - Duration::from_secs(129 * 24 * 3600);
+        old_score.ban_revoked_at = Some(now - Duration::from_secs(128 * 24 * 3600));
+
+        let mut latest_receive_idle = sample_peer_offence(2, 1);
+        latest_receive_idle.torrent_hash = torrent_hash.to_string();
+        latest_receive_idle.peer_ip = peer_ip;
+        latest_receive_idle.peer_port = 12002;
+        latest_receive_idle.policy_name = crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string();
+        latest_receive_idle.reason_code = "receive_idle".to_string();
+        latest_receive_idle.banned_at = now - Duration::from_secs(120 * 24 * 3600);
+        latest_receive_idle.ban_expires_at = now - Duration::from_secs(119 * 24 * 3600);
+        latest_receive_idle.ban_revoked_at = Some(now - Duration::from_secs(118 * 24 * 3600));
+
+        let mut latest_score = sample_peer_offence(2, 1);
+        latest_score.torrent_hash = torrent_hash.to_string();
+        latest_score.peer_ip = peer_ip;
+        latest_score.peer_port = 12003;
+        latest_score.banned_at = now - Duration::from_secs(110 * 24 * 3600);
+        latest_score.ban_expires_at = now - Duration::from_secs(109 * 24 * 3600);
+        latest_score.ban_revoked_at = Some(now - Duration::from_secs(108 * 24 * 3600));
+
+        for offence in [
+            &old_receive_idle,
+            &old_score,
+            &latest_receive_idle,
+            &latest_score,
+        ] {
+            persistence.insert_peer_offence(offence).await.unwrap();
+        }
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        let remaining = persistence.load_peer_offences_by_ip(peer_ip).await.unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|offence| (offence.policy_name.as_str(), offence.offence_number))
+                .collect::<Vec<_>>(),
+            vec![
+                (crate::policy::RECEIVE_IDLE_POLICY_NAME, 2),
+                (crate::policy::SCORE_POLICY_NAME, 2),
+            ]
+        );
     }
 
     #[tokio::test]
