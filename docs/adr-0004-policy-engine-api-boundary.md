@@ -42,7 +42,7 @@ peer, it will run the same generic workflow for each implementation:
 The control loop should not branch on concrete policy names except while building the configured
 policy list. After construction, policy-specific behavior should live behind the policy API. A
 policy implementation receives the observation timestamp, previous state, offence history, and shared
-eligibility result, then returns a bounded assessment. Policy adapters may also own policy-specific
+eligibility result, then returns a bounded assessment. Runtime policies may also own policy-specific
 persistence and metric mapping hooks behind the same interface, but they must not mutate qBittorrent
 state, read wall-clock time, or require the upper orchestration path to match on concrete policy
 implementations.
@@ -50,11 +50,11 @@ implementations.
 Previous-session and assessment state are opaque trait objects at the orchestration boundary. The
 control loop may read only common summary methods such as `first_seen_at`, offence identity,
 bad-duration seconds, average upload rate, sample count, and bad/bannable booleans. Concrete policy
-state is downcast only inside the policy adapter that created it.
+state is downcast only inside the policy implementation that created it.
 
 Policy reads go through a `PolicyDataStore` interface. Production poll cycles use a cycle-scoped
-cache preloaded from batch session and offence-history queries for the in-scope torrent set. Policy
-adapters still request previous state and offence history through the interface, which keeps the
+cache preloaded from batch session and offence-history queries for the in-scope torrent set. Runtime
+policies still request previous state and offence history through the interface, which keeps the
 control loop independent of whether state came from legacy score sessions, generic policy sessions,
 or another implementation. The cache intentionally batches by observed torrent rather than by every
 individual peer, trading some bounded over-read for fewer SQLite round trips on large swarms.
@@ -133,7 +133,7 @@ details string. The control loop derives `ban_expires_at` from its poll timestam
 persists the pending intent from those generic fields, and uses the TTL/expiry to choose the longest
 qBittorrent ban when multiple policies target the same IP. Policy assessment code does not write
 offence rows or active-ban rows directly; any policy-specific persistence happens through the
-generic policy adapter interface.
+generic runtime policy interface.
 
 The assessment always includes the updated session, even when the disposition is not a ban. The
 control loop persists that session before or alongside any pending intent so crash recovery sees the
@@ -147,17 +147,17 @@ remote data. High-cardinality operational context such as peer IP, torrent hash,
 generic control-loop log context, not policy diagnostics. `threshold_met` is the shared boolean
 diagnostic the control loop may use for generic not-bannable log state.
 
-Policy metric labels are static labels provided by the policy adapter through the common interface.
-Reason-code metric labels are selected by the adapter from its fixed reason set, with unknown
+Policy metric labels are static labels provided by the runtime policy through the common interface.
+Reason-code metric labels are selected by the policy from its fixed reason set, with unknown
 policy-local reasons collapsed to `other`. Existing score-only histograms remain score-scoped
-telemetry emitted by the score adapter; additional policies should use generic counters unless they
+telemetry emitted by the score policy; additional policies should use generic counters unless they
 need explicitly policy-scoped histograms.
 
 The generic telemetry fields have finite value sets:
 
 - Log `state`: `ban_pending`, `ban`, `ban_failed`, `ban_persist_failed`, `exempt`,
   `not_bannable`, `reban_cooldown`, or `duplicate_suppressed`.
-- Metric `policy_name`: `score` or `receive_idle` for the current compiled adapters.
+- Metric `policy_name`: `score` or `receive_idle` for the current compiled runtime policies.
 - Metric `sample`: `all` or `bad`.
 - Metric `result`: `all`, `bannable`, `applied`, `failed`, or `expired`, depending on metric.
 - Metric `decision`: `ban`, `not_bannable`, `exemption`, `reban_cooldown`, or
@@ -205,17 +205,17 @@ clearing only the matching intent.
 - Existing score session data needs a compatibility path or migration into the generic session
   model.
 - Some score-specific telemetry will need a generic diagnostic representation, or it must remain as
-  explicitly score-scoped metrics emitted by the score policy adapter.
+  explicitly score-scoped metrics emitted by the score policy.
 - Trait-object ergonomics may require careful ownership choices for session state and diagnostics.
 
 ## Migration Notes
 
 Implementation review: [`adr-0004-boundary-review.md`](adr-0004-boundary-review.md).
 
-Start by introducing the generic policy API and adapting the existing score and receive-idle logic
+Start by introducing the generic policy API and moving the existing score and receive-idle logic
 behind it without changing ban semantics. Policy construction is static at startup: enabled policy
-flags decide which adapters evaluate new samples, while replay uses the compiled registry of known
-adapters so disabling a policy does not orphan pending pre-restart intents.
+flags decide which runtime policies evaluate new samples, while replay uses the compiled registry of
+known policies so disabling a policy does not orphan pending pre-restart intents.
 
 Configuration compatibility is part of the rollout. Existing score-policy config remains valid:
 legacy `policy.reban_cooldown` and `policy.ban_ladder.durations` keys are score-policy aliases

@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
-    policy::{PeerPolicyAdapter, PolicyCycleCache, PolicyDataStore, PolicyEngine},
+    policy::{PolicyCycleCache, PolicyDataStore, PolicyEngine, RuntimePolicy},
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
     types::{
@@ -88,8 +88,8 @@ pub struct ControlLoop {
     config: Arc<AppConfig>,
     persistence: Arc<Persistence>,
     qbittorrent: Arc<QbittorrentClient>,
-    peer_policies: Vec<Arc<dyn PeerPolicyAdapter>>,
-    replay_policies: Vec<Arc<dyn PeerPolicyAdapter>>,
+    peer_policies: Vec<Arc<dyn RuntimePolicy>>,
+    replay_policies: Vec<Arc<dyn RuntimePolicy>>,
     service_state: Arc<ServiceState>,
     metrics: Arc<AppMetrics>,
     shutdown: watch::Receiver<bool>,
@@ -106,7 +106,7 @@ pub struct PollCycleResult {
 
 #[derive(Clone)]
 struct PendingBanAction {
-    policy: Arc<dyn PeerPolicyAdapter>,
+    policy: Arc<dyn RuntimePolicy>,
     torrent_hash: String,
     torrent_name: String,
     torrent_tracker: String,
@@ -119,7 +119,7 @@ struct PendingBanAction {
 
 #[derive(Clone)]
 struct PeerPolicyRun {
-    policy: Arc<dyn PeerPolicyAdapter>,
+    policy: Arc<dyn RuntimePolicy>,
     policy_name: &'static str,
     metric_label: &'static str,
     peer_key: String,
@@ -523,7 +523,7 @@ impl ControlLoop {
 
     async fn load_peer_policy_run(
         &self,
-        policy: Arc<dyn PeerPolicyAdapter>,
+        policy: Arc<dyn RuntimePolicy>,
         policy_store: &dyn PolicyDataStore,
         observed_peer: &ObservedPeer,
         observed_at: std::time::SystemTime,
@@ -550,7 +550,7 @@ impl ControlLoop {
         })?;
         if assessment.policy_name != policy.name() {
             bail!(
-                "policy adapter `{}` returned assessment for `{}`",
+                "runtime policy `{}` returned assessment for `{}`",
                 policy.name(),
                 assessment.policy_name
             );
@@ -1405,7 +1405,7 @@ impl ControlLoop {
         Ok(())
     }
 
-    fn peer_policy_by_name(&self, policy_name: &str) -> Option<Arc<dyn PeerPolicyAdapter>> {
+    fn peer_policy_by_name(&self, policy_name: &str) -> Option<Arc<dyn RuntimePolicy>> {
         self.replay_policies
             .iter()
             .find(|policy| policy.name() == policy_name)

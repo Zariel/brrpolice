@@ -238,9 +238,9 @@ pub trait PeerPolicyReplay: PeerPolicy + Send + Sync {
     }
 }
 
-pub trait PeerPolicyAdapter: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
+pub trait RuntimePolicy: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
 
-impl<T> PeerPolicyAdapter for T where T: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
+impl<T> RuntimePolicy for T where T: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
 
 #[derive(Debug, Clone)]
 struct ScoreSessionSnapshot {
@@ -310,7 +310,7 @@ pub struct PolicyCycleCache {
 impl PolicyCycleCache {
     pub async fn load(
         persistence: &Persistence,
-        policies: &[Arc<dyn PeerPolicyAdapter>],
+        policies: &[Arc<dyn RuntimePolicy>],
         torrent_hashes: &[String],
     ) -> Result<Self> {
         let policy_names = policies
@@ -581,18 +581,8 @@ fn receive_idle_previous_session(
         .transpose()
 }
 
-#[derive(Clone)]
-struct ScorePeerPolicy {
-    policy: ScorePolicy,
-}
-
-#[derive(Clone)]
-struct ReceiveIdlePeerPolicy {
-    policy: ReceiveIdlePolicy,
-}
-
 #[async_trait::async_trait]
-impl PeerPolicy for ScorePeerPolicy {
+impl PeerPolicy for ScorePolicy {
     fn name(&self) -> &'static str {
         SCORE_POLICY_NAME
     }
@@ -607,10 +597,8 @@ impl PeerPolicy for ScorePeerPolicy {
 
     fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
         let previous = score_previous_session(input.previous_session)?;
-        let evaluation = self.policy.evaluate_peer(input.peer, previous);
-        let disposition = self
-            .policy
-            .decide_ban(input.peer, &evaluation, input.offence_history);
+        let evaluation = self.evaluate_peer(input.peer, previous);
+        let disposition = self.decide_ban(input.peer, &evaluation, input.offence_history);
         let diagnostics = vec![
             PolicyDiagnostic {
                 name: "score",
@@ -635,7 +623,7 @@ impl PeerPolicy for ScorePeerPolicy {
             PolicyDiagnostic {
                 name: "threshold_met",
                 value: PolicyDiagnosticValue::Bool(
-                    evaluation.session.ban_score >= self.policy.config.ban_threshold,
+                    evaluation.session.ban_score >= self.config.ban_threshold,
                 ),
             },
         ];
@@ -665,7 +653,7 @@ impl PeerPolicy for ScorePeerPolicy {
 }
 
 #[async_trait::async_trait]
-impl PeerPolicyStorage for ScorePeerPolicy {
+impl PeerPolicyStorage for ScorePolicy {
     fn session_preload_kind(&self) -> PolicySessionPreloadKind {
         PolicySessionPreloadKind::LegacyScore
     }
@@ -707,7 +695,7 @@ impl PeerPolicyStorage for ScorePeerPolicy {
         store: &dyn PolicyDataStore,
         peer: &PeerContext,
     ) -> Result<OffenceHistory> {
-        let identity = self.policy.offence_identity(peer);
+        let identity = self.offence_identity(peer);
         store
             .load_policy_offence_history(self.name(), &identity)
             .await
@@ -739,7 +727,7 @@ impl PeerPolicyStorage for ScorePeerPolicy {
 }
 
 #[async_trait::async_trait]
-impl PeerPolicyReplay for ScorePeerPolicy {
+impl PeerPolicyReplay for ScorePolicy {
     async fn record_replayed_intent(
         &self,
         persistence: &Persistence,
@@ -795,7 +783,7 @@ impl PeerPolicyReplay for ScorePeerPolicy {
 }
 
 #[async_trait::async_trait]
-impl PeerPolicy for ReceiveIdlePeerPolicy {
+impl PeerPolicy for ReceiveIdlePolicy {
     fn name(&self) -> &'static str {
         RECEIVE_IDLE_POLICY_NAME
     }
@@ -810,10 +798,9 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
 
     fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
         let previous = receive_idle_previous_session(input.previous_session)?;
-        let evaluation = self.policy.evaluate_receive_idle_peer(input.peer, previous);
+        let evaluation = self.evaluate_receive_idle_peer(input.peer, previous);
         let disposition =
-            self.policy
-                .decide_receive_idle_ban(input.peer, &evaluation, input.offence_history);
+            self.decide_receive_idle_ban(input.peer, &evaluation, input.offence_history);
         let diagnostics = vec![
             PolicyDiagnostic {
                 name: "idle_seconds",
@@ -847,7 +834,7 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
 }
 
 #[async_trait::async_trait]
-impl PeerPolicyStorage for ReceiveIdlePeerPolicy {
+impl PeerPolicyStorage for ReceiveIdlePolicy {
     fn session_preload_kind(&self) -> PolicySessionPreloadKind {
         PolicySessionPreloadKind::PeerPolicySessions
     }
@@ -883,7 +870,7 @@ impl PeerPolicyStorage for ReceiveIdlePeerPolicy {
         store: &dyn PolicyDataStore,
         peer: &PeerContext,
     ) -> Result<OffenceHistory> {
-        let identity = self.policy.offence_identity(peer);
+        let identity = self.offence_identity(peer);
         store
             .load_policy_offence_history(self.name(), &identity)
             .await
@@ -916,7 +903,7 @@ impl PeerPolicyStorage for ReceiveIdlePeerPolicy {
 }
 
 #[async_trait::async_trait]
-impl PeerPolicyReplay for ReceiveIdlePeerPolicy {
+impl PeerPolicyReplay for ReceiveIdlePolicy {
     async fn record_replayed_intent(
         &self,
         persistence: &Persistence,
@@ -1951,29 +1938,21 @@ impl PolicyEngine {
         self.context().peer_observation_id(peer)
     }
 
-    pub fn enabled_peer_policies(&self) -> Vec<Arc<dyn PeerPolicyAdapter>> {
-        let mut policies: Vec<Arc<dyn PeerPolicyAdapter>> = Vec::new();
+    pub fn enabled_peer_policies(&self) -> Vec<Arc<dyn RuntimePolicy>> {
+        let mut policies: Vec<Arc<dyn RuntimePolicy>> = Vec::new();
         if self.config.score.enabled {
-            policies.push(Arc::new(ScorePeerPolicy {
-                policy: self.score_policy(),
-            }));
+            policies.push(Arc::new(self.score_policy()));
         }
         if self.config.receive_idle.enabled {
-            policies.push(Arc::new(ReceiveIdlePeerPolicy {
-                policy: self.receive_idle_policy(),
-            }));
+            policies.push(Arc::new(self.receive_idle_policy()));
         }
         policies
     }
 
-    pub fn replay_peer_policies(&self) -> Vec<Arc<dyn PeerPolicyAdapter>> {
+    pub fn replay_peer_policies(&self) -> Vec<Arc<dyn RuntimePolicy>> {
         vec![
-            Arc::new(ScorePeerPolicy {
-                policy: self.score_policy(),
-            }),
-            Arc::new(ReceiveIdlePeerPolicy {
-                policy: self.receive_idle_policy(),
-            }),
+            Arc::new(self.score_policy()),
+            Arc::new(self.receive_idle_policy()),
         ]
     }
 
@@ -2159,8 +2138,8 @@ mod tests {
     };
 
     use super::{
-        PeerPolicy, PolicyEngine, RECEIVE_IDLE_POLICY_NAME, ReceiveIdlePeerPolicy,
-        ReceiveIdleSessionSnapshot, SCORE_POLICY_NAME, ScorePeerPolicy,
+        PeerPolicy, PolicyEngine, RECEIVE_IDLE_POLICY_NAME, ReceiveIdleSessionSnapshot,
+        SCORE_POLICY_NAME,
     };
 
     proptest! {
@@ -3210,9 +3189,7 @@ mod tests {
         let mut previous = first.session.clone();
         previous.policy_version = "policy-v2".to_string();
 
-        let policy = ReceiveIdlePeerPolicy {
-            policy: engine.receive_idle_policy(),
-        };
+        let policy = engine.receive_idle_policy();
         let history = empty_history();
         let peer = seeded_peer_with_uploaded(210, 0);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
@@ -3234,9 +3211,7 @@ mod tests {
         let mut previous = first.session.clone();
         previous.policy_name = SCORE_POLICY_NAME.to_string();
 
-        let policy = ReceiveIdlePeerPolicy {
-            policy: engine.receive_idle_policy(),
-        };
+        let policy = engine.receive_idle_policy();
         let history = empty_history();
         let peer = seeded_peer_with_uploaded(210, 0);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
@@ -3252,16 +3227,14 @@ mod tests {
     }
 
     #[test]
-    fn score_adapter_preserves_engine_decision_and_state_summary() {
+    fn score_policy_preserves_engine_decision_and_state_summary() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(config, &FiltersConfig::default());
-        let policy = ScorePeerPolicy {
-            policy: engine.score_policy(),
-        };
+        let policy = engine.score_policy();
         let peer = seeded_peer(180, 0.10, 500);
         let history = OffenceHistory {
             offence_count: 2,
@@ -3269,7 +3242,7 @@ mod tests {
         };
         let direct_evaluation = engine.evaluate_peer(&peer, None);
         let direct_disposition = engine.decide_ban(&peer, &direct_evaluation, &history);
-        let adapter_assessment = policy
+        let policy_assessment = policy
             .assess_peer(PeerPolicyInput {
                 peer: &peer,
                 previous_session: None,
@@ -3277,35 +3250,33 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(adapter_assessment.disposition, direct_disposition);
+        assert_eq!(policy_assessment.disposition, direct_disposition);
         assert_eq!(
-            adapter_assessment.evaluation.offence_identity(),
+            policy_assessment.evaluation.offence_identity(),
             &direct_evaluation.session.offence_identity
         );
         assert_eq!(
-            adapter_assessment.evaluation.bad_duration(),
+            policy_assessment.evaluation.bad_duration(),
             direct_evaluation.session.bad_duration
         );
         assert_eq!(
-            adapter_assessment.evaluation.avg_upload_rate_bps(),
+            policy_assessment.evaluation.avg_upload_rate_bps(),
             direct_evaluation.session.rolling_avg_up_rate_bps
         );
         assert_eq!(
-            adapter_assessment.evaluation.is_bannable(),
+            policy_assessment.evaluation.is_bannable(),
             direct_evaluation.is_bannable
         );
         assert_eq!(
-            adapter_assessment.diagnostic_bool("threshold_met"),
+            policy_assessment.diagnostic_bool("threshold_met"),
             Some(true)
         );
     }
 
     #[test]
-    fn score_adapter_rejects_incompatible_session_snapshot() {
+    fn score_policy_rejects_incompatible_session_snapshot() {
         let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
-        let policy = ScorePeerPolicy {
-            policy: engine.score_policy(),
-        };
+        let policy = engine.score_policy();
         let peer = seeded_peer(180, 0.10, 500);
         let previous = engine.begin_receive_idle_session(&peer, None);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
@@ -3322,11 +3293,9 @@ mod tests {
     }
 
     #[test]
-    fn receive_idle_adapter_preserves_engine_decision_and_state_summary() {
+    fn receive_idle_policy_preserves_engine_decision_and_state_summary() {
         let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let policy = ReceiveIdlePeerPolicy {
-            policy: engine.receive_idle_policy(),
-        };
+        let policy = engine.receive_idle_policy();
         let first_peer = seeded_peer_with_uploaded(180, 0);
         let first = engine.evaluate_receive_idle_peer(&first_peer, None);
         let second_peer = seeded_peer_with_uploaded(240, 0);
@@ -3338,7 +3307,7 @@ mod tests {
         let previous = ReceiveIdleSessionSnapshot {
             session: first.session,
         };
-        let adapter_assessment = policy
+        let policy_assessment = policy
             .assess_peer(PeerPolicyInput {
                 peer: &second_peer,
                 previous_session: Some(&previous),
@@ -3346,25 +3315,25 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(adapter_assessment.disposition, direct_disposition);
+        assert_eq!(policy_assessment.disposition, direct_disposition);
         assert_eq!(
-            adapter_assessment.evaluation.offence_identity(),
+            policy_assessment.evaluation.offence_identity(),
             &direct_evaluation.session.offence_identity
         );
         assert_eq!(
-            adapter_assessment.evaluation.bad_duration(),
+            policy_assessment.evaluation.bad_duration(),
             direct_evaluation.session.bad_duration
         );
         assert_eq!(
-            adapter_assessment.evaluation.avg_upload_rate_bps(),
+            policy_assessment.evaluation.avg_upload_rate_bps(),
             direct_evaluation.session.last_upload_rate_bps
         );
         assert_eq!(
-            adapter_assessment.evaluation.is_bannable(),
+            policy_assessment.evaluation.is_bannable(),
             direct_evaluation.is_bannable
         );
         assert_eq!(
-            adapter_assessment.diagnostic_bool("threshold_met"),
+            policy_assessment.diagnostic_bool("threshold_met"),
             Some(true)
         );
     }
