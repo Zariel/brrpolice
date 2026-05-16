@@ -52,6 +52,12 @@ pub trait PolicyDataStore: Send + Sync {
     ) -> Result<OffenceHistory>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySessionPreloadKind {
+    LegacyScore,
+    PeerPolicySessions,
+}
+
 #[async_trait::async_trait]
 pub trait PeerPolicy: Send + Sync {
     fn name(&self) -> &'static str;
@@ -59,12 +65,22 @@ pub trait PeerPolicy: Send + Sync {
         self.name()
     }
     fn reason_metric_label(&self, reason_code: &str) -> &'static str;
-    async fn preload_sessions(
+    fn session_preload_kind(&self) -> PolicySessionPreloadKind;
+    async fn preload_legacy_sessions(
         &self,
-        persistence: &Persistence,
-        torrent_hashes: &[String],
-        cache: &mut PolicyCycleCache,
-    ) -> Result<()>;
+        _persistence: &Persistence,
+        _torrent_hashes: &[String],
+        _cache: &mut PolicyCycleCache,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn cache_peer_policy_session(
+        &self,
+        _session: PeerPolicySessionState,
+        _cache: &mut PolicyCycleCache,
+    ) -> Result<()> {
+        anyhow::bail!("{} does not use peer_policy_sessions", self.name())
+    }
     async fn load_previous_session(
         &self,
         store: &dyn PolicyDataStore,
@@ -191,12 +207,41 @@ impl PolicyCycleCache {
             .collect::<Vec<_>>();
         let mut cache = Self::default();
 
+        let mut peer_policy_session_policies = HashMap::new();
         for policy in policies {
-            policy
-                .preload_sessions(persistence, torrent_hashes, &mut cache)
+            match policy.session_preload_kind() {
+                PolicySessionPreloadKind::LegacyScore => {
+                    policy
+                        .preload_legacy_sessions(persistence, torrent_hashes, &mut cache)
+                        .await?;
+                    cache.batch_load_count += 1;
+                }
+                PolicySessionPreloadKind::PeerPolicySessions => {
+                    peer_policy_session_policies.insert(policy.name(), policy);
+                }
+            }
+        }
+
+        if !peer_policy_session_policies.is_empty() {
+            let peer_policy_session_names = peer_policy_session_policies
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            let sessions = persistence
+                .load_peer_policy_sessions_for_policy_torrents(
+                    &peer_policy_session_names,
+                    torrent_hashes,
+                )
                 .await?;
             cache.batch_load_count += 1;
+            for session in sessions {
+                if let Some(policy) = peer_policy_session_policies.get(session.policy_name.as_str())
+                {
+                    policy.cache_peer_policy_session(session, &mut cache)?;
+                }
+            }
         }
+
         let offence_histories = persistence
             .load_policy_offence_histories_for_policy_torrents(&policy_names, torrent_hashes)
             .await?;
@@ -448,7 +493,11 @@ impl PeerPolicy for ScorePeerPolicy {
         }
     }
 
-    async fn preload_sessions(
+    fn session_preload_kind(&self) -> PolicySessionPreloadKind {
+        PolicySessionPreloadKind::LegacyScore
+    }
+
+    async fn preload_legacy_sessions(
         &self,
         persistence: &Persistence,
         torrent_hashes: &[String],
@@ -662,23 +711,21 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         }
     }
 
-    async fn preload_sessions(
+    fn session_preload_kind(&self) -> PolicySessionPreloadKind {
+        PolicySessionPreloadKind::PeerPolicySessions
+    }
+
+    fn cache_peer_policy_session(
         &self,
-        persistence: &Persistence,
-        torrent_hashes: &[String],
+        session: PeerPolicySessionState,
         cache: &mut PolicyCycleCache,
     ) -> Result<()> {
-        let sessions = persistence
-            .load_peer_policy_sessions_for_policy_torrents(&[self.name()], torrent_hashes)
-            .await?;
-        for session in sessions {
-            cache.insert_session_snapshot(
-                self.name(),
-                session.observation_id.clone(),
-                session.last_seen_at,
-                receive_idle_session_snapshot(session),
-            );
-        }
+        cache.insert_session_snapshot(
+            self.name(),
+            session.observation_id.clone(),
+            session.last_seen_at,
+            receive_idle_session_snapshot(session),
+        );
         Ok(())
     }
 

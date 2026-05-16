@@ -1777,7 +1777,13 @@ mod tests {
         config.score.enabled = true;
         config.receive_idle.enabled = true;
         let policy = PolicyEngine::new(config, &FiltersConfig::default());
-        let policies = policy.enabled_peer_policies();
+        let mut policies = policy.enabled_peer_policies();
+        let receive_idle_policy = policies
+            .iter()
+            .find(|policy| policy.name() == crate::policy::RECEIVE_IDLE_POLICY_NAME)
+            .unwrap()
+            .clone();
+        policies.push(receive_idle_policy);
         let torrent = TorrentSummary {
             hash: "abc123".to_string(),
             name: "Example".to_string(),
