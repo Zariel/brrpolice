@@ -24,9 +24,11 @@ The observation identity models the currently connected endpoint. The offence id
 
 Per-peer session state is persisted in SQLite so policy timing survives restarts. Score state is still read from the legacy `peer_sessions` table for compatibility, while generic policy sessions use `peer_policy_sessions` with a `policy_name` key and versioned policy state.
 
-The control loop receives previous-session and assessment state through one opaque policy interface.
-It reads only common summary fields for logging, metrics, identity, and enforcement. Concrete score
-or receive-idle state is interpreted only by the concrete policy that produced it.
+The control loop executes `RuntimePolicy` objects. That boundary combines the narrow `PeerPolicy`
+assessment API with the storage and replay hooks needed to run a full poll cycle, while keeping
+policy-local state opaque to orchestration. The control loop reads only common summary fields for
+logging, metrics, identity, and enforcement. Concrete score or receive-idle state is interpreted only
+by the concrete policy that produced it.
 
 To avoid per-peer/per-policy database reads, each poll cycle preloads session and offence-history
 rows for the in-scope torrent set into a cycle-scoped `PolicyDataStore` cache. Runtime policies still

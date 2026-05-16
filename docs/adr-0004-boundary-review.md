@@ -6,10 +6,11 @@ Review date: 2026-05-16
 
 ADR-0004's policy-engine boundary is implemented for the production control-loop path.
 
-The control loop evaluates configured peer-ban policies through `PeerPolicy` trait objects. It does
-not match on score versus receive-idle to load state, assess peers, persist assessment state, record
-enforcement, emit policy metrics, log policy outcomes, or replay pending intents. Policy selection is
-limited to startup construction of the enabled policy list and the replay registry.
+The control loop evaluates configured peer-ban policies through `RuntimePolicy` trait objects, which
+combine the narrow `PeerPolicy` assessment API with storage and replay hooks. It does not match on
+score versus receive-idle to load state, assess peers, persist assessment state, record enforcement,
+emit policy metrics, log policy outcomes, or replay pending intents. Policy selection is limited to
+startup construction of the enabled policy list and the replay registry.
 
 ## Review Scope
 
