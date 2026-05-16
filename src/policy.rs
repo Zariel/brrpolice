@@ -393,10 +393,16 @@ fn generic_evaluation(assessment: &PeerPolicyAssessment) -> Result<&PeerPolicyEv
 
 fn score_previous_session(
     previous: Option<&dyn PolicySessionSnapshot>,
-) -> Option<&PeerSessionState> {
+) -> Result<Option<&PeerSessionState>> {
     previous
-        .and_then(|session| session.as_any().downcast_ref::<ScoreSessionSnapshot>())
-        .map(|session| &session.session)
+        .map(|session| {
+            session
+                .as_any()
+                .downcast_ref::<ScoreSessionSnapshot>()
+                .map(|session| &session.session)
+                .ok_or_else(|| anyhow::anyhow!("score assessment carried non-score session"))
+        })
+        .transpose()
 }
 
 fn generic_previous_session(
@@ -484,7 +490,7 @@ impl PeerPolicy for ScorePeerPolicy {
     }
 
     fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
-        let previous = score_previous_session(input.previous_session);
+        let previous = score_previous_session(input.previous_session)?;
         let evaluation = self.engine.evaluate_peer(input.peer, previous);
         let disposition = self
             .engine
@@ -3089,6 +3095,27 @@ mod tests {
             adapter_assessment.diagnostic_bool("threshold_met"),
             Some(true)
         );
+    }
+
+    #[test]
+    fn score_adapter_rejects_incompatible_session_snapshot() {
+        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
+        let policy = ScorePeerPolicy {
+            engine: engine.clone(),
+        };
+        let peer = seeded_peer(180, 0.10, 500);
+        let previous = engine.begin_receive_idle_session(&peer, None);
+        let previous = GenericSessionSnapshot { session: previous };
+        let history = empty_history();
+        let error = policy
+            .assess_peer(PeerPolicyInput {
+                peer: &peer,
+                previous_session: Some(&previous),
+                offence_history: &history,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-score session"));
     }
 
     #[test]
