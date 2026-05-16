@@ -19,7 +19,7 @@ The review checked production code for concrete policy branches and implementati
 - `src/control.rs`
 - `src/metrics.rs`
 - `src/persistence.rs`
-- `src/policy.rs`
+- `src/policy/`
 - `src/types.rs`
 
 The audit also checked tests and docs separately so regression fixtures that mention score and
