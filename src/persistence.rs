@@ -1884,8 +1884,9 @@ mod tests {
 
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
-        MIGRATIONS_TABLE_SQL, PeerOffenceRecord, PendingBanIntentRecord, Persistence,
-        RecoverySnapshot, RetentionPruneResult, migration_checksum,
+        MIGRATION_0006_DESCRIPTION, MIGRATION_0006_SQL, MIGRATIONS_TABLE_SQL, PeerOffenceRecord,
+        PendingBanIntentRecord, Persistence, RecoverySnapshot, RetentionPruneResult,
+        migration_checksum,
     };
     use crate::{
         config::{DatabaseConfig, RetentionConfig, VacuumConfig, VacuumMode},
@@ -2639,6 +2640,128 @@ mod tests {
 
         assert_eq!(churn_amplifier, 0.0);
         assert_eq!(migration_6_applied, 1);
+    }
+
+    #[tokio::test]
+    async fn migrations_from_schema_v6_preserve_pending_intents_as_score_policy() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy-v6.sqlite");
+        let persistence = file_persistence(&db_path).await;
+
+        for (_, _, sql) in MIGRATION_FIXTURES {
+            persistence.pool.execute(*sql).await.unwrap();
+        }
+        persistence.pool.execute(MIGRATION_0006_SQL).await.unwrap();
+        persistence
+            .pool
+            .execute(MIGRATIONS_TABLE_SQL)
+            .await
+            .unwrap();
+        for (version, description, sql) in MIGRATION_FIXTURES {
+            mark_fixture_migration_applied(&persistence, *version, description, sql).await;
+        }
+        mark_fixture_migration_applied(
+            &persistence,
+            6,
+            MIGRATION_0006_DESCRIPTION,
+            MIGRATION_0006_SQL,
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO pending_ban_intents (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_at,
+                ban_expires_at,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                last_error
+            ) VALUES (
+                'abc123',
+                '10.0.0.10',
+                51413,
+                2,
+                'slow_non_progressing',
+                '1970-01-01T00:15:00Z',
+                '1970-01-01T01:15:00Z',
+                120,
+                0.001,
+                128,
+                'failed before upgrade'
+            )
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO peer_offences (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_seconds,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                banned_at,
+                ban_expires_at,
+                ban_revoked_at
+            ) VALUES (
+                'abc123',
+                '10.0.0.10',
+                51413,
+                1,
+                'slow_non_progressing',
+                180,
+                120,
+                0.002,
+                256,
+                '1970-01-01T00:10:00Z',
+                '1970-01-01T01:10:00Z',
+                NULL
+            )
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+
+        persistence.run_migrations().await.unwrap();
+
+        let loaded = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![PendingBanIntentRecord {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: "10.0.0.10".parse().unwrap(),
+                peer_port: 51413,
+                policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
+                offence_number: 2,
+                reason_code: "slow_non_progressing".to_string(),
+                observed_at: UNIX_EPOCH + Duration::from_secs(900),
+                ban_expires_at: UNIX_EPOCH + Duration::from_secs(4_500),
+                bad_duration: Duration::from_secs(120),
+                progress_delta_per_mille: 1,
+                avg_up_rate_bps: 128,
+                last_error: "failed before upgrade".to_string(),
+            }]
+        );
+        let offences = persistence
+            .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(offences.len(), 1);
+        assert_eq!(offences[0].policy_name, crate::policy::SCORE_POLICY_NAME);
+        assert!(persistence.is_ready().await);
     }
 
     #[tokio::test]
@@ -3723,6 +3846,26 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn mark_fixture_migration_applied(
+        persistence: &Persistence,
+        version: i64,
+        description: &str,
+        sql: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+            VALUES (?, ?, TRUE, ?, 0)
+            "#,
+        )
+        .bind(version)
+        .bind(description)
+        .bind(migration_checksum(sql))
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
     }
 
     fn sample_peer_session() -> PeerSessionState {
