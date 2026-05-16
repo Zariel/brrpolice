@@ -519,7 +519,24 @@ impl PolicyEngine {
         peer: &PeerContext,
         existing: Option<&PeerPolicySessionState>,
     ) -> PeerPolicyEvaluation {
-        let previous = existing.cloned();
+        let observation_id = self.peer_observation_id(peer);
+        let offence_identity = self.offence_identity(peer);
+        let previous = existing
+            .filter(|previous| {
+                previous.policy_name == RECEIVE_IDLE_POLICY_NAME
+                    && (self.can_continue_receive_idle_session(
+                        previous,
+                        &observation_id,
+                        &offence_identity,
+                        peer,
+                    ) || self.can_carry_over_receive_idle_session(
+                        previous,
+                        &observation_id,
+                        &offence_identity,
+                        peer,
+                    ))
+            })
+            .cloned();
         let mut session = self.begin_receive_idle_session(peer, previous.as_ref());
         let sample_duration = previous
             .as_ref()
@@ -690,6 +707,17 @@ impl PolicyEngine {
                 <= self.config.decay_window
     }
 
+    fn can_carry_over_receive_idle_session(
+        &self,
+        previous: &PeerPolicySessionState,
+        observation_id: &PeerObservationId,
+        offence_identity: &OffenceIdentity,
+        peer: &PeerContext,
+    ) -> bool {
+        self.can_carry_over_policy(previous, observation_id, offence_identity, peer)
+            && self.policy_session_gap(previous, peer) <= self.config.receive_idle.sustain_duration
+    }
+
     fn can_continue_policy_session(
         &self,
         previous: &PeerPolicySessionState,
@@ -700,6 +728,27 @@ impl PolicyEngine {
         previous.observation_id == *observation_id
             && previous.offence_identity == *offence_identity
             && peer.observed_at >= previous.last_seen_at
+    }
+
+    fn can_continue_receive_idle_session(
+        &self,
+        previous: &PeerPolicySessionState,
+        observation_id: &PeerObservationId,
+        offence_identity: &OffenceIdentity,
+        peer: &PeerContext,
+    ) -> bool {
+        self.can_continue_policy_session(previous, observation_id, offence_identity, peer)
+            && self.policy_session_gap(previous, peer) <= self.config.receive_idle.sustain_duration
+    }
+
+    fn policy_session_gap(
+        &self,
+        previous: &PeerPolicySessionState,
+        peer: &PeerContext,
+    ) -> Duration {
+        peer.observed_at
+            .duration_since(previous.last_seen_at)
+            .unwrap_or_default()
     }
 
     fn decay_bad_duration(&self, bad_duration: Duration, elapsed: Duration) -> Duration {
@@ -1979,6 +2028,22 @@ mod tests {
             BanDisposition::Ban(decision) => assert_eq!(decision.reason_code, "receive_idle"),
             other => panic!("expected receive idle ban, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn receive_idle_does_not_count_absent_gap_as_idle_time() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = engine
+            .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(210, 0), Some(&first.session));
+        assert_eq!(second.session.bad_duration, Duration::from_secs(30));
+
+        let returned_peer = seeded_peer_with_uploaded(600, 0);
+        let returned = engine.evaluate_receive_idle_peer(&returned_peer, Some(&second.session));
+
+        assert!(!returned.is_bad_sample);
+        assert_eq!(returned.session.bad_duration, Duration::ZERO);
+        assert!(!returned.is_bannable);
     }
 
     #[test]
