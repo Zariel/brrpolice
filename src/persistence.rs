@@ -844,6 +844,39 @@ impl Persistence {
             )
             "#,
         )
+        .bind(peer_session_cutoff.clone())
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let _peer_policy_sessions_deleted = sqlx::query(
+            r#"
+            DELETE FROM peer_policy_sessions
+            WHERE rowid IN (
+                SELECT pps.rowid
+                FROM peer_policy_sessions pps
+                WHERE pps.last_seen_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM active_bans ab
+                        WHERE ab.reconciled_at IS NULL
+                            AND ab.scope = ('torrent:' || pps.torrent_hash)
+                            AND ab.peer_ip = pps.peer_ip
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM pending_ban_intents pbi
+                        WHERE pbi.torrent_hash = pps.torrent_hash
+                            AND pbi.peer_ip = pps.peer_ip
+                            AND pbi.peer_port = pps.peer_port
+                            AND pbi.policy_name = pps.policy_name
+                    )
+                ORDER BY pps.last_seen_at
+                LIMIT ?
+            )
+            "#,
+        )
         .bind(peer_session_cutoff)
         .bind(row_limit)
         .execute(&mut *tx)
@@ -1858,7 +1891,7 @@ mod tests {
         config::{DatabaseConfig, RetentionConfig, VacuumConfig, VacuumMode},
         types::{
             BanDecision, ExemptionReason, OffenceHistory, OffenceIdentity, PeerEvaluation,
-            PeerObservationId, PeerSessionState,
+            PeerObservationId, PeerPolicySessionState, PeerSessionState,
         },
     };
 
@@ -2861,6 +2894,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_prune_deletes_only_safe_stale_policy_sessions() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_500_000);
+
+        let mut stale_deletable = sample_peer_policy_session();
+        stale_deletable.observation_id.torrent_hash = "policy-stale-delete".to_string();
+        stale_deletable.offence_identity.torrent_hash = "policy-stale-delete".to_string();
+        stale_deletable.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&stale_deletable, "policy-v1")
+            .await
+            .unwrap();
+
+        let mut protected_by_ban = sample_peer_policy_session();
+        protected_by_ban.observation_id.torrent_hash = "policy-stale-ban".to_string();
+        protected_by_ban.offence_identity.torrent_hash = "policy-stale-ban".to_string();
+        protected_by_ban.observation_id.peer_port = 51414;
+        protected_by_ban.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&protected_by_ban, "policy-v1")
+            .await
+            .unwrap();
+        persistence
+            .upsert_active_ban(&ActiveBanRecord {
+                peer_ip: protected_by_ban.observation_id.peer_ip,
+                peer_port: protected_by_ban.observation_id.peer_port,
+                scope: format!("torrent:{}", protected_by_ban.observation_id.torrent_hash),
+                offence_number: 1,
+                reason: "receive_idle".to_string(),
+                created_at: now - Duration::from_secs(3600),
+                expires_at: now + Duration::from_secs(3600),
+                reconciled_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut protected_by_intent = sample_peer_policy_session();
+        protected_by_intent.observation_id.torrent_hash = "policy-stale-intent".to_string();
+        protected_by_intent.offence_identity.torrent_hash = "policy-stale-intent".to_string();
+        protected_by_intent.observation_id.peer_port = 51415;
+        protected_by_intent.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&protected_by_intent, "policy-v1")
+            .await
+            .unwrap();
+        persistence
+            .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                torrent_hash: protected_by_intent.observation_id.torrent_hash.clone(),
+                peer_ip: protected_by_intent.observation_id.peer_ip,
+                peer_port: protected_by_intent.observation_id.peer_port,
+                policy_name: crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string(),
+                offence_number: 1,
+                reason_code: "receive_idle".to_string(),
+                observed_at: now - Duration::from_secs(3600),
+                ban_expires_at: now + Duration::from_secs(3600),
+                bad_duration: Duration::from_secs(300),
+                progress_delta_per_mille: 0,
+                avg_up_rate_bps: 0,
+                last_error: "retry".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &stale_deletable.observation_id
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &protected_by_ban.observation_id
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &protected_by_intent.observation_id
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn retention_prune_respects_row_limits() {
         let persistence = test_persistence().await;
         persistence.run_migrations().await.unwrap();
@@ -3668,6 +3817,31 @@ mod tests {
             banned_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs.saturating_sub(1800)),
             ban_expires_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs),
             ban_revoked_at: None,
+        }
+    }
+
+    fn sample_peer_policy_session() -> PeerPolicySessionState {
+        PeerPolicySessionState {
+            policy_name: crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string(),
+            observation_id: PeerObservationId {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+                peer_port: 51413,
+            },
+            offence_identity: OffenceIdentity {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            },
+            first_seen_at: UNIX_EPOCH + Duration::from_secs(60),
+            last_seen_at: UNIX_EPOCH + Duration::from_secs(180),
+            observed_duration: Duration::from_secs(120),
+            bad_duration: Duration::from_secs(60),
+            sample_count: 2,
+            last_uploaded_bytes: Some(0),
+            last_upload_rate_bps: 0,
+            last_exemption_reason: None,
+            bannable_since: None,
+            last_ban_decision_at: None,
         }
     }
 }
