@@ -843,6 +843,7 @@ fn environment_source(source: Option<Map<String, String>>) -> Environment {
         .list_separator(",")
         .try_parsing(true);
     for key in [
+        "policy.receive_idle.ban_ladder.durations",
         "policy.ban_ladder.durations",
         "filters.include_categories",
         "filters.exclude_categories",
@@ -1171,6 +1172,30 @@ allowlist_peer_ips = ["127.0.0.1"]
 
         assert_eq!(config.qbittorrent.api_key, "api-key-from-env");
         assert_eq!(config.qbittorrent.auth_mode_name(), "api_key");
+    }
+
+    #[test]
+    fn environment_can_set_receive_idle_ban_ladder() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = load_test_config(
+            &config_path,
+            HashMap::from([(
+                "BRRPOLICE_POLICY__RECEIVE_IDLE__BAN_LADDER__DURATIONS".to_string(),
+                "5m,45m,3h".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.policy.receive_idle.ban_ladder.durations,
+            vec![
+                Duration::from_secs(300),
+                Duration::from_secs(2_700),
+                Duration::from_secs(10_800),
+            ]
+        );
     }
 
     #[test]
