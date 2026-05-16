@@ -272,6 +272,7 @@ fn process_fields(
             port: fields.peer_port,
             progress,
             up_rate_bps: fields.average_upload_rate_bps,
+            uploaded_bytes: None,
         },
         first_seen_at,
         observed_at,

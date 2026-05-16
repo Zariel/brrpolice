@@ -32,6 +32,7 @@ pub struct PeerSnapshot {
     pub port: u16,
     pub progress: f64,
     pub up_rate_bps: u64,
+    pub uploaded_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,32 @@ pub struct PeerSessionState {
     pub last_exemption_reason: Option<ExemptionReason>,
     pub bannable_since: Option<SystemTime>,
     pub last_ban_decision_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerPolicySessionState {
+    pub policy_name: String,
+    pub observation_id: PeerObservationId,
+    pub offence_identity: OffenceIdentity,
+    pub first_seen_at: SystemTime,
+    pub last_seen_at: SystemTime,
+    pub observed_duration: Duration,
+    pub bad_duration: Duration,
+    pub sample_count: u32,
+    pub last_uploaded_bytes: Option<u64>,
+    pub last_upload_rate_bps: u64,
+    pub last_exemption_reason: Option<ExemptionReason>,
+    pub bannable_since: Option<SystemTime>,
+    pub last_ban_decision_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerPolicyEvaluation {
+    pub session: PeerPolicySessionState,
+    pub sample_duration: Duration,
+    pub uploaded_delta_bytes: Option<u64>,
+    pub is_bad_sample: bool,
+    pub is_bannable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -80,6 +80,16 @@ impl AppConfig {
             .set_default("policy.score.churn.min_reconnects", 2_u32)?
             .set_default("policy.score.churn.max_amplifier", 1.0_f64)?
             .set_default("policy.score.churn.decay_per_second", 0.002_f64)?
+            .set_default("policy.receive_idle.enabled", true)?
+            .set_default("policy.receive_idle.min_observation_duration", "3m")?
+            .set_default("policy.receive_idle.sustain_duration", "2m")?
+            .set_default("policy.receive_idle.max_upload_rate_bps", 0_u64)?
+            .set_default("policy.receive_idle.max_uploaded_delta_bytes", 0_u64)?
+            .set_default("policy.receive_idle.reban_cooldown", "10m")?
+            .set_default(
+                "policy.receive_idle.ban_ladder.durations",
+                vec!["10m", "30m", "2h", "6h"],
+            )?
             .set_default(
                 "policy.ban_ladder.durations",
                 vec!["1h", "6h", "24h", "168h"],
@@ -161,6 +171,13 @@ impl AppConfig {
                 "policy.score.churn.min_reconnects={}\n",
                 "policy.score.churn.max_amplifier={:.6}\n",
                 "policy.score.churn.decay_per_second={:.6}\n",
+                "policy.receive_idle.enabled={}\n",
+                "policy.receive_idle.min_observation_duration={}\n",
+                "policy.receive_idle.sustain_duration={}\n",
+                "policy.receive_idle.max_upload_rate_bps={}\n",
+                "policy.receive_idle.max_uploaded_delta_bytes={}\n",
+                "policy.receive_idle.reban_cooldown={}\n",
+                "policy.receive_idle.ban_ladder={}\n",
                 "policy.ban_ladder={}\n",
                 "filters.include_categories={}\n",
                 "filters.exclude_categories={}\n",
@@ -214,6 +231,20 @@ impl AppConfig {
             self.policy.score.churn.min_reconnects,
             self.policy.score.churn.max_amplifier,
             self.policy.score.churn.decay_per_second,
+            self.policy.receive_idle.enabled,
+            self.policy.receive_idle.min_observation_duration.as_secs(),
+            self.policy.receive_idle.sustain_duration.as_secs(),
+            self.policy.receive_idle.max_upload_rate_bps,
+            self.policy.receive_idle.max_uploaded_delta_bytes,
+            self.policy.receive_idle.reban_cooldown.as_secs(),
+            self.policy
+                .receive_idle
+                .ban_ladder
+                .durations
+                .iter()
+                .map(|duration| duration.as_secs().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             self.policy
                 .ban_ladder
                 .durations
@@ -364,6 +395,34 @@ impl AppConfig {
         if self.policy.score.churn.decay_per_second < 0.0 {
             bail!("policy.score.churn.decay_per_second must be >= 0.0");
         }
+        require_positive_duration(
+            self.policy.receive_idle.min_observation_duration,
+            "policy.receive_idle.min_observation_duration",
+        )?;
+        require_positive_duration(
+            self.policy.receive_idle.sustain_duration,
+            "policy.receive_idle.sustain_duration",
+        )?;
+        require_positive_duration(
+            self.policy.receive_idle.reban_cooldown,
+            "policy.receive_idle.reban_cooldown",
+        )?;
+        if self.policy.receive_idle.ban_ladder.durations.is_empty() {
+            bail!("policy.receive_idle.ban_ladder.durations must not be empty");
+        }
+        for (index, duration) in self
+            .policy
+            .receive_idle
+            .ban_ladder
+            .durations
+            .iter()
+            .enumerate()
+        {
+            require_positive_duration(
+                *duration,
+                &format!("policy.receive_idle.ban_ladder.durations[{index}]"),
+            )?;
+        }
         if self.policy.min_total_seeders == 0 {
             bail!("policy.min_total_seeders must be at least 1");
         }
@@ -473,6 +532,8 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub score: ScorePolicyConfig,
     #[serde(default)]
+    pub receive_idle: ReceiveIdlePolicyConfig,
+    #[serde(default)]
     pub ban_ladder: BanLadderConfig,
 }
 
@@ -485,6 +546,7 @@ impl Default for PolicyConfig {
             min_total_seeders: 3,
             reban_cooldown: Duration::from_secs(1_800),
             score: ScorePolicyConfig::default(),
+            receive_idle: ReceiveIdlePolicyConfig::default(),
             ban_ladder: BanLadderConfig::default(),
         }
     }
@@ -552,6 +614,42 @@ impl Default for ChurnPolicyConfig {
             min_reconnects: 2,
             max_amplifier: 1.0,
             decay_per_second: 0.002,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReceiveIdlePolicyConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub min_observation_duration: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub sustain_duration: Duration,
+    pub max_upload_rate_bps: u64,
+    pub max_uploaded_delta_bytes: u64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub reban_cooldown: Duration,
+    #[serde(default)]
+    pub ban_ladder: BanLadderConfig,
+}
+
+impl Default for ReceiveIdlePolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_observation_duration: Duration::from_secs(180),
+            sustain_duration: Duration::from_secs(120),
+            max_upload_rate_bps: 0,
+            max_uploaded_delta_bytes: 0,
+            reban_cooldown: Duration::from_secs(600),
+            ban_ladder: BanLadderConfig {
+                durations: vec![
+                    Duration::from_secs(600),
+                    Duration::from_secs(1_800),
+                    Duration::from_secs(7_200),
+                    Duration::from_secs(21_600),
+                ],
+            },
         }
     }
 }
@@ -745,6 +843,7 @@ fn environment_source(source: Option<Map<String, String>>) -> Environment {
         .list_separator(",")
         .try_parsing(true);
     for key in [
+        "policy.receive_idle.ban_ladder.durations",
         "policy.ban_ladder.durations",
         "filters.include_categories",
         "filters.exclude_categories",
@@ -1073,6 +1172,30 @@ allowlist_peer_ips = ["127.0.0.1"]
 
         assert_eq!(config.qbittorrent.api_key, "api-key-from-env");
         assert_eq!(config.qbittorrent.auth_mode_name(), "api_key");
+    }
+
+    #[test]
+    fn environment_can_set_receive_idle_ban_ladder() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = load_test_config(
+            &config_path,
+            HashMap::from([(
+                "BRRPOLICE_POLICY__RECEIVE_IDLE__BAN_LADDER__DURATIONS".to_string(),
+                "5m,45m,3h".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.policy.receive_idle.ban_ladder.durations,
+            vec![
+                Duration::from_secs(300),
+                Duration::from_secs(2_700),
+                Duration::from_secs(10_800),
+            ]
+        );
     }
 
     #[test]

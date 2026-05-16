@@ -22,11 +22,11 @@ use crate::{
     config::{DatabaseConfig, RetentionConfig, VacuumMode},
     types::{
         BanDecision, ExemptionReason, OffenceIdentity, PeerEvaluation, PeerObservationId,
-        PeerSessionState,
+        PeerPolicyEvaluation, PeerPolicySessionState, PeerSessionState,
     },
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 const MIGRATIONS_TABLE_SQL: &str = r#"
@@ -69,6 +69,7 @@ pub struct PeerOffenceRecord {
     pub torrent_hash: String,
     pub peer_ip: IpAddr,
     pub peer_port: u16,
+    pub policy_name: String,
     pub offence_number: u32,
     pub reason_code: String,
     pub observed_duration: Duration,
@@ -85,6 +86,7 @@ pub struct PendingBanIntentRecord {
     pub torrent_hash: String,
     pub peer_ip: IpAddr,
     pub peer_port: u16,
+    pub policy_name: String,
     pub offence_number: u32,
     pub reason_code: String,
     pub observed_at: SystemTime,
@@ -294,12 +296,67 @@ impl Persistence {
         row.map(decode_peer_session).transpose()
     }
 
+    pub async fn get_peer_policy_session(
+        &self,
+        policy_name: &str,
+        observation_id: &PeerObservationId,
+    ) -> Result<Option<PeerPolicySessionState>> {
+        get_peer_policy_session_exec(&self.pool, policy_name, observation_id).await
+    }
+
+    pub async fn get_latest_peer_policy_session_for_torrent_ip(
+        &self,
+        policy_name: &str,
+        torrent_hash: &str,
+        peer_ip: IpAddr,
+    ) -> Result<Option<PeerPolicySessionState>> {
+        let row = sqlx::query_as::<_, PeerPolicySessionRow>(
+            r#"
+            SELECT
+                policy_name,
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                first_seen_at,
+                last_seen_at,
+                observed_seconds,
+                bad_seconds,
+                sample_count,
+                last_uploaded_bytes,
+                last_upload_rate_bps,
+                last_exemption_reason,
+                state_json,
+                bannable_since,
+                last_ban_decision_at
+            FROM peer_policy_sessions
+            WHERE policy_name = ? AND torrent_hash = ? AND peer_ip = ?
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(policy_name)
+        .bind(torrent_hash)
+        .bind(peer_ip.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(decode_peer_policy_session).transpose()
+    }
+
     pub async fn upsert_peer_session(
         &self,
         session: &PeerSessionState,
         policy_version: &str,
     ) -> Result<()> {
         upsert_peer_session_exec(&self.pool, session, policy_version).await
+    }
+
+    pub async fn upsert_peer_policy_session(
+        &self,
+        session: &PeerPolicySessionState,
+        policy_version: &str,
+    ) -> Result<()> {
+        upsert_peer_policy_session_exec(&self.pool, session, policy_version).await
     }
 
     #[cfg(test)]
@@ -460,12 +517,79 @@ impl Persistence {
             torrent_hash: updated_session.observation_id.torrent_hash.clone(),
             peer_ip: decision.peer_ip,
             peer_port: decision.peer_port,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: decision.offence_number,
             reason_code: decision.reason_code.clone(),
             observed_duration: updated_session.observed_duration,
             bad_duration: updated_session.bad_duration,
             progress_delta_per_mille: progress_delta_per_mille(evaluation.progress_delta),
             avg_up_rate_bps: updated_session.rolling_avg_up_rate_bps,
+            banned_at: enforced_at,
+            ban_expires_at: enforced_at + decision.ttl,
+            ban_revoked_at: None,
+        };
+        let offence_id = insert_peer_offence_exec(&mut *tx, &offence).await?;
+
+        let active_ban = ActiveBanRecord {
+            peer_ip: decision.peer_ip,
+            peer_port: decision.peer_port,
+            scope: format!("torrent:{}", updated_session.observation_id.torrent_hash),
+            offence_number: decision.offence_number,
+            reason: decision.reason_code.clone(),
+            created_at: enforced_at,
+            expires_at: enforced_at + decision.ttl,
+            reconciled_at: None,
+        };
+        upsert_active_ban_exec(&mut *tx, &active_ban).await?;
+
+        tx.commit().await?;
+
+        Ok(EnforcementWriteResult {
+            duplicate_suppressed: false,
+            offence_id: Some(offence_id),
+            active_ban: Some(active_ban),
+        })
+    }
+
+    pub async fn record_policy_ban_enforcement(
+        &self,
+        evaluation: &PeerPolicyEvaluation,
+        decision: &BanDecision,
+        enforced_at: SystemTime,
+    ) -> Result<EnforcementWriteResult> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(session) = get_peer_policy_session_exec(
+            &mut *tx,
+            &evaluation.session.policy_name,
+            &evaluation.session.observation_id,
+        )
+        .await?
+            && session.last_ban_decision_at.is_some()
+        {
+            tx.commit().await?;
+            return Ok(EnforcementWriteResult {
+                duplicate_suppressed: true,
+                offence_id: None,
+                active_ban: None,
+            });
+        }
+
+        let mut updated_session = evaluation.session.clone();
+        updated_session.last_ban_decision_at = Some(enforced_at);
+        upsert_peer_policy_session_exec(&mut *tx, &updated_session, "policy-v1").await?;
+
+        let offence = PeerOffenceRecord {
+            id: None,
+            torrent_hash: updated_session.observation_id.torrent_hash.clone(),
+            peer_ip: decision.peer_ip,
+            peer_port: decision.peer_port,
+            policy_name: updated_session.policy_name.clone(),
+            offence_number: decision.offence_number,
+            reason_code: decision.reason_code.clone(),
+            observed_duration: updated_session.observed_duration,
+            bad_duration: updated_session.bad_duration,
+            progress_delta_per_mille: 0,
+            avg_up_rate_bps: updated_session.last_upload_rate_bps,
             banned_at: enforced_at,
             ban_expires_at: enforced_at + decision.ttl,
             ban_revoked_at: None,
@@ -528,6 +652,7 @@ impl Persistence {
                 torrent_hash,
                 peer_ip,
                 peer_port,
+                policy_name,
                 offence_number,
                 reason_code,
                 observed_seconds,
@@ -553,17 +678,27 @@ impl Persistence {
         &self,
         identity: &OffenceIdentity,
     ) -> Result<crate::types::OffenceHistory> {
+        self.load_policy_offence_history(crate::policy::SCORE_POLICY_NAME, identity)
+            .await
+    }
+
+    pub async fn load_policy_offence_history(
+        &self,
+        policy_name: &str,
+        identity: &OffenceIdentity,
+    ) -> Result<crate::types::OffenceHistory> {
         let row = sqlx::query(
             r#"
             SELECT
                 COUNT(*) AS offence_count,
                 MAX(ban_expires_at) AS last_ban_expires_at
             FROM peer_offences
-            WHERE torrent_hash = ? AND peer_ip = ?
+            WHERE torrent_hash = ? AND peer_ip = ? AND policy_name = ?
             "#,
         )
         .bind(&identity.torrent_hash)
         .bind(identity.peer_ip.to_string())
+        .bind(policy_name)
         .fetch_one(&self.pool)
         .await?;
 
@@ -597,6 +732,7 @@ impl Persistence {
                 torrent_hash,
                 peer_ip,
                 peer_port,
+                policy_name,
                 offence_number,
                 reason_code,
                 observed_at,
@@ -606,8 +742,8 @@ impl Persistence {
                 avg_up_rate_bps,
                 last_error
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(torrent_hash, peer_ip, peer_port, offence_number) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(torrent_hash, peer_ip, peer_port, policy_name, offence_number) DO UPDATE SET
                 reason_code = excluded.reason_code,
                 observed_at = excluded.observed_at,
                 ban_expires_at = excluded.ban_expires_at,
@@ -620,6 +756,7 @@ impl Persistence {
         .bind(&record.torrent_hash)
         .bind(record.peer_ip.to_string())
         .bind(i64::from(record.peer_port))
+        .bind(&record.policy_name)
         .bind(i64::from(record.offence_number))
         .bind(&record.reason_code)
         .bind(format_system_time(record.observed_at))
@@ -644,17 +781,19 @@ impl Persistence {
         torrent_hash: &str,
         peer_ip: IpAddr,
         peer_port: u16,
+        policy_name: &str,
         offence_number: u32,
     ) -> Result<bool> {
         let result = sqlx::query(
             r#"
             DELETE FROM pending_ban_intents
-            WHERE torrent_hash = ? AND peer_ip = ? AND peer_port = ? AND offence_number = ?
+            WHERE torrent_hash = ? AND peer_ip = ? AND peer_port = ? AND policy_name = ? AND offence_number = ?
             "#,
         )
         .bind(torrent_hash)
         .bind(peer_ip.to_string())
         .bind(i64::from(peer_port))
+        .bind(policy_name)
         .bind(i64::from(offence_number))
         .execute(&self.pool)
         .await?;
@@ -705,6 +844,39 @@ impl Persistence {
             )
             "#,
         )
+        .bind(peer_session_cutoff.clone())
+        .bind(row_limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let _peer_policy_sessions_deleted = sqlx::query(
+            r#"
+            DELETE FROM peer_policy_sessions
+            WHERE rowid IN (
+                SELECT pps.rowid
+                FROM peer_policy_sessions pps
+                WHERE pps.last_seen_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM active_bans ab
+                        WHERE ab.reconciled_at IS NULL
+                            AND ab.scope = ('torrent:' || pps.torrent_hash)
+                            AND ab.peer_ip = pps.peer_ip
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM pending_ban_intents pbi
+                        WHERE pbi.torrent_hash = pps.torrent_hash
+                            AND pbi.peer_ip = pps.peer_ip
+                            AND pbi.peer_port = pps.peer_port
+                            AND pbi.policy_name = pps.policy_name
+                    )
+                ORDER BY pps.last_seen_at
+                LIMIT ?
+            )
+            "#,
+        )
         .bind(peer_session_cutoff)
         .bind(row_limit)
         .execute(&mut *tx)
@@ -727,6 +899,7 @@ impl Persistence {
                         FROM peer_offences newer
                         WHERE newer.torrent_hash = po.torrent_hash
                             AND newer.peer_ip = po.peer_ip
+                            AND newer.policy_name = po.policy_name
                             AND (
                                 newer.banned_at > po.banned_at
                                 OR (newer.banned_at = po.banned_at AND newer.rowid > po.rowid)
@@ -932,6 +1105,7 @@ struct PeerOffenceRow {
     torrent_hash: String,
     peer_ip: String,
     peer_port: i64,
+    policy_name: String,
     offence_number: i64,
     reason_code: String,
     observed_seconds: i64,
@@ -948,6 +1122,7 @@ struct PendingBanIntentRow {
     torrent_hash: String,
     peer_ip: String,
     peer_port: i64,
+    policy_name: String,
     offence_number: i64,
     reason_code: String,
     observed_at: String,
@@ -956,6 +1131,25 @@ struct PendingBanIntentRow {
     progress_delta: f64,
     avg_up_rate_bps: i64,
     last_error: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PeerPolicySessionRow {
+    policy_name: String,
+    torrent_hash: String,
+    peer_ip: String,
+    peer_port: i64,
+    first_seen_at: String,
+    last_seen_at: String,
+    observed_seconds: i64,
+    bad_seconds: i64,
+    sample_count: i64,
+    last_uploaded_bytes: Option<i64>,
+    last_upload_rate_bps: i64,
+    last_exemption_reason: Option<String>,
+    state_json: String,
+    bannable_since: Option<String>,
+    last_ban_decision_at: Option<String>,
 }
 
 async fn upsert_service_meta(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -1093,6 +1287,48 @@ fn decode_peer_session(row: PeerSessionRow) -> Result<PeerSessionState> {
     })
 }
 
+fn decode_peer_policy_session(row: PeerPolicySessionRow) -> Result<PeerPolicySessionState> {
+    let _state_json = &row.state_json;
+    let peer_ip = row.peer_ip.parse::<IpAddr>()?;
+    let peer_port = u16::try_from(row.peer_port)?;
+    let torrent_hash = row.torrent_hash;
+    Ok(PeerPolicySessionState {
+        policy_name: row.policy_name,
+        observation_id: PeerObservationId {
+            torrent_hash: torrent_hash.clone(),
+            peer_ip,
+            peer_port,
+        },
+        offence_identity: OffenceIdentity {
+            torrent_hash,
+            peer_ip,
+        },
+        first_seen_at: parse_system_time(&row.first_seen_at)?,
+        last_seen_at: parse_system_time(&row.last_seen_at)?,
+        observed_duration: Duration::from_secs(u64::try_from(row.observed_seconds)?),
+        bad_duration: Duration::from_secs(u64::try_from(row.bad_seconds)?),
+        sample_count: u32::try_from(row.sample_count)?,
+        last_uploaded_bytes: row
+            .last_uploaded_bytes
+            .map(u64::try_from)
+            .transpose()
+            .context("last uploaded bytes exceeds unsigned range")?,
+        last_upload_rate_bps: u64::try_from(row.last_upload_rate_bps)?,
+        last_exemption_reason: row
+            .last_exemption_reason
+            .map(|value| decode_exemption_reason(&value))
+            .transpose()?,
+        bannable_since: row
+            .bannable_since
+            .map(|value| parse_system_time(&value))
+            .transpose()?,
+        last_ban_decision_at: row
+            .last_ban_decision_at
+            .map(|value| parse_system_time(&value))
+            .transpose()?,
+    })
+}
+
 fn decode_service_meta(row: ServiceMetaRow) -> Result<ServiceMetaRecord> {
     Ok(ServiceMetaRecord {
         schema_version: row.schema_version,
@@ -1159,6 +1395,45 @@ where
     .await?;
 
     row.map(decode_peer_session).transpose()
+}
+
+async fn get_peer_policy_session_exec<'e, E>(
+    executor: E,
+    policy_name: &str,
+    observation_id: &PeerObservationId,
+) -> Result<Option<PeerPolicySessionState>>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query_as::<_, PeerPolicySessionRow>(
+        r#"
+        SELECT
+            policy_name,
+            torrent_hash,
+            peer_ip,
+            peer_port,
+            first_seen_at,
+            last_seen_at,
+            observed_seconds,
+            bad_seconds,
+            sample_count,
+            last_uploaded_bytes,
+            last_upload_rate_bps,
+            last_exemption_reason,
+            state_json,
+            bannable_since,
+            last_ban_decision_at
+        FROM peer_policy_sessions
+        WHERE policy_name = ? AND torrent_hash = ? AND peer_key = ?
+        "#,
+    )
+    .bind(policy_name)
+    .bind(&observation_id.torrent_hash)
+    .bind(peer_key(observation_id.peer_ip, observation_id.peer_port))
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(decode_peer_policy_session).transpose()
 }
 
 async fn load_peer_sessions_exec<'e, E>(executor: E) -> Result<Vec<PeerSessionState>>
@@ -1305,6 +1580,89 @@ where
     Ok(())
 }
 
+async fn upsert_peer_policy_session_exec<'e, E>(
+    executor: E,
+    session: &PeerPolicySessionState,
+    policy_version: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+        INSERT INTO peer_policy_sessions (
+            policy_name,
+            torrent_hash,
+            peer_key,
+            peer_ip,
+            peer_port,
+            first_seen_at,
+            last_seen_at,
+            observed_seconds,
+            bad_seconds,
+            sample_count,
+            last_uploaded_bytes,
+            last_upload_rate_bps,
+            last_exemption_reason,
+            state_json,
+            policy_version,
+            bannable_since,
+            last_ban_decision_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
+        ON CONFLICT(policy_name, torrent_hash, peer_key) DO UPDATE SET
+            peer_ip = excluded.peer_ip,
+            peer_port = excluded.peer_port,
+            first_seen_at = excluded.first_seen_at,
+            last_seen_at = excluded.last_seen_at,
+            observed_seconds = excluded.observed_seconds,
+            bad_seconds = excluded.bad_seconds,
+            sample_count = excluded.sample_count,
+            last_uploaded_bytes = excluded.last_uploaded_bytes,
+            last_upload_rate_bps = excluded.last_upload_rate_bps,
+            last_exemption_reason = excluded.last_exemption_reason,
+            state_json = excluded.state_json,
+            policy_version = excluded.policy_version,
+            bannable_since = excluded.bannable_since,
+            last_ban_decision_at = excluded.last_ban_decision_at
+        "#,
+    )
+    .bind(&session.policy_name)
+    .bind(&session.observation_id.torrent_hash)
+    .bind(peer_key(
+        session.observation_id.peer_ip,
+        session.observation_id.peer_port,
+    ))
+    .bind(session.observation_id.peer_ip.to_string())
+    .bind(i64::from(session.observation_id.peer_port))
+    .bind(format_system_time(session.first_seen_at))
+    .bind(format_system_time(session.last_seen_at))
+    .bind(i64::try_from(session.observed_duration.as_secs())?)
+    .bind(i64::try_from(session.bad_duration.as_secs())?)
+    .bind(i64::from(session.sample_count))
+    .bind(
+        session
+            .last_uploaded_bytes
+            .map(i64::try_from)
+            .transpose()
+            .context("last uploaded bytes exceeds sqlite integer range")?,
+    )
+    .bind(i64::try_from(session.last_upload_rate_bps)?)
+    .bind(
+        session
+            .last_exemption_reason
+            .as_ref()
+            .map(encode_exemption_reason),
+    )
+    .bind(policy_version)
+    .bind(session.bannable_since.map(format_system_time))
+    .bind(session.last_ban_decision_at.map(format_system_time))
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
 async fn load_active_bans_exec<'e, E>(executor: E) -> Result<Vec<ActiveBanRecord>>
 where
     E: Executor<'e, Database = sqlx::Sqlite>,
@@ -1378,6 +1736,7 @@ where
             torrent_hash,
             peer_ip,
             peer_port,
+            policy_name,
             offence_number,
             reason_code,
             observed_at,
@@ -1387,7 +1746,7 @@ where
             avg_up_rate_bps,
             last_error
         FROM pending_ban_intents
-        ORDER BY observed_at, torrent_hash, peer_ip, peer_port, offence_number
+        ORDER BY observed_at, torrent_hash, peer_ip, peer_port, policy_name, offence_number
         "#,
     )
     .fetch_all(executor)
@@ -1406,6 +1765,7 @@ where
             torrent_hash,
             peer_ip,
             peer_port,
+            policy_name,
             offence_number,
             reason_code,
             observed_seconds,
@@ -1415,12 +1775,13 @@ where
             banned_at,
             ban_expires_at,
             ban_revoked_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&offence.torrent_hash)
     .bind(offence.peer_ip.to_string())
     .bind(i64::from(offence.peer_port))
+    .bind(&offence.policy_name)
     .bind(i64::from(offence.offence_number))
     .bind(&offence.reason_code)
     .bind(
@@ -1477,6 +1838,7 @@ fn decode_peer_offence(row: PeerOffenceRow) -> Result<PeerOffenceRecord> {
         torrent_hash: row.torrent_hash,
         peer_ip: row.peer_ip.parse()?,
         peer_port: u16::try_from(row.peer_port)?,
+        policy_name: row.policy_name,
         offence_number: u32::try_from(row.offence_number)?,
         reason_code: row.reason_code,
         observed_duration: Duration::from_secs(u64::try_from(row.observed_seconds)?),
@@ -1497,6 +1859,7 @@ fn decode_pending_ban_intent(row: PendingBanIntentRow) -> Result<PendingBanInten
         torrent_hash: row.torrent_hash,
         peer_ip: row.peer_ip.parse()?,
         peer_port: u16::try_from(row.peer_port)?,
+        policy_name: row.policy_name,
         offence_number: u32::try_from(row.offence_number)?,
         reason_code: row.reason_code,
         observed_at: parse_system_time(&row.observed_at)?,
@@ -1521,14 +1884,15 @@ mod tests {
 
     use super::{
         ActiveBanRecord, CURRENT_SCHEMA_VERSION, DEFAULT_SERVICE_VERSION, EnforcementWriteResult,
-        MIGRATIONS_TABLE_SQL, PeerOffenceRecord, PendingBanIntentRecord, Persistence,
-        RecoverySnapshot, RetentionPruneResult, migration_checksum,
+        MIGRATION_0006_DESCRIPTION, MIGRATION_0006_SQL, MIGRATIONS_TABLE_SQL, PeerOffenceRecord,
+        PendingBanIntentRecord, Persistence, RecoverySnapshot, RetentionPruneResult,
+        migration_checksum,
     };
     use crate::{
         config::{DatabaseConfig, RetentionConfig, VacuumConfig, VacuumMode},
         types::{
             BanDecision, ExemptionReason, OffenceHistory, OffenceIdentity, PeerEvaluation,
-            PeerObservationId, PeerSessionState,
+            PeerObservationId, PeerPolicySessionState, PeerSessionState,
         },
     };
 
@@ -1808,6 +2172,7 @@ mod tests {
             torrent_hash: "abc123".to_string(),
             peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 2,
             reason_code: "slow_non_progressing".to_string(),
             observed_at: UNIX_EPOCH + Duration::from_secs(900),
@@ -1831,6 +2196,7 @@ mod tests {
                     &record.torrent_hash,
                     record.peer_ip,
                     record.peer_port,
+                    &record.policy_name,
                     record.offence_number,
                 )
                 .await
@@ -2277,6 +2643,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrations_from_schema_v6_preserve_pending_intents_as_score_policy() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy-v6.sqlite");
+        let persistence = file_persistence(&db_path).await;
+
+        for (_, _, sql) in MIGRATION_FIXTURES {
+            persistence.pool.execute(*sql).await.unwrap();
+        }
+        persistence.pool.execute(MIGRATION_0006_SQL).await.unwrap();
+        persistence
+            .pool
+            .execute(MIGRATIONS_TABLE_SQL)
+            .await
+            .unwrap();
+        for (version, description, sql) in MIGRATION_FIXTURES {
+            mark_fixture_migration_applied(&persistence, *version, description, sql).await;
+        }
+        mark_fixture_migration_applied(
+            &persistence,
+            6,
+            MIGRATION_0006_DESCRIPTION,
+            MIGRATION_0006_SQL,
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO pending_ban_intents (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_at,
+                ban_expires_at,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                last_error
+            ) VALUES (
+                'abc123',
+                '10.0.0.10',
+                51413,
+                2,
+                'slow_non_progressing',
+                '1970-01-01T00:15:00Z',
+                '1970-01-01T01:15:00Z',
+                120,
+                0.001,
+                128,
+                'failed before upgrade'
+            )
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO peer_offences (
+                torrent_hash,
+                peer_ip,
+                peer_port,
+                offence_number,
+                reason_code,
+                observed_seconds,
+                bad_seconds,
+                progress_delta,
+                avg_up_rate_bps,
+                banned_at,
+                ban_expires_at,
+                ban_revoked_at
+            ) VALUES (
+                'abc123',
+                '10.0.0.10',
+                51413,
+                1,
+                'slow_non_progressing',
+                180,
+                120,
+                0.002,
+                256,
+                '1970-01-01T00:10:00Z',
+                '1970-01-01T01:10:00Z',
+                NULL
+            )
+            "#,
+        )
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
+
+        persistence.run_migrations().await.unwrap();
+
+        let loaded = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![PendingBanIntentRecord {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: "10.0.0.10".parse().unwrap(),
+                peer_port: 51413,
+                policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
+                offence_number: 2,
+                reason_code: "slow_non_progressing".to_string(),
+                observed_at: UNIX_EPOCH + Duration::from_secs(900),
+                ban_expires_at: UNIX_EPOCH + Duration::from_secs(4_500),
+                bad_duration: Duration::from_secs(120),
+                progress_delta_per_mille: 1,
+                avg_up_rate_bps: 128,
+                last_error: "failed before upgrade".to_string(),
+            }]
+        );
+        let offences = persistence
+            .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(offences.len(), 1);
+        assert_eq!(offences[0].policy_name, crate::policy::SCORE_POLICY_NAME);
+        assert!(persistence.is_ready().await);
+    }
+
+    #[tokio::test]
     async fn migrations_fail_when_db_has_unknown_applied_version() {
         let persistence = test_persistence().await;
         persistence.run_migrations().await.unwrap();
@@ -2330,6 +2818,7 @@ mod tests {
                 .clone(),
             peer_ip: stale_session_with_pending_intent.observation_id.peer_ip,
             peer_port: stale_session_with_pending_intent.observation_id.peer_port,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(3 * 24 * 3600),
@@ -2384,6 +2873,7 @@ mod tests {
             torrent_hash: "old".to_string(),
             peer_ip: "10.0.0.50".parse().unwrap(),
             peer_port: 12345,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2403,6 +2893,7 @@ mod tests {
             torrent_hash: "old".to_string(),
             peer_ip: "10.0.0.50".parse().unwrap(),
             peer_port: 12346,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 2,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2426,6 +2917,7 @@ mod tests {
                 .clone(),
             peer_ip: stale_session_with_pending_intent.observation_id.peer_ip,
             peer_port: stale_session_with_pending_intent.observation_id.peer_port,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2445,6 +2937,7 @@ mod tests {
             torrent_hash: "stale-intent".to_string(),
             peer_ip: "10.0.0.70".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(3 * 24 * 3600),
@@ -2524,6 +3017,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_prune_deletes_only_safe_stale_policy_sessions() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(20_500_000);
+
+        let mut stale_deletable = sample_peer_policy_session();
+        stale_deletable.observation_id.torrent_hash = "policy-stale-delete".to_string();
+        stale_deletable.offence_identity.torrent_hash = "policy-stale-delete".to_string();
+        stale_deletable.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&stale_deletable, "policy-v1")
+            .await
+            .unwrap();
+
+        let mut protected_by_ban = sample_peer_policy_session();
+        protected_by_ban.observation_id.torrent_hash = "policy-stale-ban".to_string();
+        protected_by_ban.offence_identity.torrent_hash = "policy-stale-ban".to_string();
+        protected_by_ban.observation_id.peer_port = 51414;
+        protected_by_ban.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&protected_by_ban, "policy-v1")
+            .await
+            .unwrap();
+        persistence
+            .upsert_active_ban(&ActiveBanRecord {
+                peer_ip: protected_by_ban.observation_id.peer_ip,
+                peer_port: protected_by_ban.observation_id.peer_port,
+                scope: format!("torrent:{}", protected_by_ban.observation_id.torrent_hash),
+                offence_number: 1,
+                reason: "receive_idle".to_string(),
+                created_at: now - Duration::from_secs(3600),
+                expires_at: now + Duration::from_secs(3600),
+                reconciled_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut protected_by_intent = sample_peer_policy_session();
+        protected_by_intent.observation_id.torrent_hash = "policy-stale-intent".to_string();
+        protected_by_intent.offence_identity.torrent_hash = "policy-stale-intent".to_string();
+        protected_by_intent.observation_id.peer_port = 51415;
+        protected_by_intent.last_seen_at = now - Duration::from_secs(8 * 24 * 3600);
+        persistence
+            .upsert_peer_policy_session(&protected_by_intent, "policy-v1")
+            .await
+            .unwrap();
+        persistence
+            .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                torrent_hash: protected_by_intent.observation_id.torrent_hash.clone(),
+                peer_ip: protected_by_intent.observation_id.peer_ip,
+                peer_port: protected_by_intent.observation_id.peer_port,
+                policy_name: crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string(),
+                offence_number: 1,
+                reason_code: "receive_idle".to_string(),
+                observed_at: now - Duration::from_secs(3600),
+                ban_expires_at: now + Duration::from_secs(3600),
+                bad_duration: Duration::from_secs(300),
+                progress_delta_per_mille: 0,
+                avg_up_rate_bps: 0,
+                last_error: "retry".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &stale_deletable.observation_id
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &protected_by_ban.observation_id
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            persistence
+                .get_peer_policy_session(
+                    crate::policy::RECEIVE_IDLE_POLICY_NAME,
+                    &protected_by_intent.observation_id
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn retention_prune_respects_row_limits() {
         let persistence = test_persistence().await;
         persistence.run_migrations().await.unwrap();
@@ -2580,6 +3189,7 @@ mod tests {
             torrent_hash: "idempotent".to_string(),
             peer_ip: "10.0.0.81".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2599,6 +3209,7 @@ mod tests {
             torrent_hash: "idempotent".to_string(),
             peer_ip: "10.0.0.81".parse().unwrap(),
             peer_port: 51414,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 2,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2633,6 +3244,7 @@ mod tests {
             torrent_hash: "idempotent".to_string(),
             peer_ip: "10.0.0.83".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(3 * 24 * 3600),
@@ -2687,6 +3299,7 @@ mod tests {
             torrent_hash: "replayable".to_string(),
             peer_ip: "10.0.0.90".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(5 * 24 * 3600),
@@ -2758,6 +3371,7 @@ mod tests {
             torrent_hash: "continuity".to_string(),
             peer_ip,
             peer_port: 10000,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2773,6 +3387,7 @@ mod tests {
             torrent_hash: "continuity".to_string(),
             peer_ip,
             peer_port: 10001,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 2,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2825,6 +3440,7 @@ mod tests {
             torrent_hash: "stale-continuity".to_string(),
             peer_ip,
             peer_port: 11000,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2840,6 +3456,7 @@ mod tests {
             torrent_hash: "stale-continuity".to_string(),
             peer_ip,
             peer_port: 11001,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 2,
             reason_code: "score_based".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -2882,6 +3499,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_prune_keeps_latest_stale_offence_per_policy() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(31_000_000);
+        let peer_ip: IpAddr = "10.0.0.102".parse().unwrap();
+        let torrent_hash = "policy-stale-continuity";
+
+        let mut old_receive_idle = sample_peer_offence(1, 1);
+        old_receive_idle.torrent_hash = torrent_hash.to_string();
+        old_receive_idle.peer_ip = peer_ip;
+        old_receive_idle.peer_port = 12000;
+        old_receive_idle.policy_name = crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string();
+        old_receive_idle.reason_code = "receive_idle".to_string();
+        old_receive_idle.banned_at = now - Duration::from_secs(140 * 24 * 3600);
+        old_receive_idle.ban_expires_at = now - Duration::from_secs(139 * 24 * 3600);
+        old_receive_idle.ban_revoked_at = Some(now - Duration::from_secs(138 * 24 * 3600));
+
+        let mut old_score = sample_peer_offence(1, 1);
+        old_score.torrent_hash = torrent_hash.to_string();
+        old_score.peer_ip = peer_ip;
+        old_score.peer_port = 12001;
+        old_score.banned_at = now - Duration::from_secs(130 * 24 * 3600);
+        old_score.ban_expires_at = now - Duration::from_secs(129 * 24 * 3600);
+        old_score.ban_revoked_at = Some(now - Duration::from_secs(128 * 24 * 3600));
+
+        let mut latest_receive_idle = sample_peer_offence(2, 1);
+        latest_receive_idle.torrent_hash = torrent_hash.to_string();
+        latest_receive_idle.peer_ip = peer_ip;
+        latest_receive_idle.peer_port = 12002;
+        latest_receive_idle.policy_name = crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string();
+        latest_receive_idle.reason_code = "receive_idle".to_string();
+        latest_receive_idle.banned_at = now - Duration::from_secs(120 * 24 * 3600);
+        latest_receive_idle.ban_expires_at = now - Duration::from_secs(119 * 24 * 3600);
+        latest_receive_idle.ban_revoked_at = Some(now - Duration::from_secs(118 * 24 * 3600));
+
+        let mut latest_score = sample_peer_offence(2, 1);
+        latest_score.torrent_hash = torrent_hash.to_string();
+        latest_score.peer_ip = peer_ip;
+        latest_score.peer_port = 12003;
+        latest_score.banned_at = now - Duration::from_secs(110 * 24 * 3600);
+        latest_score.ban_expires_at = now - Duration::from_secs(109 * 24 * 3600);
+        latest_score.ban_revoked_at = Some(now - Duration::from_secs(108 * 24 * 3600));
+
+        for offence in [
+            &old_receive_idle,
+            &old_score,
+            &latest_receive_idle,
+            &latest_score,
+        ] {
+            persistence.insert_peer_offence(offence).await.unwrap();
+        }
+
+        let retention = RetentionConfig {
+            enabled: true,
+            prune_interval: Duration::from_secs(3600),
+            peer_session_max_age: Duration::from_secs(7 * 24 * 3600),
+            peer_offence_max_age: Duration::from_secs(90 * 24 * 3600),
+            reconciled_ban_max_age: Duration::from_secs(30 * 24 * 3600),
+            pending_intent_max_age: Duration::from_secs(24 * 3600),
+            max_rows_per_run: 100,
+            vacuum: VacuumConfig {
+                mode: VacuumMode::Off,
+                incremental_pages: 200,
+            },
+        };
+
+        persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+
+        let remaining = persistence.load_peer_offences_by_ip(peer_ip).await.unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|offence| (offence.policy_name.as_str(), offence.offence_number))
+                .collect::<Vec<_>>(),
+            vec![
+                (crate::policy::RECEIVE_IDLE_POLICY_NAME, 2),
+                (crate::policy::SCORE_POLICY_NAME, 2),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn retention_prune_pending_intents_age_by_expiry_time() {
         let persistence = test_persistence().await;
         persistence.run_migrations().await.unwrap();
@@ -2891,6 +3593,7 @@ mod tests {
             torrent_hash: "recently-expired".to_string(),
             peer_ip: "10.0.0.110".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(7 * 24 * 3600),
@@ -2904,6 +3607,7 @@ mod tests {
             torrent_hash: "long-expired".to_string(),
             peer_ip: "10.0.0.111".parse().unwrap(),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number: 1,
             reason_code: "score_based".to_string(),
             observed_at: now - Duration::from_secs(7 * 24 * 3600),
@@ -3025,6 +3729,7 @@ mod tests {
                     torrent_hash: format!("steady-offence-{offence_slot}"),
                     peer_ip: IpAddr::V4(Ipv4Addr::new(10, 3, 0, offence_slot as u8)),
                     peer_port: 41000 + i,
+                    policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
                     offence_number: 1,
                     reason_code: "score_based".to_string(),
                     observed_duration: Duration::from_secs(120),
@@ -3063,6 +3768,7 @@ mod tests {
                         (index % 255) as u8,
                     )),
                     peer_port: 43000 + i,
+                    policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
                     offence_number: 1,
                     reason_code: "score_based".to_string(),
                     observed_at: stale_seen_at,
@@ -3140,6 +3846,26 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn mark_fixture_migration_applied(
+        persistence: &Persistence,
+        version: i64,
+        description: &str,
+        sql: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+            VALUES (?, ?, TRUE, ?, 0)
+            "#,
+        )
+        .bind(version)
+        .bind(description)
+        .bind(migration_checksum(sql))
+        .execute(&persistence.pool)
+        .await
+        .unwrap();
     }
 
     fn sample_peer_session() -> PeerSessionState {
@@ -3224,6 +3950,7 @@ mod tests {
             torrent_hash: "abc123".to_string(),
             peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
             peer_port: 51413,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number,
             reason_code: "slow_non_progressing".to_string(),
             observed_duration: Duration::from_secs(600),
@@ -3233,6 +3960,31 @@ mod tests {
             banned_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs.saturating_sub(1800)),
             ban_expires_at: UNIX_EPOCH + Duration::from_secs(ban_expires_at_secs),
             ban_revoked_at: None,
+        }
+    }
+
+    fn sample_peer_policy_session() -> PeerPolicySessionState {
+        PeerPolicySessionState {
+            policy_name: crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string(),
+            observation_id: PeerObservationId {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+                peer_port: 51413,
+            },
+            offence_identity: OffenceIdentity {
+                torrent_hash: "abc123".to_string(),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            },
+            first_seen_at: UNIX_EPOCH + Duration::from_secs(60),
+            last_seen_at: UNIX_EPOCH + Duration::from_secs(180),
+            observed_duration: Duration::from_secs(120),
+            bad_duration: Duration::from_secs(60),
+            sample_count: 2,
+            last_uploaded_bytes: Some(0),
+            last_upload_rate_bps: 0,
+            last_exemption_reason: None,
+            bannable_since: None,
+            last_ban_decision_at: None,
         }
     }
 }
