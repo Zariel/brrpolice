@@ -126,7 +126,10 @@ Shared exemptions apply before either policy can ban: out-of-scope torrents, all
 | `policy.decay_window` | `BRRPOLICE_POLICY__DECAY_WINDOW` | `60m` | Window used to decay bad history and carry over peer state between sightings. |
 | `policy.ignore_peer_progress_at_or_above` | `BRRPOLICE_POLICY__IGNORE_PEER_PROGRESS_AT_OR_ABOVE` | `0.95` | Exempts peers at or above this completion ratio. |
 | `policy.min_total_seeders` | `BRRPOLICE_POLICY__MIN_TOTAL_SEEDERS` | `3` | Skips torrents below this seeder count. |
-| `policy.reban_cooldown` | `BRRPOLICE_POLICY__REBAN_COOLDOWN` | `30m` | Cooldown before re-banning a recently handled peer identity. |
+| `policy.reban_cooldown` | `BRRPOLICE_POLICY__REBAN_COOLDOWN` | `30m` | Deprecated alias for `policy.score.reban_cooldown`. |
+| `policy.score.enabled` | `BRRPOLICE_POLICY__SCORE__ENABLED` | `true` | Enables the score/rate-progress policy. Set `false` to run only other enabled peer policies. |
+| `policy.score.reban_cooldown` | `BRRPOLICE_POLICY__SCORE__REBAN_COOLDOWN` | `30m` | Cooldown before the score policy can re-ban the same torrent/IP identity. |
+| `policy.score.ban_ladder.durations` | `BRRPOLICE_POLICY__SCORE__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Score-policy ban durations by policy-specific offence number. If offences exceed the list, the final duration is reused. |
 | `policy.score.target_rate_bps` | `BRRPOLICE_POLICY__SCORE__TARGET_RATE_BPS` | `65536` | Score model upload target in bytes/sec. Lower observed rates increase score risk. |
 | `policy.score.required_progress_delta` | `BRRPOLICE_POLICY__SCORE__REQUIRED_PROGRESS_DELTA` | `0.02` | Score model progress target as a fraction (`0.02` = `2%`). Lower progress increases score risk. |
 | `policy.score.progress_rate_scale_start` | `BRRPOLICE_POLICY__SCORE__PROGRESS_RATE_SCALE_START` | `2.0` | Upload-rate multiple where progress expectation starts relaxing for fast peers. |
@@ -153,11 +156,18 @@ Shared exemptions apply before either policy can ban: out-of-scope torrents, all
 | `policy.receive_idle.max_uploaded_delta_bytes` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MAX_UPLOADED_DELTA_BYTES` | `0` | Maximum cumulative uploaded-byte delta between samples that still counts as idle. The default requires no uploaded-byte progress. |
 | `policy.receive_idle.reban_cooldown` | `BRRPOLICE_POLICY__RECEIVE_IDLE__REBAN_COOLDOWN` | `10m` | Cooldown before receive-idle can re-ban the same torrent/IP identity. |
 | `policy.receive_idle.ban_ladder.durations` | `BRRPOLICE_POLICY__RECEIVE_IDLE__BAN_LADDER__DURATIONS` | `["10m","30m","2h","6h"]` | Receive-idle ban durations by policy-specific offence number. If offences exceed the list, the final duration is reused. |
-| `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
+| `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Deprecated alias for `policy.score.ban_ladder.durations`. |
 
-Example receive-idle override:
+Example policy override:
 
 ```toml
+[policy.score]
+enabled = true
+reban_cooldown = "30m"
+
+[policy.score.ban_ladder]
+durations = ["1h", "6h", "24h", "168h"]
+
 [policy.receive_idle]
 enabled = true
 min_observation_duration = "3m"

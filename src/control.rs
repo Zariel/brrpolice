@@ -581,7 +581,10 @@ impl ControlLoop {
     }
 
     fn enabled_peer_policies(&self) -> Vec<PeerPolicyKind> {
-        let mut policies = vec![PeerPolicyKind::Score];
+        let mut policies = Vec::new();
+        if self.config.policy.score.enabled {
+            policies.push(PeerPolicyKind::Score);
+        }
         if self.config.policy.receive_idle.enabled {
             policies.push(PeerPolicyKind::ReceiveIdle);
         }
@@ -646,8 +649,16 @@ impl ControlLoop {
                 } else {
                     None
                 };
+                let mut policy_context = peer_context.clone();
+                if let Some(first_seen_at) = existing
+                    .as_ref()
+                    .or(carryover.as_ref())
+                    .map(|session| session.first_seen_at)
+                {
+                    policy_context.first_seen_at = first_seen_at;
+                }
                 let evaluation = self.policy.evaluate_receive_idle_peer(
-                    peer_context,
+                    &policy_context,
                     existing.as_ref().or(carryover.as_ref()),
                 );
                 self.metrics
@@ -660,7 +671,7 @@ impl ControlLoop {
                     .await?;
                 let disposition =
                     self.policy
-                        .decide_receive_idle_ban(peer_context, &evaluation, &history);
+                        .decide_receive_idle_ban(&policy_context, &evaluation, &history);
                 let evaluation = PendingBanEvaluation::Policy(evaluation);
                 let peer_key = peer_log_state_key(kind.name(), evaluation.offence_identity());
                 Ok(PeerPolicyRun {
@@ -673,6 +684,7 @@ impl ControlLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_peer_policy_run(
         &mut self,
         run: PeerPolicyRun,
@@ -923,6 +935,7 @@ impl ControlLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_peer_policy_exempt(
         &mut self,
         run: &PeerPolicyRun,
@@ -1769,7 +1782,7 @@ impl ControlLoop {
 
     async fn refresh_gauges(&self) -> Result<()> {
         self.metrics
-            .set_active_tracked_peers(self.persistence.count_peer_sessions().await?);
+            .set_active_tracked_peers(self.persistence.count_tracked_peer_sessions().await?);
         self.metrics
             .set_active_bans(self.persistence.count_active_bans().await?);
         self.metrics
@@ -3047,6 +3060,161 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_cycle_does_not_evaluate_score_when_disabled() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let metrics_handle = metrics.clone();
+        let seeded_now = std::time::SystemTime::now();
+        let peer_ip = "10.0.0.10".parse().unwrap();
+        persistence
+            .upsert_peer_policy_session(
+                &PeerPolicySessionState {
+                    policy_name: crate::policy::RECEIVE_IDLE_POLICY_NAME.to_string(),
+                    observation_id: PeerObservationId {
+                        torrent_hash: "abc123".to_string(),
+                        peer_ip,
+                        peer_port: 51414,
+                    },
+                    offence_identity: OffenceIdentity {
+                        torrent_hash: "abc123".to_string(),
+                        peer_ip,
+                    },
+                    first_seen_at: seeded_now - Duration::from_secs(180),
+                    last_seen_at: seeded_now - Duration::from_secs(60),
+                    observed_duration: Duration::from_secs(120),
+                    bad_duration: Duration::from_secs(120),
+                    sample_count: 2,
+                    last_uploaded_bytes: Some(0),
+                    last_upload_rate_bps: 0,
+                    last_exemption_reason: None,
+                    bannable_since: Some(seeded_now - Duration::from_secs(30)),
+                    last_ban_decision_at: None,
+                },
+                "policy-v1",
+            )
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/torrents/info?filter=active",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"hash\":\"abc123\",\"name\":\"Example\",\"category\":\"tv\",\"tags\":\"public\",\"num_complete\":5}]",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/sync/torrentPeers?hash=abc123&rid=0",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rid\":15,\"peers\":{\"10.0.0.10:51414\":{\"client\":\"qBittorrent/5.0.0\",\"ip\":\"10.0.0.10\",\"port\":51414,\"progress\":0.1005,\"dl_speed\":1024,\"up_speed\":0,\"uploaded\":0}},\"peers_removed\":[]}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/transfer/banPeers",
+                must_contain: vec!["peers=10.0.0.10%3A51414"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json=", "10.0.0.10"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ])
+        .await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+        state.mark_recovery_complete();
+
+        let mut config = test_config(&base_url);
+        config.policy.new_peer_grace_period = Duration::from_secs(1);
+        config.policy.score.enabled = false;
+        config.policy.receive_idle = crate::config::ReceiveIdlePolicyConfig {
+            enabled: true,
+            min_observation_duration: Duration::from_secs(1),
+            sustain_duration: Duration::from_secs(120),
+            max_upload_rate_bps: 0,
+            max_uploaded_delta_bytes: 0,
+            reban_cooldown: Duration::from_secs(1),
+            ban_ladder: BanLadderConfig {
+                durations: vec![Duration::from_secs(600)],
+            },
+        };
+        let config = Arc::new(config);
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let mut control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        let result = control.run_poll_cycle().await.unwrap();
+        let observation_id = PeerObservationId {
+            torrent_hash: "abc123".to_string(),
+            peer_ip: "10.0.0.10".parse().unwrap(),
+            peer_port: 51414,
+        };
+        let receive_after = persistence
+            .get_peer_policy_session(crate::policy::RECEIVE_IDLE_POLICY_NAME, &observation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            super::PollCycleResult {
+                torrent_count: 1,
+                peer_count: 1,
+                ban_count: 1,
+            },
+            "receive_after={receive_after:?}"
+        );
+        assert!(
+            persistence
+                .get_peer_session(&observation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let offences = persistence.load_peer_offences_by_ip(peer_ip).await.unwrap();
+        assert_eq!(offences.len(), 1);
+        assert_eq!(
+            offences[0].policy_name,
+            crate::policy::RECEIVE_IDLE_POLICY_NAME
+        );
+        assert!(
+            metrics_handle
+                .render()
+                .unwrap()
+                .contains("brrpolice_active_tracked_peers 1")
         );
 
         server.await.unwrap();

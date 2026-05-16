@@ -439,6 +439,7 @@ impl AppMetrics {
             .observe(duration.as_secs_f64());
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_prune_success(
         &self,
         duration: Duration,

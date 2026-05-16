@@ -221,6 +221,19 @@ impl Persistence {
         Ok(count as usize)
     }
 
+    pub async fn count_tracked_peer_sessions(&self) -> Result<usize> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM peer_sessions)
+                + (SELECT COUNT(*) FROM peer_policy_sessions)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
     pub async fn count_active_bans(&self) -> Result<usize> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM active_bans WHERE reconciled_at IS NULL",

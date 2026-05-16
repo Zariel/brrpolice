@@ -30,7 +30,8 @@ pub const RECEIVE_IDLE_POLICY_NAME: &str = "receive_idle";
 const RECEIVE_IDLE_REASON_CODE: &str = "receive_idle";
 
 impl PolicyEngine {
-    pub fn new(config: PolicyConfig, filters: &FiltersConfig) -> Self {
+    pub fn new(mut config: PolicyConfig, filters: &FiltersConfig) -> Self {
+        config.apply_legacy_score_aliases();
         let allowlisted_ips = filters
             .allowlist_peer_ips
             .iter()
@@ -105,7 +106,7 @@ impl PolicyEngine {
         let durations = if policy_name == RECEIVE_IDLE_POLICY_NAME {
             &self.config.receive_idle.ban_ladder.durations
         } else {
-            &self.config.ban_ladder.durations
+            &self.config.score.ban_ladder.durations
         };
         let index = offence_number.saturating_sub(1) as usize;
         durations
@@ -118,7 +119,7 @@ impl PolicyEngine {
         if policy_name == RECEIVE_IDLE_POLICY_NAME {
             self.config.receive_idle.reban_cooldown
         } else {
-            self.config.reban_cooldown
+            self.config.score.reban_cooldown
         }
     }
 

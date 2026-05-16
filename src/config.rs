@@ -47,6 +47,8 @@ impl AppConfig {
         env_source: Option<Map<String, String>>,
         require_file: bool,
     ) -> Result<Self> {
+        let alias_sources =
+            PolicyAliasSources::from_sources(path, env_source.as_ref(), require_file);
         let raw = Config::builder()
             .set_default("qbittorrent.base_url", "http://qbittorrent:8080")?
             .set_default("qbittorrent.username", "")?
@@ -61,6 +63,12 @@ impl AppConfig {
             .set_default("policy.ignore_peer_progress_at_or_above", 0.95_f64)?
             .set_default("policy.min_total_seeders", 3_u32)?
             .set_default("policy.reban_cooldown", "30m")?
+            .set_default("policy.score.enabled", true)?
+            .set_default("policy.score.reban_cooldown", "30m")?
+            .set_default(
+                "policy.score.ban_ladder.durations",
+                vec!["1h", "6h", "24h", "168h"],
+            )?
             .set_default("policy.score.target_rate_bps", 65_536_u64)?
             .set_default("policy.score.required_progress_delta", 0.02_f64)?
             .set_default("policy.score.progress_rate_scale_start", 2.0_f64)?
@@ -115,9 +123,15 @@ impl AppConfig {
             .add_source(environment_source(env_source))
             .build()
             .with_context(|| format!("failed to load configuration file `{}`", path.display()))?;
-        let parsed = raw.try_deserialize::<AppConfig>()?;
+        let mut parsed = raw.try_deserialize::<AppConfig>()?;
+        parsed.normalize_policy_aliases(alias_sources);
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    fn normalize_policy_aliases(&mut self, alias_sources: PolicyAliasSources) {
+        self.policy
+            .apply_legacy_score_aliases_with_explicit_nested(alias_sources);
     }
 
     pub fn init_tracing(&self) -> Result<()> {
@@ -152,6 +166,9 @@ impl AppConfig {
                 "policy.ignore_peer_progress_at_or_above={:.6}\n",
                 "policy.min_total_seeders={}\n",
                 "policy.reban_cooldown={}\n",
+                "policy.score.enabled={}\n",
+                "policy.score.reban_cooldown={}\n",
+                "policy.score.ban_ladder={}\n",
                 "policy.score.target_rate_bps={}\n",
                 "policy.score.required_progress_delta={:.6}\n",
                 "policy.score.progress_rate_scale_start={:.6}\n",
@@ -212,6 +229,16 @@ impl AppConfig {
             self.policy.ignore_peer_progress_at_or_above,
             self.policy.min_total_seeders,
             self.policy.reban_cooldown.as_secs(),
+            self.policy.score.enabled,
+            self.policy.score.reban_cooldown.as_secs(),
+            self.policy
+                .score
+                .ban_ladder
+                .durations
+                .iter()
+                .map(|duration| duration.as_secs().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             self.policy.score.target_rate_bps,
             self.policy.score.required_progress_delta,
             self.policy.score.progress_rate_scale_start,
@@ -340,6 +367,19 @@ impl AppConfig {
         )?;
         require_positive_duration(self.policy.decay_window, "policy.decay_window")?;
         require_positive_duration(self.policy.reban_cooldown, "policy.reban_cooldown")?;
+        require_positive_duration(
+            self.policy.score.reban_cooldown,
+            "policy.score.reban_cooldown",
+        )?;
+        if self.policy.score.ban_ladder.durations.is_empty() {
+            bail!("policy.score.ban_ladder.durations must not be empty");
+        }
+        for (index, duration) in self.policy.score.ban_ladder.durations.iter().enumerate() {
+            require_positive_duration(
+                *duration,
+                &format!("policy.score.ban_ladder.durations[{index}]"),
+            )?;
+        }
         require_positive_duration(
             self.policy.score.sustain_duration,
             "policy.score.sustain_duration",
@@ -552,8 +592,67 @@ impl Default for PolicyConfig {
     }
 }
 
+impl PolicyConfig {
+    pub fn apply_legacy_score_aliases(&mut self) {
+        self.apply_legacy_score_aliases_with_explicit_nested(PolicyAliasSources::default());
+    }
+
+    fn apply_legacy_score_aliases_with_explicit_nested(
+        &mut self,
+        alias_sources: PolicyAliasSources,
+    ) {
+        let default_policy = Self::default();
+        if !alias_sources.score_reban_cooldown
+            && self.score.reban_cooldown == default_policy.score.reban_cooldown
+            && self.reban_cooldown != default_policy.reban_cooldown
+        {
+            self.score.reban_cooldown = self.reban_cooldown;
+        }
+        if !alias_sources.score_ban_ladder
+            && self.score.ban_ladder == default_policy.score.ban_ladder
+            && self.ban_ladder != default_policy.ban_ladder
+        {
+            self.score.ban_ladder = self.ban_ladder.clone();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PolicyAliasSources {
+    score_reban_cooldown: bool,
+    score_ban_ladder: bool,
+}
+
+impl PolicyAliasSources {
+    fn from_sources(
+        path: &Path,
+        env_source: Option<&Map<String, String>>,
+        require_file: bool,
+    ) -> Self {
+        let mut sources = Self::default();
+        if (require_file || path.exists())
+            && let Ok(contents) = std::fs::read_to_string(path)
+        {
+            sources.score_reban_cooldown |=
+                toml_key_exists(&contents, "policy.score", "reban_cooldown");
+            sources.score_ban_ladder |=
+                toml_key_exists(&contents, "policy.score.ban_ladder", "durations");
+        }
+        sources.score_reban_cooldown |=
+            env_key_exists(env_source, "BRRPOLICE_POLICY__SCORE__REBAN_COOLDOWN");
+        sources.score_ban_ladder |=
+            env_key_exists(env_source, "BRRPOLICE_POLICY__SCORE__BAN_LADDER__DURATIONS");
+        sources
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScorePolicyConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub reban_cooldown: Duration,
+    #[serde(default)]
+    pub ban_ladder: BanLadderConfig,
     pub target_rate_bps: u64,
     pub required_progress_delta: f64,
     pub progress_rate_scale_start: f64,
@@ -577,6 +676,9 @@ pub struct ScorePolicyConfig {
 impl Default for ScorePolicyConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            reban_cooldown: Duration::from_secs(1_800),
+            ban_ladder: BanLadderConfig::default(),
             target_rate_bps: 65_536,
             required_progress_delta: 0.02,
             progress_rate_scale_start: 2.0,
@@ -654,7 +756,7 @@ impl Default for ReceiveIdlePolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BanLadderConfig {
     #[serde(default, deserialize_with = "deserialize_duration_vec")]
     pub durations: Vec<Duration>,
@@ -843,6 +945,7 @@ fn environment_source(source: Option<Map<String, String>>) -> Environment {
         .list_separator(",")
         .try_parsing(true);
     for key in [
+        "policy.score.ban_ladder.durations",
         "policy.receive_idle.ban_ladder.durations",
         "policy.ban_ladder.durations",
         "filters.include_categories",
@@ -855,6 +958,40 @@ fn environment_source(source: Option<Map<String, String>>) -> Environment {
         env = env.with_list_parse_key(key);
     }
     env.source(source)
+}
+
+fn toml_key_exists(contents: &str, section: &str, key: &str) -> bool {
+    let dotted_key = format!("{section}.{key}");
+    let section_header = format!("[{section}]");
+    let mut in_section = false;
+    for line in contents.lines() {
+        let line = line
+            .split_once('#')
+            .map(|(line, _)| line)
+            .unwrap_or(line)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == section_header;
+            continue;
+        }
+        if line
+            .split_once('=')
+            .map(|(name, _)| name.trim() == dotted_key || (in_section && name.trim() == key))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn env_key_exists(source: Option<&Map<String, String>>, key: &str) -> bool {
+    source
+        .map(|source| source.contains_key(key))
+        .unwrap_or_else(|| std::env::var_os(key).is_some())
 }
 
 fn validate_env_var_name(name: &str) -> Result<()> {
@@ -948,6 +1085,11 @@ mod tests {
         assert_eq!(config.retention.vacuum.mode.as_str(), "incremental");
         assert_eq!(config.retention.vacuum.incremental_pages, 200);
         assert_eq!(config.policy.new_peer_grace_period, Duration::from_secs(60));
+        assert!(config.policy.score.enabled);
+        assert_eq!(
+            config.policy.score.reban_cooldown,
+            Duration::from_secs(1_800)
+        );
         assert!(config.policy.score.churn.enabled);
         assert_eq!(config.policy.score.progress_rate_scale_start, 2.0);
         assert_eq!(config.policy.score.progress_rate_scale_end, 16.0);
@@ -960,7 +1102,7 @@ mod tests {
         assert_eq!(config.policy.score.churn.max_amplifier, 1.0);
         assert_eq!(config.policy.score.churn.decay_per_second, 0.002);
         assert_eq!(
-            config.policy.ban_ladder.durations,
+            config.policy.score.ban_ladder.durations,
             vec![
                 Duration::from_secs(3_600),
                 Duration::from_secs(21_600),
@@ -1194,6 +1336,144 @@ allowlist_peer_ips = ["127.0.0.1"]
                 Duration::from_secs(300),
                 Duration::from_secs(2_700),
                 Duration::from_secs(10_800),
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_nested_score_policy_aliases() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy.score]
+enabled = false
+reban_cooldown = "7m"
+
+[policy.score.ban_ladder]
+durations = ["3m", "9m"]
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert!(!config.policy.score.enabled);
+        assert_eq!(config.policy.score.reban_cooldown, Duration::from_secs(420));
+        assert_eq!(
+            config.policy.score.ban_ladder.durations,
+            vec![Duration::from_secs(180), Duration::from_secs(540)]
+        );
+    }
+
+    #[test]
+    fn legacy_score_policy_aliases_remain_compatible() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy]
+reban_cooldown = "11m"
+
+[policy.ban_ladder]
+durations = ["4m", "8m"]
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert_eq!(config.policy.score.reban_cooldown, Duration::from_secs(660));
+        assert_eq!(
+            config.policy.score.ban_ladder.durations,
+            vec![Duration::from_secs(240), Duration::from_secs(480)]
+        );
+    }
+
+    #[test]
+    fn nested_score_policy_keys_take_precedence_over_legacy_aliases() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy]
+reban_cooldown = "11m"
+
+[policy.ban_ladder]
+durations = ["4m", "8m"]
+
+[policy.score]
+reban_cooldown = "13m"
+
+[policy.score.ban_ladder]
+durations = ["5m", "10m"]
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert_eq!(config.policy.score.reban_cooldown, Duration::from_secs(780));
+        assert_eq!(
+            config.policy.score.ban_ladder.durations,
+            vec![Duration::from_secs(300), Duration::from_secs(600)]
+        );
+    }
+
+    #[test]
+    fn explicit_nested_score_defaults_take_precedence_over_legacy_aliases() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[policy]
+reban_cooldown = "11m"
+
+[policy.ban_ladder]
+durations = ["4m", "8m"]
+
+[policy.score]
+reban_cooldown = "30m"
+
+[policy.score.ban_ladder]
+durations = ["1h", "6h", "24h", "168h"]
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+
+        assert_eq!(
+            config.policy.score.reban_cooldown,
+            Duration::from_secs(1_800)
+        );
+        assert_eq!(
+            config.policy.score.ban_ladder.durations,
+            vec![
+                Duration::from_secs(3_600),
+                Duration::from_secs(21_600),
+                Duration::from_secs(86_400),
+                Duration::from_secs(604_800),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_can_set_score_ban_ladder() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.toml");
+
+        let config = load_test_config(
+            &config_path,
+            HashMap::from([(
+                "BRRPOLICE_POLICY__SCORE__BAN_LADDER__DURATIONS".to_string(),
+                "6m,12m,1h".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.policy.score.ban_ladder.durations,
+            vec![
+                Duration::from_secs(360),
+                Duration::from_secs(720),
+                Duration::from_secs(3_600),
             ]
         );
     }
