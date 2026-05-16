@@ -395,6 +395,22 @@ impl QbittorrentClient {
         torrents
             .into_iter()
             .filter(|torrent| torrent.amount_left == 0)
+            .filter(|torrent| match torrent.connected_leecher_count() {
+                Some(0) => {
+                    debug!(
+                        torrent_hash = %torrent.hash,
+                        torrent_name = %torrent.name,
+                        total_seeders = torrent.num_complete.max(0),
+                        connected_leecher_count = 0,
+                        connected_seed_count = ?torrent.connected_seed_count(),
+                        in_scope = false,
+                        reason_code = "no_connected_leechers",
+                        "torrent filter decision"
+                    );
+                    false
+                }
+                Some(_) | None => true,
+            })
             .map(|torrent| TorrentSummary {
                 hash: torrent.hash,
                 name: torrent.name,
@@ -716,6 +732,20 @@ struct QbTorrent {
     num_complete: i64,
     #[serde(default)]
     amount_left: i64,
+    #[serde(default)]
+    num_leechs: Option<i64>,
+    #[serde(default)]
+    num_seeds: Option<i64>,
+}
+
+impl QbTorrent {
+    fn connected_leecher_count(&self) -> Option<u32> {
+        self.num_leechs.map(|count| count.max(0) as u32)
+    }
+
+    fn connected_seed_count(&self) -> Option<u32> {
+        self.num_seeds.map(|count| count.max(0) as u32)
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -929,6 +959,8 @@ mod tests {
                         "category":"tv",
                         "tags":"seed,public",
                         "num_complete":17,
+                        "num_leechs":2,
+                        "num_seeds":1,
                         "amount_left":0
                     },
                     {
@@ -938,6 +970,8 @@ mod tests {
                         "category":"",
                         "tags":"",
                         "num_complete":0,
+                        "num_leechs":0,
+                        "num_seeds":0,
                         "amount_left":1024
                     }
                 ]"#,
@@ -951,10 +985,14 @@ mod tests {
         assert_eq!(torrents[0].category, "tv");
         assert_eq!(torrents[0].tags, "seed,public");
         assert_eq!(torrents[0].num_complete, 17);
+        assert_eq!(torrents[0].connected_leecher_count(), Some(2));
+        assert_eq!(torrents[0].connected_seed_count(), Some(1));
         assert_eq!(torrents[0].amount_left, 0);
         assert_eq!(torrents[1].tracker, "");
         assert_eq!(torrents[1].category, "");
         assert_eq!(torrents[1].tags, "");
+        assert_eq!(torrents[1].connected_leecher_count(), Some(0));
+        assert_eq!(torrents[1].connected_seed_count(), Some(0));
         assert_eq!(torrents[1].amount_left, 1024);
     }
 
@@ -987,6 +1025,8 @@ mod tests {
                 tags: "seed,public".to_string(),
                 num_complete: 7,
                 amount_left: 0,
+                num_leechs: Some(1),
+                num_seeds: Some(0),
             },
             QbTorrent {
                 hash: "b".to_string(),
@@ -996,6 +1036,19 @@ mod tests {
                 tags: "seed".to_string(),
                 num_complete: 9,
                 amount_left: 1,
+                num_leechs: Some(1),
+                num_seeds: Some(0),
+            },
+            QbTorrent {
+                hash: "c".to_string(),
+                name: "Complete with only connected seeds".to_string(),
+                tracker: String::new(),
+                category: "tv".to_string(),
+                tags: "seed".to_string(),
+                num_complete: 9,
+                amount_left: 0,
+                num_leechs: Some(0),
+                num_seeds: Some(100),
             },
         ]);
 
@@ -1677,7 +1730,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/json")
-                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5,"amount_left":0},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6,"amount_left":0},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6,"amount_left":0},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6,"amount_left":0},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2,"amount_left":0},{"hash":"f","name":"Incomplete active","category":"tv","tags":"keep","num_complete":9,"amount_left":256}]"#),
+                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6,"num_leechs":1,"num_seeds":100,"amount_left":0},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"f","name":"Incomplete active","category":"tv","tags":"keep","num_complete":9,"num_leechs":1,"num_seeds":0,"amount_left":256},{"hash":"g","name":"No connected leechers","category":"tv","tags":"keep","num_complete":9,"num_leechs":0,"num_seeds":100,"amount_left":0}]"#),
             )
             .expect(1)
             .mount(&server)
