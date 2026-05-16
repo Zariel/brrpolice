@@ -11,7 +11,7 @@ use anyhow::Result;
 use ipnet::IpNet;
 
 use crate::{
-    config::{FiltersConfig, PolicyConfig},
+    config::{FiltersConfig, PolicyConfig, ReceiveIdlePolicyConfig, ScorePolicyConfig},
     metrics::AppMetrics,
     persistence::{EnforcementWriteResult, PendingBanIntentRecord, Persistence},
     types::{
@@ -30,23 +30,27 @@ pub struct PolicyEngine {
 }
 
 #[derive(Clone)]
-struct PolicySupport {
-    config: PolicyConfig,
+struct PolicyContext {
+    new_peer_grace_period: Duration,
+    decay_window: Duration,
+    ignore_peer_progress_at_or_above: f64,
     allowlisted_ips: HashSet<IpAddr>,
     allowlisted_cidrs: Vec<IpNet>,
 }
 
 #[derive(Clone)]
 struct ScorePolicy {
-    support: PolicySupport,
+    context: PolicyContext,
+    config: ScorePolicyConfig,
 }
 
 #[derive(Clone)]
 struct ReceiveIdlePolicy {
-    support: PolicySupport,
+    context: PolicyContext,
+    config: ReceiveIdlePolicyConfig,
 }
 
-impl PolicySupport {
+impl PolicyContext {
     fn peer_observation_id(&self, peer: &PeerContext) -> PeerObservationId {
         PeerObservationId {
             torrent_hash: peer.torrent.hash.clone(),
@@ -71,10 +75,10 @@ impl PolicySupport {
             return Some(ExemptionReason::AllowlistedPeer);
         }
 
-        if peer.peer.progress >= self.config.ignore_peer_progress_at_or_above {
+        if peer.peer.progress >= self.ignore_peer_progress_at_or_above {
             return Some(ExemptionReason::NearComplete {
                 progress: peer.peer.progress,
-                threshold: self.config.ignore_peer_progress_at_or_above,
+                threshold: self.ignore_peer_progress_at_or_above,
             });
         }
 
@@ -84,7 +88,7 @@ impl PolicySupport {
                     .observed_at
                     .duration_since(peer.first_seen_at)
                     .unwrap_or_default(),
-                grace_period: self.config.new_peer_grace_period,
+                grace_period: self.new_peer_grace_period,
             });
         }
 
@@ -104,7 +108,7 @@ impl PolicySupport {
         observed_at
             .duration_since(first_seen_at)
             .unwrap_or_default()
-            < self.config.new_peer_grace_period
+            < self.new_peer_grace_period
     }
 
     fn can_carry_over_session(
@@ -124,7 +128,7 @@ impl PolicySupport {
                 .observed_at
                 .duration_since(previous_last_seen_at)
                 .unwrap_or_default()
-                <= self.config.decay_window
+                <= self.decay_window
     }
 }
 
@@ -631,7 +635,7 @@ impl PeerPolicy for ScorePeerPolicy {
             PolicyDiagnostic {
                 name: "threshold_met",
                 value: PolicyDiagnosticValue::Bool(
-                    evaluation.session.ban_score >= self.policy.support.config.score.ban_threshold,
+                    evaluation.session.ban_score >= self.policy.config.ban_threshold,
                 ),
             },
         ];
@@ -985,22 +989,19 @@ impl PeerPolicyReplay for ReceiveIdlePeerPolicy {
 
 impl ScorePolicy {
     pub fn peer_observation_id(&self, peer: &PeerContext) -> PeerObservationId {
-        self.support.peer_observation_id(peer)
+        self.context.peer_observation_id(peer)
     }
 
     pub fn offence_identity(&self, peer: &PeerContext) -> OffenceIdentity {
-        self.support.offence_identity(peer)
+        self.context.offence_identity(peer)
     }
 
     pub fn classify_exemption(&self, peer: &PeerContext) -> Option<ExemptionReason> {
-        self.support.classify_exemption(peer)
+        self.context.classify_exemption(peer)
     }
 
     pub fn ban_ttl_for_offence(&self, offence_number: u32) -> Duration {
-        ban_ttl_from_ladder(
-            &self.support.config.score.ban_ladder.durations,
-            offence_number,
-        )
+        ban_ttl_from_ladder(&self.config.ban_ladder.durations, offence_number)
     }
 
     pub fn begin_session(
@@ -1051,7 +1052,7 @@ impl ScorePolicy {
             session.bad_duration = self.decay_bad_duration(previous.bad_duration, gap);
             session.ban_score = self.decay_score(previous.ban_score, gap);
             session.ban_score_above_threshold_duration =
-                if session.ban_score >= self.support.config.score.ban_threshold {
+                if session.ban_score >= self.config.ban_threshold {
                     previous
                         .ban_score_above_threshold_duration
                         .saturating_sub(gap)
@@ -1099,7 +1100,7 @@ impl ScorePolicy {
             let score_sample_active = self.score_sample_is_upload_active(peer);
             let score_sample_eligible = exemption.is_none() && score_sample_active;
             let is_bad_sample = score_sample_eligible
-                && peer.peer.up_rate_bps < self.support.config.score.target_rate_bps
+                && peer.peer.up_rate_bps < self.config.target_rate_bps
                 && progress_delta < required_progress_delta;
             if is_bad_sample {
                 session.bad_duration = sample_duration;
@@ -1119,8 +1120,8 @@ impl ScorePolicy {
                 session.ban_score_above_threshold_duration = Duration::ZERO;
             } else {
                 session.ban_score = (session.ban_score + effective_sample_score_risk)
-                    .clamp(0.0, self.support.config.score.max_score);
-                if session.ban_score >= self.support.config.score.ban_threshold {
+                    .clamp(0.0, self.config.max_score);
+                if session.ban_score >= self.config.ban_threshold {
                     session.ban_score_above_threshold_duration = sample_duration;
                 }
             }
@@ -1164,7 +1165,7 @@ impl ScorePolicy {
         let score_sample_active = self.score_sample_is_upload_active(peer);
         let score_sample_eligible = exemption.is_none() && score_sample_active;
         let is_bad_sample = score_sample_eligible
-            && peer.peer.up_rate_bps < self.support.config.score.target_rate_bps
+            && peer.peer.up_rate_bps < self.config.target_rate_bps
             && progress_delta < required_progress_delta;
         let reconnect = previous.observation_id != self.peer_observation_id(peer);
         let bad_duration = if is_bad_sample {
@@ -1197,11 +1198,10 @@ impl ScorePolicy {
         if !score_sample_eligible {
             ban_score_above_threshold_duration = Duration::ZERO;
         } else {
-            ban_score = (ban_score + effective_sample_score_risk)
-                .clamp(0.0, self.support.config.score.max_score);
-            if ban_score >= self.support.config.score.ban_threshold {
+            ban_score = (ban_score + effective_sample_score_risk).clamp(0.0, self.config.max_score);
+            if ban_score >= self.config.ban_threshold {
                 ban_score_above_threshold_duration += sample_duration;
-            } else if ban_score <= self.support.config.score.clear_threshold {
+            } else if ban_score <= self.config.clear_threshold {
                 ban_score_above_threshold_duration = Duration::ZERO;
             }
         }
@@ -1274,9 +1274,9 @@ impl ScorePolicy {
         if !evaluation.is_bannable {
             return BanDisposition::NotBannableYet {
                 observed_duration: evaluation.session.observed_duration,
-                required_observation: self.support.config.score.min_observation_duration,
+                required_observation: self.config.min_observation_duration,
                 bad_duration: evaluation.session.ban_score_above_threshold_duration,
-                required_bad_duration: self.support.config.score.sustain_duration,
+                required_bad_duration: self.config.sustain_duration,
             };
         }
 
@@ -1296,10 +1296,8 @@ impl ScorePolicy {
             evaluation.session.observed_duration,
             evaluation.session.rolling_avg_up_rate_bps,
         );
-        let rate_risk = normalized_rate_risk(
-            evaluation.sample_up_rate_bps,
-            self.support.config.score.target_rate_bps,
-        );
+        let rate_risk =
+            normalized_rate_risk(evaluation.sample_up_rate_bps, self.config.target_rate_bps);
         let progress_risk =
             normalized_progress_risk(evaluation.progress_delta, required_progress_delta);
         let factors = self.reason_factors(rate_risk, progress_risk, evaluation);
@@ -1351,7 +1349,7 @@ impl ScorePolicy {
         offence_identity: &OffenceIdentity,
         peer: &PeerContext,
     ) -> bool {
-        self.support.can_carry_over_session(
+        self.context.can_carry_over_session(
             &previous.observation_id,
             &previous.offence_identity,
             previous.last_seen_at,
@@ -1368,14 +1366,14 @@ impl ScorePolicy {
 
         // bad_duration decays on inactivity so stale poor behaviour does not keep a peer
         // bannable forever; sustain_duration controls how quickly we forget it.
-        let decay_ratio = self.support.config.score.sustain_duration.as_secs_f64()
-            / self.support.config.decay_window.as_secs_f64();
+        let decay_ratio =
+            self.config.sustain_duration.as_secs_f64() / self.context.decay_window.as_secs_f64();
         let decay = elapsed.mul_f64(decay_ratio);
         bad_duration.saturating_sub(decay)
     }
 
     fn decay_score(&self, score: f64, elapsed: Duration) -> f64 {
-        self.decay_value(score, elapsed, self.support.config.score.decay_per_second)
+        self.decay_value(score, elapsed, self.config.decay_per_second)
     }
 
     fn decay_value(&self, value: f64, elapsed: Duration, decay_per_second: f64) -> f64 {
@@ -1395,11 +1393,11 @@ impl ScorePolicy {
         is_bad_sample: bool,
         exemption_free: bool,
     ) -> (u32, Option<SystemTime>, f64) {
-        if !self.support.config.score.churn.enabled {
+        if !self.config.churn.enabled {
             return (0, None, 0.0);
         }
 
-        let churn = &self.support.config.score.churn;
+        let churn = &self.config.churn;
         let mut reconnect_count = previous.churn_reconnect_count;
         let mut window_started_at = previous.churn_window_started_at;
         let mut amplifier =
@@ -1445,33 +1443,30 @@ impl ScorePolicy {
     }
 
     fn required_progress_delta(&self, observed_duration: Duration, up_rate_bps: u64) -> f64 {
-        if observed_duration.is_zero() || self.support.config.score.required_progress_delta <= 0.0 {
+        if observed_duration.is_zero() || self.config.required_progress_delta <= 0.0 {
             return 0.0;
         }
 
-        let sustain_secs = self.support.config.score.sustain_duration.as_secs_f64();
+        let sustain_secs = self.config.sustain_duration.as_secs_f64();
         if sustain_secs <= 0.0 {
-            return self.support.config.score.required_progress_delta
-                * self.progress_rate_scale(up_rate_bps);
+            return self.config.required_progress_delta * self.progress_rate_scale(up_rate_bps);
         }
 
         let observed_secs = observed_duration.as_secs_f64();
         let ramp = (observed_secs / sustain_secs).clamp(0.0, 1.0);
-        self.support.config.score.required_progress_delta
-            * ramp
-            * self.progress_rate_scale(up_rate_bps)
+        self.config.required_progress_delta * ramp * self.progress_rate_scale(up_rate_bps)
     }
 
     fn progress_rate_scale(&self, up_rate_bps: u64) -> f64 {
-        let target_rate_bps = self.support.config.score.target_rate_bps;
+        let target_rate_bps = self.config.target_rate_bps;
         if target_rate_bps == 0 {
             return 1.0;
         }
 
         let ratio = up_rate_bps as f64 / target_rate_bps as f64;
-        let start = self.support.config.score.progress_rate_scale_start;
-        let end = self.support.config.score.progress_rate_scale_end;
-        let min_scale = self.support.config.score.progress_rate_min_scale;
+        let start = self.config.progress_rate_scale_start;
+        let end = self.config.progress_rate_scale_end;
+        let min_scale = self.config.progress_rate_min_scale;
 
         if ratio <= start {
             return 1.0;
@@ -1496,7 +1491,7 @@ impl ScorePolicy {
 
         // Move the baseline toward latest progress over sustain_duration. This prevents
         // one early burst of progress from permanently masking later stagnation.
-        let sustain_secs = self.support.config.score.sustain_duration.as_secs_f64();
+        let sustain_secs = self.config.sustain_duration.as_secs_f64();
         if sustain_secs <= 0.0 {
             return latest_progress;
         }
@@ -1544,8 +1539,8 @@ impl ScorePolicy {
         if !exemption_free {
             return false;
         }
-        observed_duration >= self.support.config.score.min_observation_duration
-            && score_above_threshold_duration >= self.support.config.score.sustain_duration
+        observed_duration >= self.config.min_observation_duration
+            && score_above_threshold_duration >= self.config.sustain_duration
     }
 
     fn sample_score_risk(
@@ -1554,19 +1549,17 @@ impl ScorePolicy {
         progress_delta: f64,
         required_progress_delta: f64,
     ) -> f64 {
-        let rate_risk =
-            normalized_rate_risk(up_rate_bps, self.support.config.score.target_rate_bps);
+        let rate_risk = normalized_rate_risk(up_rate_bps, self.config.target_rate_bps);
         let progress_risk = normalized_progress_risk(progress_delta, required_progress_delta);
-        let weight_total =
-            self.support.config.score.weight_rate + self.support.config.score.weight_progress;
+        let weight_total = self.config.weight_rate + self.config.weight_progress;
         if weight_total <= 0.0 {
             return 0.0;
         }
 
-        let weighted_risk = ((self.support.config.score.weight_rate * rate_risk)
-            + (self.support.config.score.weight_progress * progress_risk))
+        let weighted_risk = ((self.config.weight_rate * rate_risk)
+            + (self.config.weight_progress * progress_risk))
             / weight_total;
-        let floor_risk = (self.support.config.score.rate_risk_floor * rate_risk).clamp(0.0, 1.0);
+        let floor_risk = (self.config.rate_risk_floor * rate_risk).clamp(0.0, 1.0);
 
         weighted_risk.max(floor_risk)
     }
@@ -1588,11 +1581,7 @@ impl ScorePolicy {
         last_ban_expires_at: Option<SystemTime>,
         observed_at: SystemTime,
     ) -> Option<Duration> {
-        remaining_reban_cooldown(
-            last_ban_expires_at,
-            observed_at,
-            self.support.config.score.reban_cooldown,
-        )
+        remaining_reban_cooldown(last_ban_expires_at, observed_at, self.config.reban_cooldown)
     }
 
     fn reason_factors(
@@ -1615,9 +1604,8 @@ impl ScorePolicy {
             factors.push("progress_deficit");
         }
 
-        if self.support.config.score.churn.enabled
-            && evaluation.session.churn_reconnect_count
-                >= self.support.config.score.churn.min_reconnects
+        if self.config.churn.enabled
+            && evaluation.session.churn_reconnect_count >= self.config.churn.min_reconnects
             && evaluation.session.churn_amplifier > 0.0
         {
             factors.push("reconnect_churn");
@@ -1633,15 +1621,15 @@ impl ScorePolicy {
 
 impl ReceiveIdlePolicy {
     pub fn peer_observation_id(&self, peer: &PeerContext) -> PeerObservationId {
-        self.support.peer_observation_id(peer)
+        self.context.peer_observation_id(peer)
     }
 
     pub fn offence_identity(&self, peer: &PeerContext) -> OffenceIdentity {
-        self.support.offence_identity(peer)
+        self.context.offence_identity(peer)
     }
 
     pub fn classify_exemption(&self, peer: &PeerContext) -> Option<ExemptionReason> {
-        self.support.classify_exemption(peer)
+        self.context.classify_exemption(peer)
     }
 
     pub fn begin_receive_idle_session(
@@ -1748,12 +1736,11 @@ impl ReceiveIdlePolicy {
             }
         });
         let exemption = self.classify_exemption(peer);
-        let is_bad_sample = self.support.config.receive_idle.enabled
+        let is_bad_sample = self.config.enabled
             && exemption.is_none()
-            && peer.peer.up_rate_bps <= self.support.config.receive_idle.max_upload_rate_bps
-            && uploaded_delta_bytes.is_some_and(|delta| {
-                delta <= self.support.config.receive_idle.max_uploaded_delta_bytes
-            });
+            && peer.peer.up_rate_bps <= self.config.max_upload_rate_bps
+            && uploaded_delta_bytes
+                .is_some_and(|delta| delta <= self.config.max_uploaded_delta_bytes);
 
         session.last_seen_at = peer.observed_at;
         session.last_uploaded_bytes = peer.peer.uploaded_bytes;
@@ -1765,11 +1752,10 @@ impl ReceiveIdlePolicy {
             Duration::ZERO
         };
 
-        let is_bannable = self.support.config.receive_idle.enabled
+        let is_bannable = self.config.enabled
             && session.last_exemption_reason.is_none()
-            && session.observed_duration
-                >= self.support.config.receive_idle.min_observation_duration
-            && session.bad_duration >= self.support.config.receive_idle.sustain_duration;
+            && session.observed_duration >= self.config.min_observation_duration
+            && session.bad_duration >= self.config.sustain_duration;
         session.bannable_since = if is_bannable {
             session.bannable_since.or(Some(peer.observed_at))
         } else {
@@ -1801,9 +1787,9 @@ impl ReceiveIdlePolicy {
         if !evaluation.is_bannable {
             return BanDisposition::NotBannableYet {
                 observed_duration: evaluation.session.observed_duration,
-                required_observation: self.support.config.receive_idle.min_observation_duration,
+                required_observation: self.config.min_observation_duration,
                 bad_duration: evaluation.session.bad_duration,
-                required_bad_duration: self.support.config.receive_idle.sustain_duration,
+                required_bad_duration: self.config.sustain_duration,
             };
         }
 
@@ -1843,10 +1829,7 @@ impl ReceiveIdlePolicy {
     }
 
     fn receive_idle_ban_ttl_for_offence(&self, offence_number: u32) -> Duration {
-        ban_ttl_from_ladder(
-            &self.support.config.receive_idle.ban_ladder.durations,
-            offence_number,
-        )
+        ban_ttl_from_ladder(&self.config.ban_ladder.durations, offence_number)
     }
 
     fn can_carry_over_policy(
@@ -1856,7 +1839,7 @@ impl ReceiveIdlePolicy {
         offence_identity: &OffenceIdentity,
         peer: &PeerContext,
     ) -> bool {
-        self.support.can_carry_over_session(
+        self.context.can_carry_over_session(
             &previous.observation_id,
             &previous.offence_identity,
             previous.last_seen_at,
@@ -1874,8 +1857,7 @@ impl ReceiveIdlePolicy {
         peer: &PeerContext,
     ) -> bool {
         self.can_carry_over_policy(previous, observation_id, offence_identity, peer)
-            && self.policy_session_gap(previous, peer)
-                <= self.support.config.receive_idle.sustain_duration
+            && self.policy_session_gap(previous, peer) <= self.config.sustain_duration
     }
 
     fn can_continue_policy_session(
@@ -1898,8 +1880,7 @@ impl ReceiveIdlePolicy {
         peer: &PeerContext,
     ) -> bool {
         self.can_continue_policy_session(previous, observation_id, offence_identity, peer)
-            && self.policy_session_gap(previous, peer)
-                <= self.support.config.receive_idle.sustain_duration
+            && self.policy_session_gap(previous, peer) <= self.config.sustain_duration
     }
 
     fn policy_session_gap(
@@ -1917,11 +1898,7 @@ impl ReceiveIdlePolicy {
         last_ban_expires_at: Option<SystemTime>,
         observed_at: SystemTime,
     ) -> Option<Duration> {
-        remaining_reban_cooldown(
-            last_ban_expires_at,
-            observed_at,
-            self.support.config.receive_idle.reban_cooldown,
-        )
+        remaining_reban_cooldown(last_ban_expires_at, observed_at, self.config.reban_cooldown)
     }
 }
 
@@ -1946,9 +1923,11 @@ impl PolicyEngine {
         }
     }
 
-    fn support(&self) -> PolicySupport {
-        PolicySupport {
-            config: self.config.clone(),
+    fn context(&self) -> PolicyContext {
+        PolicyContext {
+            new_peer_grace_period: self.config.new_peer_grace_period,
+            decay_window: self.config.decay_window,
+            ignore_peer_progress_at_or_above: self.config.ignore_peer_progress_at_or_above,
             allowlisted_ips: self.allowlisted_ips.clone(),
             allowlisted_cidrs: self.allowlisted_cidrs.clone(),
         }
@@ -1956,18 +1935,20 @@ impl PolicyEngine {
 
     fn score_policy(&self) -> ScorePolicy {
         ScorePolicy {
-            support: self.support(),
+            context: self.context(),
+            config: self.config.score.clone(),
         }
     }
 
     fn receive_idle_policy(&self) -> ReceiveIdlePolicy {
         ReceiveIdlePolicy {
-            support: self.support(),
+            context: self.context(),
+            config: self.config.receive_idle.clone(),
         }
     }
 
     pub fn peer_observation_id(&self, peer: &PeerContext) -> PeerObservationId {
-        self.support().peer_observation_id(peer)
+        self.context().peer_observation_id(peer)
     }
 
     pub fn enabled_peer_policies(&self) -> Vec<Arc<dyn PeerPolicyAdapter>> {
@@ -1997,11 +1978,11 @@ impl PolicyEngine {
     }
 
     pub fn offence_identity(&self, peer: &PeerContext) -> OffenceIdentity {
-        self.support().offence_identity(peer)
+        self.context().offence_identity(peer)
     }
 
     pub fn classify_exemption(&self, peer: &PeerContext) -> Option<ExemptionReason> {
-        self.support().classify_exemption(peer)
+        self.context().classify_exemption(peer)
     }
 
     pub fn ban_ttl_for_offence(&self, offence_number: u32) -> Duration {
