@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::{sync::watch, time};
 use tracing::{debug, info, warn};
 
@@ -1186,6 +1186,24 @@ impl ControlLoop {
             return Ok(());
         }
 
+        if !matches!(
+            intent.policy_name.as_str(),
+            SCORE_POLICY_NAME | RECEIVE_IDLE_POLICY_NAME
+        ) {
+            let error = format!(
+                "unsupported policy `{}` in pending ban intent",
+                intent.policy_name
+            );
+            self.persistence
+                .upsert_pending_ban_intent(&PendingBanIntentRecord {
+                    last_error: error.clone(),
+                    ..intent.clone()
+                })
+                .await?;
+            self.metrics.record_ban_failure();
+            bail!("{error}");
+        }
+
         let active_ban = ActiveBanRecord {
             peer_ip: intent.peer_ip,
             peer_port: intent.peer_port,
@@ -1870,6 +1888,81 @@ mod tests {
         );
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retains_unsupported_policy_pending_intent() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let now = std::time::SystemTime::now();
+        let mut intent = pending_ban_intent(
+            "abc123",
+            "10.0.0.10",
+            51413,
+            1,
+            now - Duration::from_secs(30),
+            now + Duration::from_secs(3600),
+            "failed while service was down",
+        );
+        intent.policy_name = "future_policy".to_string();
+        intent.reason_code = "future_reason".to_string();
+        persistence
+            .upsert_pending_ban_intent(&intent)
+            .await
+            .unwrap();
+
+        let (base_url, observed_requests, _server) = spawn_recording_server().await;
+
+        let state = Arc::new(ServiceState::new());
+        state.mark_database_ready();
+        state.mark_qbittorrent_ready();
+
+        let config = Arc::new(test_config(&base_url));
+        let qbittorrent = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            config,
+            persistence.clone(),
+            qbittorrent,
+            policy,
+            state,
+            metrics,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+
+        let pending = persistence.load_pending_ban_intents().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].policy_name, "future_policy");
+        assert!(pending[0].last_error.contains("unsupported policy"));
+        assert!(persistence.load_active_bans().await.unwrap().is_empty());
+        assert!(
+            persistence
+                .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let observed_requests = observed_requests.lock().unwrap();
+        assert!(
+            observed_requests
+                .iter()
+                .all(|request| !request.contains("/api/v2/transfer/banPeers")),
+            "unsupported policy intent should not be enforced: {observed_requests:?}"
+        );
     }
 
     #[tokio::test]
@@ -2876,6 +2969,45 @@ mod tests {
         });
 
         (base_url, handle, observed_count, observed_notify)
+    }
+
+    #[derive(Clone)]
+    struct RecordingResponder {
+        observed_requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Respond for RecordingResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            self.observed_requests.lock().unwrap().push(format!(
+                "{} {}",
+                request.method,
+                request_path_and_query(request)
+            ));
+
+            if request.method.as_str() == "GET"
+                && request_path_and_query(request) == "/api/v2/app/preferences"
+            {
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string("{\"banned_IPs\":\"\"}")
+            } else {
+                ResponseTemplate::new(200)
+            }
+        }
+    }
+
+    async fn spawn_recording_server() -> (String, Arc<Mutex<Vec<String>>>, MockServer) {
+        let server = MockServer::start().await;
+        let observed_requests = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(any())
+            .respond_with(RecordingResponder {
+                observed_requests: observed_requests.clone(),
+            })
+            .mount(&server)
+            .await;
+        let base_url = format!("{}/", server.uri());
+
+        (base_url, observed_requests, server)
     }
 
     async fn wait_for_observed_requests(
