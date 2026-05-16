@@ -161,7 +161,7 @@ impl QbittorrentClient {
 
     pub async fn list_in_scope_torrents(&self) -> Result<Vec<TorrentSummary>> {
         let mut url = self.torrent_info_url()?;
-        url.query_pairs_mut().append_pair("filter", "active");
+        url.query_pairs_mut().append_pair("filter", "completed");
         let body = self.authenticated_get_text(url).await?;
         let torrents = self.parse_torrents(&body)?;
         let completed = self.filter_completed_torrents(torrents);
@@ -1554,7 +1554,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "active"))
+            .and(query_param("filter", "completed"))
             .and(header("authorization", "Bearer test-api-key"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1705,11 +1705,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_in_scope_torrents_requests_active_filter_and_applies_scope_rules() {
+    async fn list_in_scope_torrents_requests_completed_filter_and_applies_scope_rules() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "active"))
+            .and(query_param("filter", "completed"))
             .and(HeaderAbsentMatcher("cookie"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .expect(1)
@@ -1725,12 +1725,12 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "active"))
+            .and(query_param("filter", "completed"))
             .and(header("cookie", "SID=abc"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/json")
-                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6,"num_leechs":1,"num_seeds":100,"amount_left":0},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"f","name":"Incomplete active","category":"tv","tags":"keep","num_complete":9,"num_leechs":1,"num_seeds":0,"amount_left":256},{"hash":"g","name":"No connected leechers","category":"tv","tags":"keep","num_complete":9,"num_leechs":0,"num_seeds":100,"amount_left":0}]"#),
+                    .set_body_string(r#"[{"hash":"a","name":"Allowed category","category":"tv","tags":"public","num_complete":5,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"b","name":"Allowed tag","category":"music","tags":" keep ,misc ","num_complete":6,"num_leechs":1,"num_seeds":100,"amount_left":0},{"hash":"c","name":"Excluded category","category":"linux","tags":"keep","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"d","name":"Excluded tag","category":"tv","tags":"skip","num_complete":6,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"e","name":"Too small","category":"tv","tags":"keep","num_complete":2,"num_leechs":1,"num_seeds":0,"amount_left":0},{"hash":"f","name":"Incomplete completed","category":"tv","tags":"keep","num_complete":9,"num_leechs":1,"num_seeds":0,"amount_left":256},{"hash":"g","name":"No connected leechers","category":"tv","tags":"keep","num_complete":9,"num_leechs":0,"num_seeds":100,"amount_left":0}]"#),
             )
             .expect(1)
             .mount(&server)
@@ -1965,7 +1965,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "active"))
+            .and(query_param("filter", "completed"))
             .and(HeaderAbsentMatcher("cookie"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .expect(1)
@@ -1981,7 +1981,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .and(query_param("filter", "active"))
+            .and(query_param("filter", "completed"))
             .and(header("cookie", "SID=abc"))
             .respond_with(
                 ResponseTemplate::new(200)

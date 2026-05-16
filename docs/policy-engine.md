@@ -6,7 +6,7 @@ This document explains, at a high level, how `brrpolice` decides whether to ban 
 
 Each poll cycle:
 
-1. `brrpolice` asks qBittorrent for active torrents.
+1. `brrpolice` asks qBittorrent for completed torrents.
 2. It keeps only completed torrents that pass configured category/tag filters and minimum seeder count.
    When qBittorrent reports connected leecher counts for the torrent, completed torrents with zero
    connected leechers are skipped before peer detail is fetched. Connected seeds do not keep a
