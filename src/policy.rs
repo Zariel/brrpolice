@@ -487,7 +487,17 @@ impl PolicyEngine {
 
         if let Some(previous) = carryover.filter(|previous| {
             previous.policy_name == RECEIVE_IDLE_POLICY_NAME
-                && self.can_carry_over_policy(previous, &observation_id, &offence_identity, peer)
+                && (self.can_continue_policy_session(
+                    previous,
+                    &observation_id,
+                    &offence_identity,
+                    peer,
+                ) || self.can_carry_over_policy(
+                    previous,
+                    &observation_id,
+                    &offence_identity,
+                    peer,
+                ))
         }) {
             let sample_duration = peer
                 .observed_at
@@ -678,6 +688,18 @@ impl PolicyEngine {
                 .duration_since(previous.last_seen_at)
                 .unwrap_or_default()
                 <= self.config.decay_window
+    }
+
+    fn can_continue_policy_session(
+        &self,
+        previous: &PeerPolicySessionState,
+        observation_id: &PeerObservationId,
+        offence_identity: &OffenceIdentity,
+        peer: &PeerContext,
+    ) -> bool {
+        previous.observation_id == *observation_id
+            && previous.offence_identity == *offence_identity
+            && peer.observed_at >= previous.last_seen_at
     }
 
     fn decay_bad_duration(&self, bad_duration: Duration, elapsed: Duration) -> Duration {
@@ -1933,6 +1955,28 @@ mod tests {
                 assert_eq!(decision.ttl, Duration::from_secs(600));
                 assert!(decision.reason_details.contains("uploaded_delta_bytes=0"));
             }
+            other => panic!("expected receive idle ban, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receive_idle_accumulates_across_same_port_polls() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = engine
+            .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(210, 0), Some(&first.session));
+        assert!(second.is_bad_sample);
+        assert_eq!(second.session.bad_duration, Duration::from_secs(30));
+        assert!(!second.is_bannable);
+
+        let third_peer = seeded_peer_with_uploaded(240, 0);
+        let third = engine.evaluate_receive_idle_peer(&third_peer, Some(&second.session));
+        assert!(third.is_bad_sample);
+        assert_eq!(third.session.bad_duration, Duration::from_secs(60));
+        assert!(third.is_bannable);
+
+        match engine.decide_receive_idle_ban(&third_peer, &third, &empty_history()) {
+            BanDisposition::Ban(decision) => assert_eq!(decision.reason_code, "receive_idle"),
             other => panic!("expected receive idle ban, got {other:?}"),
         }
     }
