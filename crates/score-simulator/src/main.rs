@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use brrpolice::{
     config::{FiltersConfig, PolicyConfig},
-    policy::PolicyEngine,
+    policy::PolicyRegistry,
     types::{
         BanDisposition, OffenceHistory, OffenceIdentity, PeerContext, PeerObservationId,
         PeerSessionState, PeerSnapshot, TorrentScope,
@@ -125,7 +125,7 @@ struct ReplayState {
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let config = parse_args(args)?;
-    let policy = PolicyEngine::new(config.policy.clone(), &FiltersConfig::default());
+    let registry = PolicyRegistry::new(config.policy.clone(), &FiltersConfig::default());
     let mut state = ReplayState::default();
     let mut summary = Summary::default();
 
@@ -134,7 +134,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             .with_context(|| format!("opening input file `{}`", input.display()))?;
         let reader = BufReader::new(file);
         process_reader(
-            &policy,
+            &registry,
             &config,
             reader,
             input.display().to_string(),
@@ -148,7 +148,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn process_reader<R: BufRead>(
-    policy: &PolicyEngine,
+    registry: &PolicyRegistry,
     config: &SimulatorConfig,
     reader: R,
     source_name: String,
@@ -166,14 +166,14 @@ fn process_reader<R: BufRead>(
         let Some(fields) = parse_log_fields(&line) else {
             continue;
         };
-        process_fields(policy, config, fields, state, summary)?;
+        process_fields(registry, config, fields, state, summary)?;
     }
 
     Ok(())
 }
 
 fn process_fields(
-    policy: &PolicyEngine,
+    registry: &PolicyRegistry,
     config: &SimulatorConfig,
     fields: LogFields,
     state: &mut ReplayState,
@@ -280,7 +280,7 @@ fn process_fields(
     };
 
     let mut evaluation =
-        policy.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
+        registry.evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
     if config.hydrate_logged_score_state {
         hydrate_evaluation_from_log_fields(&mut evaluation, &fields, config);
     } else if let Some(seconds) = fields.observed_duration_seconds {
@@ -312,7 +312,7 @@ fn process_fields(
     summary.churn_max_reconnect_count = summary
         .churn_max_reconnect_count
         .max(evaluation.session.churn_reconnect_count);
-    match policy.decide_ban(&peer_context, &evaluation, &history) {
+    match registry.decide_ban(&peer_context, &evaluation, &history) {
         BanDisposition::Ban(decision) => {
             summary.simulated_bans += 1;
             if evaluation.session.churn_amplifier > 0.0 {
@@ -335,7 +335,7 @@ fn process_fields(
                     last_ban_expires_at: Some(expires_at),
                 },
             );
-            session_to_store = policy.record_ban_decision(&session_to_store, observed_at);
+            session_to_store = registry.record_ban_decision(&session_to_store, observed_at);
         }
         BanDisposition::Exempt(_)
         | BanDisposition::NotBannableYet { .. }
@@ -762,7 +762,7 @@ mod tests {
     use std::{io::Cursor, path::PathBuf};
 
     use super::{Summary, parse_args, parse_log_fields, process_reader};
-    use brrpolice::policy::PolicyEngine;
+    use brrpolice::policy::PolicyRegistry;
 
     #[test]
     fn parses_vmui_wrapped_json_line() {
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn replay_harness_aggregates_across_multiple_readers() {
         let config = parse_args(vec!["--input".into(), "dummy".into()]).unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let registry = PolicyRegistry::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
 
@@ -845,7 +845,7 @@ mod tests {
         );
 
         process_reader(
-            &policy,
+            &registry,
             &config,
             first,
             "first".to_string(),
@@ -854,7 +854,7 @@ mod tests {
         )
         .unwrap();
         process_reader(
-            &policy,
+            &registry,
             &config,
             second,
             "second".to_string(),
@@ -892,7 +892,7 @@ mod tests {
             "0.0025".into(),
         ])
         .unwrap();
-        let policy = PolicyEngine::new(config.policy.clone(), &Default::default());
+        let registry = PolicyRegistry::new(config.policy.clone(), &Default::default());
         let mut state = super::ReplayState::default();
         let mut summary = Summary::default();
 
@@ -903,7 +903,7 @@ mod tests {
         ));
 
         process_reader(
-            &policy,
+            &registry,
             &config,
             replay,
             "replay".to_string(),

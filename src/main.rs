@@ -7,7 +7,7 @@ use brrpolice::{
     http::HttpServer,
     metrics::AppMetrics,
     persistence::Persistence,
-    policy::PolicyEngine,
+    policy::PolicyRegistry,
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
 };
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
         metrics.clone(),
     )?);
 
-    let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
     let http_server = HttpServer::new(
         config.clone(),
         persistence.clone(),
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
         config,
         persistence,
         qbittorrent,
-        policy,
+        policy_registry,
         state.clone(),
         metrics,
         shutdown_rx,

@@ -15,7 +15,7 @@ storage.
 The current API does not make that workflow generic. The control loop has explicit branches for
 `score` and `receive_idle`, and it knows which state type, persistence method, policy method,
 metrics, logging fields, pending-intent fields, and startup replay shape each policy needs. The
-`PolicyEngine` type also owns multiple concrete policy behaviors instead of exposing a common
+`PolicyRegistry` type also owns multiple concrete policy behaviors instead of exposing a common
 policy implementation interface.
 
 This makes the next policy expensive to add. A new policy would require edits across the control

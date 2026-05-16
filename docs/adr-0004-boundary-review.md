@@ -29,7 +29,7 @@ receive-idle do not get confused with production orchestration behavior.
 
 Allowed concrete references:
 
-- `PolicyEngine::enabled_peer_policies` and `PolicyEngine::replay_peer_policies` construct the
+- `PolicyRegistry::enabled_peer_policies` and `PolicyRegistry::replay_peer_policies` construct the
   compiled runtime policy registry from config.
 - Score and receive-idle policies downcast only the opaque session/evaluation state that they
   created.

@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
-    policy::{PolicyCycleCache, PolicyDataStore, PolicyEngine, RuntimePolicy},
+    policy::{PolicyCycleCache, PolicyDataStore, PolicyRegistry, RuntimePolicy},
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
     types::{
@@ -256,13 +256,13 @@ impl ControlLoop {
         config: Arc<AppConfig>,
         persistence: Arc<Persistence>,
         qbittorrent: Arc<QbittorrentClient>,
-        policy: Arc<PolicyEngine>,
+        policy_registry: Arc<PolicyRegistry>,
         service_state: Arc<ServiceState>,
         metrics: Arc<AppMetrics>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
-        let peer_policies = policy.enabled_peer_policies();
-        let replay_policies = policy.replay_peer_policies();
+        let peer_policies = policy_registry.enabled_peer_policies();
+        let replay_policies = policy_registry.replay_peer_policies();
         Self {
             config,
             persistence,
@@ -1624,7 +1624,7 @@ mod tests {
         },
         metrics::AppMetrics,
         persistence::{ActiveBanRecord, PeerOffenceRecord, PendingBanIntentRecord, Persistence},
-        policy::{PolicyDataStore, PolicyEngine},
+        policy::{PolicyDataStore, PolicyRegistry},
         runtime::ServiceState,
         types::{
             BanDecision, OffenceHistory, OffenceIdentity, PeerContext, PeerObservationId,
@@ -1663,8 +1663,8 @@ mod tests {
         let mut config = PolicyConfig::default();
         config.score.enabled = false;
         config.receive_idle.enabled = true;
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
-        let policy = engine.enabled_peer_policies().remove(0);
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
+        let policy = registry.enabled_peer_policies().remove(0);
         let torrent = TorrentSummary {
             hash: "abc123".to_string(),
             name: "Example".to_string(),
@@ -1695,7 +1695,7 @@ mod tests {
             has_active_ban: false,
         };
         let torrent_peer = TorrentPeer {
-            observation_id: engine.peer_observation_id(&peer_context),
+            observation_id: registry.peer_observation_id(&peer_context),
             peer: peer_context.peer.clone(),
             client_name: None,
         };
@@ -1793,8 +1793,8 @@ mod tests {
         let mut config = PolicyConfig::default();
         config.score.enabled = true;
         config.receive_idle.enabled = true;
-        let policy = PolicyEngine::new(config, &FiltersConfig::default());
-        let mut policies = policy.enabled_peer_policies();
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
+        let mut policies = registry.enabled_peer_policies();
         let receive_idle_policy = policies
             .iter()
             .find(|policy| policy.name() == crate::policy::RECEIVE_IDLE_POLICY_NAME)
@@ -2041,13 +2041,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence,
             qbittorrent,
-            policy,
+            policy_registry,
             state.clone(),
             metrics,
             shutdown_rx,
@@ -2130,13 +2130,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2227,13 +2227,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2333,13 +2333,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2405,13 +2405,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2511,13 +2511,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2599,13 +2599,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2688,13 +2688,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -2763,13 +2763,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let control = ControlLoop::new(
             config,
             persistence,
             qbittorrent,
-            policy,
+            policy_registry,
             state.clone(),
             metrics,
             shutdown_rx,
@@ -2932,13 +2932,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -3167,13 +3167,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -3348,13 +3348,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -3457,13 +3457,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -3539,13 +3539,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence,
             qbittorrent,
-            policy,
+            policy_registry,
             state.clone(),
             metrics,
             shutdown_rx,
@@ -3621,13 +3621,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence,
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,
@@ -3759,13 +3759,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone(), &config.filters));
         let (_, shutdown_rx) = watch::channel(false);
         let mut control = ControlLoop::new(
             config,
             persistence.clone(),
             qbittorrent,
-            policy,
+            policy_registry,
             state,
             metrics,
             shutdown_rx,

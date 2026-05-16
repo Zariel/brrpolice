@@ -23,7 +23,8 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct PolicyEngine {
+/// Builds runtime policy instances from policy config and shared filter context.
+pub struct PolicyRegistry {
     config: PolicyConfig,
     allowlisted_ips: HashSet<IpAddr>,
     allowlisted_cidrs: Vec<IpNet>,
@@ -1900,7 +1901,7 @@ impl ReceiveIdlePolicy {
     }
 }
 
-impl PolicyEngine {
+impl PolicyRegistry {
     pub fn new(mut config: PolicyConfig, filters: &FiltersConfig) -> Self {
         config.apply_legacy_score_aliases();
         let allowlisted_ips = filters
@@ -2149,7 +2150,7 @@ mod tests {
     };
 
     use super::{
-        PeerPolicy, PolicyEngine, RECEIVE_IDLE_POLICY_NAME, ReceiveIdleSessionSnapshot,
+        PeerPolicy, PolicyRegistry, RECEIVE_IDLE_POLICY_NAME, ReceiveIdleSessionSnapshot,
         SCORE_POLICY_NAME,
     };
 
@@ -2200,7 +2201,7 @@ mod tests {
                 },
                 ..PolicyConfig::default()
             };
-            let engine = PolicyEngine::new(config.clone(), &FiltersConfig::default());
+            let registry = PolicyRegistry::new(config.clone(), &FiltersConfig::default());
 
             let mut elapsed = 120_u64;
             let mut progress = 0.10_f64;
@@ -2210,7 +2211,7 @@ mod tests {
                 elapsed += sample_secs;
                 progress = (progress + progress_delta).min(0.90);
                 let peer = seeded_peer(elapsed, progress, up_rate_bps);
-                let evaluation = engine.evaluate_peer(&peer, session.as_ref());
+                let evaluation = registry.evaluate_peer(&peer, session.as_ref());
 
                 prop_assert!((0.0..=config.score.max_score).contains(&evaluation.session.ban_score));
                 prop_assert!(evaluation.session.ban_score_above_threshold_duration <= evaluation.session.observed_duration);
@@ -2223,11 +2224,11 @@ mod tests {
 
     #[test]
     fn uses_torrent_ip_port_for_observation_identity_and_torrent_ip_for_offence_identity() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
+        let registry = PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default());
         let peer = test_peer();
 
-        let observation = engine.peer_observation_id(&peer);
-        let offence = engine.offence_identity(&peer);
+        let observation = registry.peer_observation_id(&peer);
+        let offence = registry.offence_identity(&peer);
 
         assert_eq!(observation.torrent_hash, "abc123");
         assert_eq!(observation.peer_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
@@ -2238,8 +2239,9 @@ mod tests {
 
     #[test]
     fn constructs_enabled_policy_list_from_config() {
-        let default_engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
-        let default_names = default_engine
+        let default_registry =
+            PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default());
+        let default_names = default_registry
             .enabled_peer_policies()
             .into_iter()
             .map(|policy| policy.name())
@@ -2249,7 +2251,7 @@ mod tests {
             vec![SCORE_POLICY_NAME, RECEIVE_IDLE_POLICY_NAME]
         );
 
-        let receive_idle_only = PolicyEngine::new(
+        let receive_idle_only = PolicyRegistry::new(
             PolicyConfig {
                 score: ScorePolicyConfig {
                     enabled: false,
@@ -2283,24 +2285,24 @@ mod tests {
             allowlist_peer_ips: vec!["10.0.0.10".to_string()],
             ..FiltersConfig::default()
         };
-        let engine = PolicyEngine::new(PolicyConfig::default(), &filters);
+        let registry = PolicyRegistry::new(PolicyConfig::default(), &filters);
 
         assert_eq!(
-            engine.classify_exemption(&test_peer()),
+            registry.classify_exemption(&test_peer()),
             Some(ExemptionReason::AllowlistedPeer)
         );
     }
 
     #[test]
     fn classifies_near_complete_exemption() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
+        let registry = PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default());
         let mut peer = test_peer();
         peer.peer.progress = 0.99;
         peer.first_seen_at = SystemTime::UNIX_EPOCH;
         peer.observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
 
         assert_eq!(
-            engine.classify_exemption(&peer),
+            registry.classify_exemption(&peer),
             Some(ExemptionReason::NearComplete {
                 progress: 0.99,
                 threshold: 0.95,
@@ -2310,7 +2312,7 @@ mod tests {
 
     #[test]
     fn classifies_grace_period_exemption() {
-        let engine = PolicyEngine::new(
+        let registry = PolicyRegistry::new(
             PolicyConfig {
                 new_peer_grace_period: Duration::from_secs(300),
                 ..PolicyConfig::default()
@@ -2318,7 +2320,7 @@ mod tests {
             &FiltersConfig::default(),
         );
 
-        match engine.classify_exemption(&test_peer()) {
+        match registry.classify_exemption(&test_peer()) {
             Some(ExemptionReason::NewPeerGracePeriod { grace_period, .. }) => {
                 assert_eq!(grace_period, Duration::from_secs(300));
             }
@@ -2328,14 +2330,14 @@ mod tests {
 
     #[test]
     fn classifies_active_ban_exemption_after_grace_period() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
+        let registry = PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default());
         let mut peer = test_peer();
         peer.first_seen_at = SystemTime::UNIX_EPOCH;
         peer.observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
         peer.has_active_ban = true;
 
         assert_eq!(
-            engine.classify_exemption(&peer),
+            registry.classify_exemption(&peer),
             Some(ExemptionReason::AlreadyBanned)
         );
     }
@@ -2389,10 +2391,10 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let baseline = engine.required_progress_delta(Duration::from_secs(120), 1_000);
-        let scaled = engine.required_progress_delta(Duration::from_secs(120), 4_000);
+        let baseline = registry.required_progress_delta(Duration::from_secs(120), 1_000);
+        let scaled = registry.required_progress_delta(Duration::from_secs(120), 4_000);
 
         assert_eq!(baseline, 0.02);
         assert_eq!(scaled, 0.005);
@@ -2406,20 +2408,20 @@ mod tests {
             score: score_policy_for_tests(300, 180, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let initial = seeded_peer(0, 0.10, 500);
-        let mut session = engine.begin_session(&initial, None);
+        let mut session = registry.begin_session(&initial, None);
 
         for offset in [120, 240] {
             let evaluation =
-                engine.evaluate_peer(&seeded_peer(offset, 0.1005, 500), Some(&session));
+                registry.evaluate_peer(&seeded_peer(offset, 0.1005, 500), Some(&session));
             assert!(evaluation.is_bad_sample);
             assert!(!evaluation.is_bannable);
             session = evaluation.session;
         }
 
-        let evaluation = engine.evaluate_peer(&seeded_peer(360, 0.1010, 500), Some(&session));
+        let evaluation = registry.evaluate_peer(&seeded_peer(360, 0.1010, 500), Some(&session));
         assert!(evaluation.is_bad_sample);
         assert!(evaluation.is_bannable);
         assert_eq!(
@@ -2437,12 +2439,12 @@ mod tests {
             score: score_policy_for_tests(60, 300, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let mut session = PeerSessionState {
-            observation_id: PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default())
+            observation_id: PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default())
                 .peer_observation_id(&seeded_peer(0, 0.10, 500)),
-            offence_identity: engine.offence_identity(&seeded_peer(0, 0.10, 500)),
+            offence_identity: registry.offence_identity(&seeded_peer(0, 0.10, 500)),
             first_seen_at: SystemTime::UNIX_EPOCH,
             last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(300),
             baseline_progress: 0.10,
@@ -2462,13 +2464,13 @@ mod tests {
             last_ban_decision_at: None,
         };
 
-        let evaluation = engine.evaluate_peer(&seeded_peer(420, 0.13, 2_000), Some(&session));
+        let evaluation = registry.evaluate_peer(&seeded_peer(420, 0.13, 2_000), Some(&session));
         assert!(!evaluation.is_bad_sample);
         assert!(!evaluation.is_bannable);
         assert_eq!(evaluation.session.bad_duration, Duration::from_secs(240));
         session = evaluation.session;
 
-        let second = engine.evaluate_peer(&seeded_peer(720, 0.20, 2_000), Some(&session));
+        let second = registry.evaluate_peer(&seeded_peer(720, 0.20, 2_000), Some(&session));
         assert_eq!(second.session.bad_duration, Duration::from_secs(90));
     }
 
@@ -2480,12 +2482,12 @@ mod tests {
             score: score_policy_for_tests(60, 300, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let mut peer = seeded_peer(120, 0.10, 500);
         let previous = PeerSessionState {
-            observation_id: engine.peer_observation_id(&peer),
-            offence_identity: engine.offence_identity(&peer),
+            observation_id: registry.peer_observation_id(&peer),
+            offence_identity: registry.offence_identity(&peer),
             first_seen_at: SystemTime::UNIX_EPOCH,
             last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
             baseline_progress: 0.10,
@@ -2508,7 +2510,7 @@ mod tests {
         peer.peer.port = 51414;
         peer.observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(240);
 
-        let resumed = engine.begin_session(&peer, Some(&previous));
+        let resumed = registry.begin_session(&peer, Some(&previous));
         assert_eq!(resumed.observation_id.peer_port, 51414);
         assert_eq!(resumed.offence_identity, previous.offence_identity);
         assert_eq!(resumed.observed_duration, Duration::from_secs(120));
@@ -2523,11 +2525,11 @@ mod tests {
             new_peer_grace_period: Duration::from_secs(300),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let initial = test_peer();
-        let session = engine.begin_session(&initial, None);
+        let session = registry.begin_session(&initial, None);
 
-        let evaluation = engine.evaluate_peer(&test_peer(), Some(&session));
+        let evaluation = registry.evaluate_peer(&test_peer(), Some(&session));
         assert!(!evaluation.is_bad_sample);
         assert!(!evaluation.is_bannable);
         assert!(matches!(
@@ -2548,14 +2550,14 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
-        let mut previous = engine
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
+        let mut previous = registry
             .evaluate_peer(&seeded_peer(120, 0.10, 500), None)
             .session;
         previous.ban_score = 3.0;
         previous.ban_score_above_threshold_duration = Duration::from_secs(120);
 
-        let evaluation = engine.evaluate_peer(&seeded_peer(180, 0.10, 0), Some(&previous));
+        let evaluation = registry.evaluate_peer(&seeded_peer(180, 0.10, 0), Some(&previous));
 
         assert!(!evaluation.is_bad_sample);
         assert!(!evaluation.is_bannable);
@@ -2574,9 +2576,9 @@ mod tests {
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
+        let evaluation = registry.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
         assert_eq!(evaluation.session.sample_count, 1);
         assert_eq!(
             evaluation.session.observed_duration,
@@ -2595,16 +2597,16 @@ mod tests {
             score: score_policy_for_tests(60, 120, 0.02),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let initial = seeded_peer(60, 0.10, 500);
-        let first = engine.evaluate_peer(
+        let first = registry.evaluate_peer(
             &seeded_peer(120, 0.111, 500),
-            Some(&engine.begin_session(&initial, None)),
+            Some(&registry.begin_session(&initial, None)),
         );
         assert!(!first.is_bad_sample);
 
-        let second = engine.evaluate_peer(&seeded_peer(180, 0.127, 500), Some(&first.session));
+        let second = registry.evaluate_peer(&seeded_peer(180, 0.127, 500), Some(&first.session));
         assert!(
             !second.is_bad_sample,
             "window progress should be sufficient even with small latest sample delta"
@@ -2619,14 +2621,14 @@ mod tests {
             score: score_policy_for_tests(300, 300, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let initial = seeded_peer(60, 0.10, 500);
-        let mut session = engine.begin_session(&initial, None);
+        let mut session = registry.begin_session(&initial, None);
         let mut final_eval = None;
         for observed_secs in [120, 180, 240, 300, 360] {
             let evaluation =
-                engine.evaluate_peer(&seeded_peer(observed_secs, 0.10, 500), Some(&session));
+                registry.evaluate_peer(&seeded_peer(observed_secs, 0.10, 500), Some(&session));
             assert!(evaluation.is_bad_sample);
             session = evaluation.session.clone();
             final_eval = Some(evaluation);
@@ -2648,11 +2650,11 @@ mod tests {
             score: score_policy_for_tests(600, 300, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
-        let evaluation = engine.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
+        let evaluation = registry.evaluate_peer(&seeded_peer(120, 0.10, 500), None);
 
         assert_eq!(
-            engine.decide_ban(&seeded_peer(120, 0.10, 500), &evaluation, &empty_history()),
+            registry.decide_ban(&seeded_peer(120, 0.10, 500), &evaluation, &empty_history()),
             BanDisposition::NotBannableYet {
                 observed_duration: Duration::from_secs(60),
                 required_observation: Duration::from_secs(600),
@@ -2670,12 +2672,12 @@ mod tests {
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
+        let evaluation = registry.evaluate_peer(&peer, None);
 
         assert_eq!(
-            engine.decide_ban(
+            registry.decide_ban(
                 &peer,
                 &evaluation,
                 &OffenceHistory {
@@ -2696,11 +2698,11 @@ mod tests {
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
+        let evaluation = registry.evaluate_peer(&peer, None);
 
-        match engine.decide_ban(
+        match registry.decide_ban(
             &peer,
             &evaluation,
             &OffenceHistory {
@@ -2730,11 +2732,11 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
+        let evaluation = registry.evaluate_peer(&peer, None);
 
-        match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+        match registry.decide_ban(&peer, &evaluation, &empty_history()) {
             BanDisposition::Ban(decision) => {
                 assert_eq!(decision.offence_number, 1);
                 assert_eq!(decision.ttl, Duration::from_secs(300));
@@ -2753,11 +2755,11 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
+        let evaluation = registry.evaluate_peer(&peer, None);
 
-        match engine.decide_ban(
+        match registry.decide_ban(
             &peer,
             &evaluation,
             &OffenceHistory {
@@ -2779,12 +2781,12 @@ mod tests {
             new_peer_grace_period: Duration::from_secs(300),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = test_peer();
-        let evaluation = engine.evaluate_peer(&peer, None);
+        let evaluation = registry.evaluate_peer(&peer, None);
 
         assert!(matches!(
-            engine.decide_ban(&peer, &evaluation, &empty_history()),
+            registry.decide_ban(&peer, &evaluation, &empty_history()),
             BanDisposition::Exempt(ExemptionReason::NewPeerGracePeriod { .. })
         ));
     }
@@ -2796,20 +2798,20 @@ mod tests {
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
-        let first_session = match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+        let evaluation = registry.evaluate_peer(&peer, None);
+        let first_session = match registry.decide_ban(&peer, &evaluation, &empty_history()) {
             BanDisposition::Ban(_) => {
-                engine.record_ban_decision(&evaluation.session, peer.observed_at)
+                registry.record_ban_decision(&evaluation.session, peer.observed_at)
             }
             other => panic!("expected ban decision, got {other:?}"),
         };
 
         let next_peer = seeded_peer(240, 0.10, 500);
-        let next_evaluation = engine.evaluate_peer(&next_peer, Some(&first_session));
+        let next_evaluation = registry.evaluate_peer(&next_peer, Some(&first_session));
         assert_eq!(
-            engine.decide_ban(&next_peer, &next_evaluation, &empty_history()),
+            registry.decide_ban(&next_peer, &next_evaluation, &empty_history()),
             BanDisposition::DuplicateSuppressed
         );
     }
@@ -2825,23 +2827,23 @@ mod tests {
             score,
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
         let peer = seeded_peer(180, 0.10, 500);
-        let evaluation = engine.evaluate_peer(&peer, None);
-        let banned_session = engine.record_ban_decision(&evaluation.session, peer.observed_at);
+        let evaluation = registry.evaluate_peer(&peer, None);
+        let banned_session = registry.record_ban_decision(&evaluation.session, peer.observed_at);
 
         let recovered_peer = seeded_peer(420, 0.20, 5_000);
-        let recovered = engine.evaluate_peer(&recovered_peer, Some(&banned_session));
+        let recovered = registry.evaluate_peer(&recovered_peer, Some(&banned_session));
         assert!(matches!(
-            engine.decide_ban(&recovered_peer, &recovered, &empty_history()),
+            registry.decide_ban(&recovered_peer, &recovered, &empty_history()),
             BanDisposition::NotBannableYet { .. }
         ));
         assert_eq!(recovered.session.last_ban_decision_at, None);
 
         let relapsed_peer = seeded_peer(540, 0.20, 500);
-        let relapsed = engine.evaluate_peer(&relapsed_peer, Some(&recovered.session));
+        let relapsed = registry.evaluate_peer(&relapsed_peer, Some(&recovered.session));
         assert!(matches!(
-            engine.decide_ban(
+            registry.decide_ban(
                 &relapsed_peer,
                 &relapsed,
                 &OffenceHistory {
@@ -2861,14 +2863,14 @@ mod tests {
             score: score_policy_for_tests(180, 120, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let mut session = None;
         let mut final_disposition = None;
         for (observed_secs, progress) in [(60, 0.10), (120, 0.1005), (180, 0.1010), (240, 0.1015)] {
             let peer = seeded_peer(observed_secs, progress, 500);
-            let evaluation = engine.evaluate_peer(&peer, session.as_ref());
-            final_disposition = Some(engine.decide_ban(&peer, &evaluation, &empty_history()));
+            let evaluation = registry.evaluate_peer(&peer, session.as_ref());
+            final_disposition = Some(registry.decide_ban(&peer, &evaluation, &empty_history()));
             session = Some(evaluation.session);
         }
 
@@ -2883,18 +2885,18 @@ mod tests {
             score: score_policy_for_tests(180, 120, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let first = seeded_peer(120, 0.10, 500);
-        let first_eval = engine.evaluate_peer(&first, None);
+        let first_eval = registry.evaluate_peer(&first, None);
         assert!(matches!(
-            engine.decide_ban(&first, &first_eval, &empty_history()),
+            registry.decide_ban(&first, &first_eval, &empty_history()),
             BanDisposition::NotBannableYet { .. }
         ));
 
         let mut reconnected = seeded_peer(240, 0.1005, 500);
         reconnected.peer.port = 51414;
-        let second_eval = engine.evaluate_peer(&reconnected, Some(&first_eval.session));
+        let second_eval = registry.evaluate_peer(&reconnected, Some(&first_eval.session));
 
         assert_eq!(second_eval.session.observation_id.peer_port, 51414);
         assert_eq!(
@@ -2902,7 +2904,7 @@ mod tests {
             first_eval.session.first_seen_at
         );
         assert!(matches!(
-            engine.decide_ban(&reconnected, &second_eval, &empty_history()),
+            registry.decide_ban(&reconnected, &second_eval, &empty_history()),
             BanDisposition::Ban(_)
         ));
     }
@@ -2915,13 +2917,13 @@ mod tests {
             score: churn_enabled_score_policy_for_tests(),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
+        let first = registry.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
 
         let mut second_peer = seeded_peer(180, 0.10, 1);
         second_peer.peer.port = 51414;
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
         assert!(second.is_bad_sample);
         assert_eq!(second.session.churn_reconnect_count, 1);
         assert!((second.session.churn_amplifier - 0.0).abs() < 0.0001);
@@ -2929,7 +2931,7 @@ mod tests {
 
         let mut third_peer = seeded_peer(240, 0.10, 1);
         third_peer.peer.port = 51415;
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
         assert!(third.is_bad_sample);
         assert_eq!(third.session.churn_reconnect_count, 2);
         assert!((third.session.churn_amplifier - 0.3).abs() < 0.0001);
@@ -2939,7 +2941,7 @@ mod tests {
 
         let mut fourth_peer = seeded_peer(300, 0.10, 1);
         fourth_peer.peer.port = 51416;
-        let fourth = engine.evaluate_peer(&fourth_peer, Some(&third.session));
+        let fourth = registry.evaluate_peer(&fourth_peer, Some(&third.session));
         assert!(fourth.is_bad_sample);
         assert_eq!(fourth.session.churn_reconnect_count, 3);
         assert!((fourth.session.churn_amplifier - 0.6).abs() < 0.0001);
@@ -2956,21 +2958,21 @@ mod tests {
             score: churn_enabled_score_policy_for_tests(),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(120, 0.10, 10_000), None);
+        let first = registry.evaluate_peer(&seeded_peer(120, 0.10, 10_000), None);
         assert!(!first.is_bad_sample);
 
         let mut second_peer = seeded_peer(180, 0.12, 10_000);
         second_peer.peer.port = 51414;
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
         assert!(!second.is_bad_sample);
         assert_eq!(second.session.churn_reconnect_count, 1);
         assert!((second.session.churn_amplifier - 0.0).abs() < 0.0001);
 
         let mut third_peer = seeded_peer(240, 0.14, 10_000);
         third_peer.peer.port = 51415;
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
         assert!(!third.is_bad_sample);
         assert_eq!(third.session.churn_reconnect_count, 2);
         assert!((third.session.churn_amplifier - 0.0).abs() < 0.0001);
@@ -2997,11 +2999,11 @@ mod tests {
             score,
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let previous = PeerSessionState {
-            observation_id: engine.peer_observation_id(&seeded_peer(120, 0.10, 900)),
-            offence_identity: engine.offence_identity(&seeded_peer(120, 0.10, 900)),
+            observation_id: registry.peer_observation_id(&seeded_peer(120, 0.10, 900)),
+            offence_identity: registry.offence_identity(&seeded_peer(120, 0.10, 900)),
             first_seen_at: SystemTime::UNIX_EPOCH,
             last_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
             baseline_progress: 0.10,
@@ -3023,7 +3025,7 @@ mod tests {
 
         let mut peer = seeded_peer(180, 0.108, 900);
         peer.peer.port = 51414;
-        let evaluation = engine.evaluate_peer(&peer, Some(&previous));
+        let evaluation = registry.evaluate_peer(&peer, Some(&previous));
 
         assert!(evaluation.is_bad_sample);
         assert!((evaluation.sample_score_risk - 0.2).abs() < 0.0001);
@@ -3044,18 +3046,18 @@ mod tests {
             score,
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
+        let first = registry.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
 
         let mut second_peer = seeded_peer(180, 0.10, 1);
         second_peer.peer.port = 51414;
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
         assert!((second.session.churn_amplifier - 0.5).abs() < 0.0001);
 
         let mut third_peer = seeded_peer(240, 0.10, 1);
         third_peer.peer.port = 51415;
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
         assert!((third.session.churn_amplifier - 0.5).abs() < 0.0001);
     }
 
@@ -3070,18 +3072,18 @@ mod tests {
             score,
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
+        let first = registry.evaluate_peer(&seeded_peer(120, 0.10, 1), None);
 
         let mut second_peer = seeded_peer(180, 0.10, 1);
         second_peer.peer.port = 51414;
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
         assert!(second.session.churn_amplifier > 0.0);
 
         let mut exempt_peer = seeded_peer(240, 0.99, 1);
         exempt_peer.peer.port = 51415;
-        let exempt = engine.evaluate_peer(&exempt_peer, Some(&second.session));
+        let exempt = registry.evaluate_peer(&exempt_peer, Some(&second.session));
 
         assert!(matches!(
             exempt.session.last_exemption_reason,
@@ -3097,14 +3099,14 @@ mod tests {
             decay_window: Duration::from_secs(600),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let peer = seeded_peer(240, 0.1015, 500);
-        let initial = engine.evaluate_peer(&peer, None);
-        let banned_session = engine.record_ban_decision(&initial.session, peer.observed_at);
+        let initial = registry.evaluate_peer(&peer, None);
+        let banned_session = registry.record_ban_decision(&initial.session, peer.observed_at);
 
         let recovered_peer = seeded_peer(1140, 0.20, 5_000);
-        let recovered = engine.evaluate_peer(&recovered_peer, Some(&banned_session));
+        let recovered = registry.evaluate_peer(&recovered_peer, Some(&banned_session));
 
         assert!(!recovered.is_bad_sample);
         assert!(!recovered.is_bannable);
@@ -3139,9 +3141,9 @@ mod tests {
         ];
 
         for (name, filters, peer, expected) in cases {
-            let engine = PolicyEngine::new(PolicyConfig::default(), &filters);
-            let evaluation = engine.evaluate_peer(&peer, None);
-            match engine.decide_ban(&peer, &evaluation, &empty_history()) {
+            let registry = PolicyRegistry::new(PolicyConfig::default(), &filters);
+            let evaluation = registry.evaluate_peer(&peer, None);
+            match registry.decide_ban(&peer, &evaluation, &empty_history()) {
                 BanDisposition::Exempt(reason) => assert_eq!(reason, expected, "{name}"),
                 other => panic!("expected exemption for {name}, got {other:?}"),
             }
@@ -3150,18 +3152,18 @@ mod tests {
 
     #[test]
     fn receive_idle_bans_after_sustained_zero_upload_progress() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
         let first_peer = seeded_peer_with_uploaded(180, 0);
-        let first = engine.evaluate_receive_idle_peer(&first_peer, None);
+        let first = registry.evaluate_receive_idle_peer(&first_peer, None);
         assert!(!first.is_bad_sample);
         assert!(!first.is_bannable);
 
         let second_peer = seeded_peer_with_uploaded(240, 0);
-        let second = engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
         assert!(second.is_bad_sample);
         assert!(second.is_bannable);
 
-        match engine.decide_receive_idle_ban(&second_peer, &second, &empty_history()) {
+        match registry.decide_receive_idle_ban(&second_peer, &second, &empty_history()) {
             BanDisposition::Ban(decision) => {
                 assert_eq!(decision.reason_code, "receive_idle");
                 assert_eq!(decision.ttl, Duration::from_secs(600));
@@ -3173,21 +3175,21 @@ mod tests {
 
     #[test]
     fn receive_idle_accumulates_across_same_port_polls() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
-        let second = engine
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = registry
             .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(210, 0), Some(&first.session));
         assert!(second.is_bad_sample);
         assert_eq!(second.session.bad_duration, Duration::from_secs(30));
         assert!(!second.is_bannable);
 
         let third_peer = seeded_peer_with_uploaded(240, 0);
-        let third = engine.evaluate_receive_idle_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_receive_idle_peer(&third_peer, Some(&second.session));
         assert!(third.is_bad_sample);
         assert_eq!(third.session.bad_duration, Duration::from_secs(60));
         assert!(third.is_bannable);
 
-        match engine.decide_receive_idle_ban(&third_peer, &third, &empty_history()) {
+        match registry.decide_receive_idle_ban(&third_peer, &third, &empty_history()) {
             BanDisposition::Ban(decision) => assert_eq!(decision.reason_code, "receive_idle"),
             other => panic!("expected receive idle ban, got {other:?}"),
         }
@@ -3195,12 +3197,12 @@ mod tests {
 
     #[test]
     fn receive_idle_rejects_incompatible_session_payload_version() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
         let mut previous = first.session.clone();
         previous.policy_version = "policy-v2".to_string();
 
-        let policy = engine.receive_idle_policy();
+        let policy = registry.receive_idle_policy();
         let history = empty_history();
         let peer = seeded_peer_with_uploaded(210, 0);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
@@ -3217,12 +3219,12 @@ mod tests {
 
     #[test]
     fn receive_idle_rejects_incompatible_session_policy_name() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
         let mut previous = first.session.clone();
         previous.policy_name = SCORE_POLICY_NAME.to_string();
 
-        let policy = engine.receive_idle_policy();
+        let policy = registry.receive_idle_policy();
         let history = empty_history();
         let peer = seeded_peer_with_uploaded(210, 0);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
@@ -3238,21 +3240,21 @@ mod tests {
     }
 
     #[test]
-    fn score_policy_preserves_engine_decision_and_state_summary() {
+    fn score_policy_preserves_registry_decision_and_state_summary() {
         let config = PolicyConfig {
             new_peer_grace_period: Duration::from_secs(1),
             score: score_policy_for_tests(60, 30, 0.01),
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
-        let policy = engine.score_policy();
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
+        let policy = registry.score_policy();
         let peer = seeded_peer(180, 0.10, 500);
         let history = OffenceHistory {
             offence_count: 2,
             last_ban_expires_at: None,
         };
-        let direct_evaluation = engine.evaluate_peer(&peer, None);
-        let direct_disposition = engine.decide_ban(&peer, &direct_evaluation, &history);
+        let direct_evaluation = registry.evaluate_peer(&peer, None);
+        let direct_disposition = registry.decide_ban(&peer, &direct_evaluation, &history);
         let policy_assessment = policy
             .assess_peer(PeerPolicyInput {
                 peer: &peer,
@@ -3286,10 +3288,10 @@ mod tests {
 
     #[test]
     fn score_policy_rejects_incompatible_session_snapshot() {
-        let engine = PolicyEngine::new(PolicyConfig::default(), &FiltersConfig::default());
-        let policy = engine.score_policy();
+        let registry = PolicyRegistry::new(PolicyConfig::default(), &FiltersConfig::default());
+        let policy = registry.score_policy();
         let peer = seeded_peer(180, 0.10, 500);
-        let previous = engine.begin_receive_idle_session(&peer, None);
+        let previous = registry.begin_receive_idle_session(&peer, None);
         let previous = ReceiveIdleSessionSnapshot { session: previous };
         let history = empty_history();
         let error = policy
@@ -3304,17 +3306,17 @@ mod tests {
     }
 
     #[test]
-    fn receive_idle_policy_preserves_engine_decision_and_state_summary() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let policy = engine.receive_idle_policy();
+    fn receive_idle_policy_preserves_registry_decision_and_state_summary() {
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let policy = registry.receive_idle_policy();
         let first_peer = seeded_peer_with_uploaded(180, 0);
-        let first = engine.evaluate_receive_idle_peer(&first_peer, None);
+        let first = registry.evaluate_receive_idle_peer(&first_peer, None);
         let second_peer = seeded_peer_with_uploaded(240, 0);
         let history = empty_history();
         let direct_evaluation =
-            engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
+            registry.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
         let direct_disposition =
-            engine.decide_receive_idle_ban(&second_peer, &direct_evaluation, &history);
+            registry.decide_receive_idle_ban(&second_peer, &direct_evaluation, &history);
         let previous = ReceiveIdleSessionSnapshot {
             session: first.session,
         };
@@ -3351,14 +3353,14 @@ mod tests {
 
     #[test]
     fn receive_idle_does_not_count_absent_gap_as_idle_time() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
-        let second = engine
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = registry
             .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(210, 0), Some(&first.session));
         assert_eq!(second.session.bad_duration, Duration::from_secs(30));
 
         let returned_peer = seeded_peer_with_uploaded(600, 0);
-        let returned = engine.evaluate_receive_idle_peer(&returned_peer, Some(&second.session));
+        let returned = registry.evaluate_receive_idle_peer(&returned_peer, Some(&second.session));
 
         assert!(!returned.is_bad_sample);
         assert_eq!(returned.session.bad_duration, Duration::ZERO);
@@ -3367,13 +3369,13 @@ mod tests {
 
     #[test]
     fn receive_idle_resets_on_uploaded_byte_progress() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
-        let second = engine
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = registry
             .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(240, 0), Some(&first.session));
         assert!(second.is_bad_sample);
 
-        let third = engine
+        let third = registry
             .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(300, 1), Some(&second.session));
         assert!(!third.is_bad_sample);
         assert_eq!(third.session.bad_duration, Duration::ZERO);
@@ -3382,14 +3384,14 @@ mod tests {
 
     #[test]
     fn receive_idle_missing_uploaded_bytes_is_not_bannable() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
         let mut first_peer = seeded_peer_with_uploaded(180, 0);
         first_peer.peer.uploaded_bytes = None;
-        let first = engine.evaluate_receive_idle_peer(&first_peer, None);
+        let first = registry.evaluate_receive_idle_peer(&first_peer, None);
 
         let mut second_peer = seeded_peer_with_uploaded(240, 0);
         second_peer.peer.uploaded_bytes = None;
-        let second = engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
 
         assert_eq!(second.uploaded_delta_bytes, None);
         assert!(!second.is_bad_sample);
@@ -3398,16 +3400,16 @@ mod tests {
 
     #[test]
     fn receive_idle_uses_policy_specific_reban_cooldown() {
-        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
-        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let registry = PolicyRegistry::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = registry.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
         let peer = seeded_peer_with_uploaded(240, 0);
-        let evaluation = engine.evaluate_receive_idle_peer(&peer, Some(&first.session));
+        let evaluation = registry.evaluate_receive_idle_peer(&peer, Some(&first.session));
         let history = OffenceHistory {
             offence_count: 1,
             last_ban_expires_at: Some(peer.observed_at - Duration::from_secs(300)),
         };
 
-        match engine.decide_receive_idle_ban(&peer, &evaluation, &history) {
+        match registry.decide_receive_idle_ban(&peer, &evaluation, &history) {
             BanDisposition::RebanCooldown { remaining } => {
                 assert_eq!(remaining, Duration::from_secs(300));
             }
@@ -3494,18 +3496,18 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let first_peer = seeded_peer(120, 0.10, 1);
-        let first = engine.evaluate_peer(&first_peer, None);
+        let first = registry.evaluate_peer(&first_peer, None);
         assert!(matches!(
-            engine.decide_ban(&first_peer, &first, &empty_history()),
+            registry.decide_ban(&first_peer, &first, &empty_history()),
             BanDisposition::NotBannableYet { .. }
         ));
 
         let second_peer = seeded_peer(180, 0.10, 1);
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
-        match engine.decide_ban(&second_peer, &second, &empty_history()) {
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
+        match registry.decide_ban(&second_peer, &second, &empty_history()) {
             BanDisposition::Ban(decision) => {
                 assert_eq!(decision.reason_code, "score_based");
                 assert!(decision.reason_details.contains("score peer"));
@@ -3534,16 +3536,16 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(60, 0.10, 1), None);
-        let second = engine.evaluate_peer(&seeded_peer(120, 0.106, 1), Some(&first.session));
+        let first = registry.evaluate_peer(&seeded_peer(60, 0.10, 1), None);
+        let second = registry.evaluate_peer(&seeded_peer(120, 0.106, 1), Some(&first.session));
         let third_peer = seeded_peer(180, 0.112, 1);
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
 
         assert!(third.session.ban_score < 0.1);
         assert!(matches!(
-            engine.decide_ban(&third_peer, &third, &empty_history()),
+            registry.decide_ban(&third_peer, &third, &empty_history()),
             BanDisposition::NotBannableYet { .. }
         ));
     }
@@ -3568,20 +3570,20 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
         let first_peer = seeded_peer(61, 0.10, 1);
-        let first = engine.evaluate_peer(&first_peer, None);
+        let first = registry.evaluate_peer(&first_peer, None);
         assert!((first.sample_score_risk - 1.0).abs() < 0.0001);
 
         let second_peer = seeded_peer(121, 0.106, 1);
-        let second = engine.evaluate_peer(&second_peer, Some(&first.session));
+        let second = registry.evaluate_peer(&second_peer, Some(&first.session));
         assert!(second.sample_score_risk > 0.59);
         assert!(second.sample_score_risk < 0.6);
 
         let third_peer = seeded_peer(181, 0.112, 1);
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
-        match engine.decide_ban(&third_peer, &third, &empty_history()) {
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
+        match registry.decide_ban(&third_peer, &third, &empty_history()) {
             BanDisposition::Ban(decision) => assert_eq!(decision.reason_code, "score_based"),
             other => panic!("expected score-based ban, got {other:?}"),
         }
@@ -3610,16 +3612,16 @@ mod tests {
             },
             ..PolicyConfig::default()
         };
-        let engine = PolicyEngine::new(config, &FiltersConfig::default());
+        let registry = PolicyRegistry::new(config, &FiltersConfig::default());
 
-        let first = engine.evaluate_peer(&seeded_peer(60, 0.10, 4_000), None);
-        let second = engine.evaluate_peer(&seeded_peer(120, 0.104, 4_000), Some(&first.session));
+        let first = registry.evaluate_peer(&seeded_peer(60, 0.10, 4_000), None);
+        let second = registry.evaluate_peer(&seeded_peer(120, 0.104, 4_000), Some(&first.session));
         let third_peer = seeded_peer(180, 0.108, 4_000);
-        let third = engine.evaluate_peer(&third_peer, Some(&second.session));
+        let third = registry.evaluate_peer(&third_peer, Some(&second.session));
 
         assert!(third.sample_score_risk.abs() < f64::EPSILON);
         assert!(matches!(
-            engine.decide_ban(&third_peer, &third, &empty_history()),
+            registry.decide_ban(&third_peer, &third, &empty_history()),
             BanDisposition::NotBannableYet { .. }
         ));
     }
