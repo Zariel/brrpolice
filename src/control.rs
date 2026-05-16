@@ -35,6 +35,7 @@ macro_rules! log_peer_decision {
     ) => {
         $log!(
             state = $state,
+            policy_name = SCORE_POLICY_NAME,
             torrent_hash = %$torrent.hash,
             torrent_name = %$torrent.name,
             torrent_tracker = %$torrent_tracker,
@@ -71,6 +72,7 @@ macro_rules! log_ban_action {
     ) => {
         $log!(
             state = $state,
+            policy_name = %$action.policy_name,
             torrent_hash = %$action.torrent_hash,
             torrent_name = %$action.torrent_name,
             torrent_tracker = %$action.torrent_tracker,
@@ -91,6 +93,38 @@ macro_rules! log_ban_action {
             selected_ban_ttl_seconds = $action.decision.ttl.as_secs(),
             reason_code = %$action.decision.reason_code,
             reason_details = %$action.decision.reason_details,
+            $( $extra_key = $extra_value, )*
+            $message
+        );
+    };
+}
+
+macro_rules! log_receive_idle_decision {
+    (
+        $log:ident,
+        $message:literal,
+        $state:expr,
+        $torrent:expr,
+        $torrent_tracker:expr,
+        $peer:expr,
+        $evaluation:expr,
+        $observed_at_rfc3339:expr
+        $(, $extra_key:ident = $extra_value:expr )* $(,)?
+    ) => {
+        $log!(
+            state = $state,
+            policy_name = RECEIVE_IDLE_POLICY_NAME,
+            torrent_hash = %$torrent.hash,
+            torrent_name = %$torrent.name,
+            torrent_tracker = %$torrent_tracker,
+            peer_ip = %$peer.peer.ip,
+            peer_port = $peer.peer.port,
+            observed_at = %$observed_at_rfc3339,
+            idle_seconds = $evaluation.session.bad_duration.as_secs(),
+            observed_seconds = $evaluation.session.observed_duration.as_secs(),
+            current_upload_rate_bps = $evaluation.session.last_upload_rate_bps,
+            uploaded_delta_bytes = ?$evaluation.uploaded_delta_bytes,
+            sample_count = $evaluation.session.sample_count,
             $( $extra_key = $extra_value, )*
             $message
         );
@@ -466,7 +500,10 @@ impl ControlLoop {
                 let evaluation = self
                     .policy
                     .evaluate_peer(&peer_context, existing.as_ref().or(carryover.as_ref()));
-                self.metrics.record_peer_evaluated(evaluation.is_bad_sample);
+                self.metrics
+                    .record_peer_evaluated(SCORE_POLICY_NAME, evaluation.is_bad_sample);
+                self.metrics
+                    .record_policy_evaluation(SCORE_POLICY_NAME, evaluation.is_bannable);
                 self.metrics.record_score_evaluation(
                     evaluation.session.ban_score,
                     evaluation.sample_score_risk,
@@ -477,7 +514,8 @@ impl ControlLoop {
                     .persistence
                     .load_offence_history(&evaluation.session.offence_identity)
                     .await?;
-                let peer_key = peer_log_state_key(&evaluation.session.offence_identity);
+                let peer_key =
+                    peer_log_state_key(SCORE_POLICY_NAME, &evaluation.session.offence_identity);
                 seen_peer_keys.insert(peer_key.clone());
 
                 let receive_existing = self
@@ -506,6 +544,14 @@ impl ControlLoop {
                     &peer_context,
                     receive_existing.as_ref().or(receive_carryover.as_ref()),
                 );
+                self.metrics.record_peer_evaluated(
+                    RECEIVE_IDLE_POLICY_NAME,
+                    receive_evaluation.is_bad_sample,
+                );
+                self.metrics.record_policy_evaluation(
+                    RECEIVE_IDLE_POLICY_NAME,
+                    receive_evaluation.is_bannable,
+                );
                 let receive_history = self
                     .persistence
                     .load_policy_offence_history(
@@ -513,30 +559,50 @@ impl ControlLoop {
                         &receive_evaluation.session.offence_identity,
                     )
                     .await?;
+                let receive_peer_key = peer_log_state_key(
+                    RECEIVE_IDLE_POLICY_NAME,
+                    &receive_evaluation.session.offence_identity,
+                );
+                seen_peer_keys.insert(receive_peer_key.clone());
                 match self.policy.decide_receive_idle_ban(
                     &peer_context,
                     &receive_evaluation,
                     &receive_history,
                 ) {
                     BanDisposition::Ban(decision) => {
-                        self.metrics.record_policy_ban_decision();
-                        info!(
-                            state = "ban_pending",
-                            torrent_hash = %torrent.hash,
-                            torrent_name = %torrent.name,
-                            torrent_tracker = %torrent_tracker,
-                            peer_ip = %peer.peer.ip,
-                            peer_port = peer.peer.port,
+                        self.metrics
+                            .record_policy_ban_decision(RECEIVE_IDLE_POLICY_NAME);
+                        let state = PeerDecisionLogState::BanPending;
+                        log_receive_idle_decision!(
+                            info,
+                            "peer policy update",
+                            "ban_pending",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            receive_evaluation,
+                            observed_at_rfc3339,
                             offence_number = decision.offence_number,
-                            observed_at = %observed_at_rfc3339,
-                            bad_time_seconds = receive_evaluation.session.bad_duration.as_secs(),
-                            observed_duration_seconds = receive_evaluation.session.observed_duration.as_secs(),
-                            sample_count = receive_evaluation.session.sample_count,
                             selected_ban_ttl_seconds = decision.ttl.as_secs(),
                             reason_code = decision.reason_code.as_str(),
-                            reason_details = decision.reason_details.as_str(),
-                            "peer policy update"
+                            reason_details = decision.reason_details.as_str()
                         );
+                        if self.should_log_peer_decision_state_change(&receive_peer_key, state) {
+                            log_receive_idle_decision!(
+                                warn,
+                                "peer ban pending decision",
+                                "ban_pending",
+                                torrent,
+                                torrent_tracker,
+                                peer,
+                                receive_evaluation,
+                                observed_at_rfc3339,
+                                offence_number = decision.offence_number,
+                                selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                                reason_code = decision.reason_code.as_str(),
+                                reason_details = decision.reason_details.as_str()
+                            );
+                        }
                         let pending_intent = PendingBanIntentRecord {
                             torrent_hash: torrent.hash.clone(),
                             peer_ip: decision.peer_ip,
@@ -567,10 +633,153 @@ impl ControlLoop {
                             pending_intent,
                         });
                     }
-                    BanDisposition::Exempt(_)
-                    | BanDisposition::NotBannableYet { .. }
-                    | BanDisposition::RebanCooldown { .. }
-                    | BanDisposition::DuplicateSuppressed => {
+                    BanDisposition::Exempt(reason) => {
+                        self.metrics
+                            .record_policy_exemption_decision(RECEIVE_IDLE_POLICY_NAME);
+                        let state = PeerDecisionLogState::Exempt {
+                            reason_code: exemption_reason_code(&reason),
+                        };
+                        log_receive_idle_decision!(
+                            info,
+                            "peer policy update",
+                            "exempt",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            receive_evaluation,
+                            observed_at_rfc3339,
+                            exemption_reason = format!("{reason:?}")
+                        );
+                        if self.should_log_peer_decision_state_change(&receive_peer_key, state) {
+                            log_receive_idle_decision!(
+                                warn,
+                                "peer exemption decision",
+                                "exempt",
+                                torrent,
+                                torrent_tracker,
+                                peer,
+                                receive_evaluation,
+                                observed_at_rfc3339,
+                                exemption_reason = format!("{reason:?}")
+                            );
+                        }
+                        self.persistence
+                            .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                    BanDisposition::NotBannableYet {
+                        observed_duration,
+                        required_observation,
+                        bad_duration,
+                        required_bad_duration,
+                    } => {
+                        self.metrics
+                            .record_policy_not_bannable_decision(RECEIVE_IDLE_POLICY_NAME);
+                        let unmet_observation_guardrail = observed_duration < required_observation;
+                        let unmet_sustain_guardrail = bad_duration < required_bad_duration;
+                        let state = PeerDecisionLogState::NotBannableYet {
+                            score_threshold_met: receive_evaluation.is_bad_sample,
+                            unmet_observation_guardrail,
+                            unmet_sustain_guardrail,
+                        };
+                        log_receive_idle_decision!(
+                            info,
+                            "peer policy update",
+                            "not_bannable",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            receive_evaluation,
+                            observed_at_rfc3339,
+                            required_observation_seconds = required_observation.as_secs(),
+                            required_bad_duration_seconds = required_bad_duration.as_secs(),
+                            is_bad_sample = receive_evaluation.is_bad_sample,
+                            unmet_observation_guardrail = unmet_observation_guardrail,
+                            unmet_sustain_guardrail = unmet_sustain_guardrail
+                        );
+                        if self.should_log_peer_decision_state_change(&receive_peer_key, state) {
+                            log_receive_idle_decision!(
+                                warn,
+                                "peer not bannable yet decision",
+                                "not_bannable",
+                                torrent,
+                                torrent_tracker,
+                                peer,
+                                receive_evaluation,
+                                observed_at_rfc3339,
+                                required_observation_seconds = required_observation.as_secs(),
+                                required_bad_duration_seconds = required_bad_duration.as_secs(),
+                                is_bad_sample = receive_evaluation.is_bad_sample,
+                                unmet_observation_guardrail = unmet_observation_guardrail,
+                                unmet_sustain_guardrail = unmet_sustain_guardrail
+                            );
+                        }
+                        self.persistence
+                            .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                    BanDisposition::RebanCooldown { remaining } => {
+                        self.metrics
+                            .record_policy_reban_cooldown_decision(RECEIVE_IDLE_POLICY_NAME);
+                        log_receive_idle_decision!(
+                            info,
+                            "peer policy update",
+                            "reban_cooldown",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            receive_evaluation,
+                            observed_at_rfc3339,
+                            reban_cooldown_remaining_seconds = remaining.as_secs()
+                        );
+                        if self.should_log_peer_decision_state_change(
+                            &receive_peer_key,
+                            PeerDecisionLogState::RebanCooldown,
+                        ) {
+                            log_receive_idle_decision!(
+                                warn,
+                                "peer reban cooldown decision",
+                                "reban_cooldown",
+                                torrent,
+                                torrent_tracker,
+                                peer,
+                                receive_evaluation,
+                                observed_at_rfc3339,
+                                reban_cooldown_remaining_seconds = remaining.as_secs()
+                            );
+                        }
+                        self.persistence
+                            .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                    BanDisposition::DuplicateSuppressed => {
+                        self.metrics
+                            .record_policy_duplicate_suppressed_decision(RECEIVE_IDLE_POLICY_NAME);
+                        log_receive_idle_decision!(
+                            info,
+                            "peer policy update",
+                            "duplicate_suppressed",
+                            torrent,
+                            torrent_tracker,
+                            peer,
+                            receive_evaluation,
+                            observed_at_rfc3339
+                        );
+                        if self.should_log_peer_decision_state_change(
+                            &receive_peer_key,
+                            PeerDecisionLogState::DuplicateSuppressed,
+                        ) {
+                            log_receive_idle_decision!(
+                                warn,
+                                "peer duplicate ban suppression decision",
+                                "duplicate_suppressed",
+                                torrent,
+                                torrent_tracker,
+                                peer,
+                                receive_evaluation,
+                                observed_at_rfc3339
+                            );
+                        }
                         self.persistence
                             .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
                             .await?;
@@ -579,7 +788,7 @@ impl ControlLoop {
 
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
-                        self.metrics.record_policy_ban_decision();
+                        self.metrics.record_policy_ban_decision(SCORE_POLICY_NAME);
                         let state = PeerDecisionLogState::BanPending;
                         log_peer_decision!(
                             info,
@@ -648,7 +857,8 @@ impl ControlLoop {
                         });
                     }
                     BanDisposition::Exempt(reason) => {
-                        self.metrics.record_policy_exemption_decision();
+                        self.metrics
+                            .record_policy_exemption_decision(SCORE_POLICY_NAME);
                         let state = PeerDecisionLogState::Exempt {
                             reason_code: exemption_reason_code(&reason),
                         };
@@ -692,7 +902,8 @@ impl ControlLoop {
                             evaluation.session.ban_score >= self.config.policy.score.ban_threshold;
                         let unmet_observation_guardrail = observed_duration < required_observation;
                         let unmet_sustain_guardrail = bad_duration < required_bad_duration;
-                        self.metrics.record_policy_not_bannable_decision();
+                        self.metrics
+                            .record_policy_not_bannable_decision(SCORE_POLICY_NAME);
                         let state = PeerDecisionLogState::NotBannableYet {
                             score_threshold_met,
                             unmet_observation_guardrail,
@@ -743,7 +954,8 @@ impl ControlLoop {
                             .await?;
                     }
                     BanDisposition::RebanCooldown { remaining } => {
-                        self.metrics.record_policy_reban_cooldown_decision();
+                        self.metrics
+                            .record_policy_reban_cooldown_decision(SCORE_POLICY_NAME);
                         log_peer_decision!(
                             info,
                             "peer policy update",
@@ -778,7 +990,8 @@ impl ControlLoop {
                             .await?;
                     }
                     BanDisposition::DuplicateSuppressed => {
-                        self.metrics.record_policy_duplicate_suppressed_decision();
+                        self.metrics
+                            .record_policy_duplicate_suppressed_decision(SCORE_POLICY_NAME);
                         log_peer_decision!(
                             info,
                             "peer policy update",
@@ -950,6 +1163,7 @@ impl ControlLoop {
             if !stored.duplicate_suppressed {
                 ban_count += 1;
                 self.metrics.record_ban_applied(
+                    &action.policy_name,
                     action.evaluation.bad_duration(),
                     &action.decision.reason_code,
                 );
@@ -1099,6 +1313,7 @@ impl ControlLoop {
             if intent.ban_expires_at <= recovered_at {
                 debug!(
                     torrent_hash = %intent.torrent_hash,
+                    policy_name = %intent.policy_name,
                     peer_ip = %intent.peer_ip,
                     peer_port = intent.peer_port,
                     offence_number = intent.offence_number,
@@ -1126,6 +1341,7 @@ impl ControlLoop {
                         );
                         warn!(
                             torrent_hash = %intent.torrent_hash,
+                            policy_name = %intent.policy_name,
                             peer_ip = %intent.peer_ip,
                             peer_port = intent.peer_port,
                             offence_number = intent.offence_number,
@@ -1147,6 +1363,7 @@ impl ControlLoop {
                         failed += 1;
                         warn!(
                             torrent_hash = %intent.torrent_hash,
+                            policy_name = %intent.policy_name,
                             peer_ip = %intent.peer_ip,
                             peer_port = intent.peer_port,
                             offence_number = intent.offence_number,
@@ -1348,12 +1565,16 @@ impl ControlLoop {
             active_bans.push(active_ban);
         }
         if !stored.duplicate_suppressed {
-            self.metrics
-                .record_ban_applied(intent.bad_duration, &intent.reason_code);
+            self.metrics.record_ban_applied(
+                &intent.policy_name,
+                intent.bad_duration,
+                &intent.reason_code,
+            );
         }
 
         warn!(
             torrent_hash = %intent.torrent_hash,
+            policy_name = %intent.policy_name,
             peer_ip = %intent.peer_ip,
             peer_port = intent.peer_port,
             offence_number = intent.offence_number,
@@ -1397,6 +1618,7 @@ impl ControlLoop {
                 self.metrics.record_prune_success(
                     duration,
                     pruned.peer_sessions_deleted,
+                    pruned.peer_policy_sessions_deleted,
                     pruned.peer_offences_deleted,
                     pruned.active_bans_deleted,
                     pruned.pending_ban_intents_deleted,
@@ -1405,6 +1627,7 @@ impl ControlLoop {
                 info!(
                     prune_duration_ms = duration.as_millis(),
                     peer_sessions_deleted = pruned.peer_sessions_deleted,
+                    peer_policy_sessions_deleted = pruned.peer_policy_sessions_deleted,
                     peer_offences_deleted = pruned.peer_offences_deleted,
                     active_bans_deleted = pruned.active_bans_deleted,
                     pending_ban_intents_deleted = pruned.pending_ban_intents_deleted,
@@ -1517,8 +1740,11 @@ fn tracker_hostname(tracker: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn peer_log_state_key(identity: &OffenceIdentity) -> String {
-    format!("{}|{}", identity.torrent_hash, identity.peer_ip)
+fn peer_log_state_key(policy_name: &str, identity: &OffenceIdentity) -> String {
+    format!(
+        "{policy_name}|{}|{}",
+        identity.torrent_hash, identity.peer_ip
+    )
 }
 
 fn exemption_reason_code(reason: &ExemptionReason) -> &'static str {

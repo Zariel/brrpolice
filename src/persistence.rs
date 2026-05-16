@@ -115,6 +115,7 @@ pub struct RecoverySnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionPruneResult {
     pub peer_sessions_deleted: u64,
+    pub peer_policy_sessions_deleted: u64,
     pub peer_offences_deleted: u64,
     pub active_bans_deleted: u64,
     pub pending_ban_intents_deleted: u64,
@@ -850,7 +851,7 @@ impl Persistence {
         .await?
         .rows_affected();
 
-        let _peer_policy_sessions_deleted = sqlx::query(
+        let peer_policy_sessions_deleted = sqlx::query(
             r#"
             DELETE FROM peer_policy_sessions
             WHERE rowid IN (
@@ -976,6 +977,7 @@ impl Persistence {
 
         Ok(RetentionPruneResult {
             peer_sessions_deleted,
+            peer_policy_sessions_deleted,
             peer_offences_deleted,
             active_bans_deleted,
             pending_ban_intents_deleted,
@@ -2974,6 +2976,7 @@ mod tests {
             result,
             RetentionPruneResult {
                 peer_sessions_deleted: 1,
+                peer_policy_sessions_deleted: 0,
                 peer_offences_deleted: 1,
                 active_bans_deleted: 1,
                 pending_ban_intents_deleted: 1,
@@ -3095,10 +3098,11 @@ mod tests {
             },
         };
 
-        persistence
+        let result = persistence
             .run_retention_prune(&retention, now)
             .await
             .unwrap();
+        assert_eq!(result.peer_policy_sessions_deleted, 1);
 
         assert!(
             persistence

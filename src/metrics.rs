@@ -17,12 +17,20 @@ use prometheus_client::{
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PeerSampleLabels {
+    policy_name: &'static str,
     sample: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PolicyDecisionLabels {
+    policy_name: &'static str,
     decision: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PolicyEvaluationLabels {
+    policy_name: &'static str,
+    result: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -32,6 +40,7 @@ struct BanResultLabels {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BanAppliedReasonLabels {
+    policy_name: &'static str,
     reason_code: &'static str,
 }
 
@@ -49,6 +58,7 @@ struct PrunedRowsLabels {
 pub struct AppMetrics {
     registry: Arc<Registry>,
     peer_samples_total: Family<PeerSampleLabels, Counter>,
+    policy_evaluations_total: Family<PolicyEvaluationLabels, Counter>,
     score_policy_evaluations_total: Counter,
     score_policy_bannable_total: Counter,
     policy_decisions_total: Family<PolicyDecisionLabels, Counter>,
@@ -80,8 +90,15 @@ impl AppMetrics {
         let peer_samples_total = Family::<PeerSampleLabels, Counter>::default();
         registry.register(
             "brrpolice_peer_samples",
-            "Total peer evaluations by sample classification.",
+            "Total peer evaluations by policy and sample classification.",
             peer_samples_total.clone(),
+        );
+
+        let policy_evaluations_total = Family::<PolicyEvaluationLabels, Counter>::default();
+        registry.register(
+            "brrpolice_policy_evaluations",
+            "Total peer policy evaluations by bounded policy name and result.",
+            policy_evaluations_total.clone(),
         );
 
         let score_policy_evaluations_total = Counter::default();
@@ -101,7 +118,7 @@ impl AppMetrics {
         let policy_decisions_total = Family::<PolicyDecisionLabels, Counter>::default();
         registry.register(
             "brrpolice_policy_decisions",
-            "Total policy decisions by outcome type.",
+            "Total policy decisions by bounded policy name and outcome type.",
             policy_decisions_total.clone(),
         );
 
@@ -115,7 +132,7 @@ impl AppMetrics {
         let ban_applied_reasons_total = Family::<BanAppliedReasonLabels, Counter>::default();
         registry.register(
             "brrpolice_ban_applied_reasons",
-            "Total successfully applied bans by bounded reason code.",
+            "Total successfully applied bans by bounded policy name and reason code.",
             ban_applied_reasons_total.clone(),
         );
 
@@ -242,6 +259,7 @@ impl AppMetrics {
         Self {
             registry: Arc::new(registry),
             peer_samples_total,
+            policy_evaluations_total,
             score_policy_evaluations_total,
             score_policy_bannable_total,
             policy_decisions_total,
@@ -273,29 +291,59 @@ impl AppMetrics {
         Ok(encoded)
     }
 
-    pub fn record_peer_evaluated(&self, is_bad_sample: bool) {
+    pub fn record_peer_evaluated(&self, policy_name: &str, is_bad_sample: bool) {
+        let policy_name = bounded_policy_name(policy_name);
         self.peer_samples_total
-            .get_or_create(&PeerSampleLabels { sample: "all" })
+            .get_or_create(&PeerSampleLabels {
+                policy_name,
+                sample: "all",
+            })
             .inc();
         if is_bad_sample {
             self.peer_samples_total
-                .get_or_create(&PeerSampleLabels { sample: "bad" })
+                .get_or_create(&PeerSampleLabels {
+                    policy_name,
+                    sample: "bad",
+                })
                 .inc();
         }
     }
 
-    pub fn record_ban_applied(&self, bad_duration: Duration, reason_code: &str) {
+    pub fn record_policy_evaluation(&self, policy_name: &str, is_bannable: bool) {
+        let policy_name = bounded_policy_name(policy_name);
+        self.policy_evaluations_total
+            .get_or_create(&PolicyEvaluationLabels {
+                policy_name,
+                result: "all",
+            })
+            .inc();
+        if is_bannable {
+            self.policy_evaluations_total
+                .get_or_create(&PolicyEvaluationLabels {
+                    policy_name,
+                    result: "bannable",
+                })
+                .inc();
+        }
+    }
+
+    pub fn record_ban_applied(&self, policy_name: &str, bad_duration: Duration, reason_code: &str) {
         self.ban_results_total
             .get_or_create(&BanResultLabels { result: "applied" })
             .inc();
         self.bad_time_before_ban_seconds
             .observe(bad_duration.as_secs_f64());
+        let policy_name = bounded_policy_name(policy_name);
         let reason_code = match reason_code {
             "score_based" => "score_based",
+            "receive_idle" => "receive_idle",
             _ => "other",
         };
         self.ban_applied_reasons_total
-            .get_or_create(&BanAppliedReasonLabels { reason_code })
+            .get_or_create(&BanAppliedReasonLabels {
+                policy_name,
+                reason_code,
+            })
             .inc();
     }
 
@@ -316,39 +364,46 @@ impl AppMetrics {
             .observe(above_threshold_duration.as_secs_f64());
     }
 
-    pub fn record_policy_ban_decision(&self) {
+    pub fn record_policy_ban_decision(&self, policy_name: &str) {
         self.policy_decisions_total
-            .get_or_create(&PolicyDecisionLabels { decision: "ban" })
+            .get_or_create(&PolicyDecisionLabels {
+                policy_name: bounded_policy_name(policy_name),
+                decision: "ban",
+            })
             .inc();
     }
 
-    pub fn record_policy_not_bannable_decision(&self) {
+    pub fn record_policy_not_bannable_decision(&self, policy_name: &str) {
         self.policy_decisions_total
             .get_or_create(&PolicyDecisionLabels {
+                policy_name: bounded_policy_name(policy_name),
                 decision: "not_bannable",
             })
             .inc();
     }
 
-    pub fn record_policy_exemption_decision(&self) {
+    pub fn record_policy_exemption_decision(&self, policy_name: &str) {
         self.policy_decisions_total
             .get_or_create(&PolicyDecisionLabels {
+                policy_name: bounded_policy_name(policy_name),
                 decision: "exemption",
             })
             .inc();
     }
 
-    pub fn record_policy_reban_cooldown_decision(&self) {
+    pub fn record_policy_reban_cooldown_decision(&self, policy_name: &str) {
         self.policy_decisions_total
             .get_or_create(&PolicyDecisionLabels {
+                policy_name: bounded_policy_name(policy_name),
                 decision: "reban_cooldown",
             })
             .inc();
     }
 
-    pub fn record_policy_duplicate_suppressed_decision(&self) {
+    pub fn record_policy_duplicate_suppressed_decision(&self, policy_name: &str) {
         self.policy_decisions_total
             .get_or_create(&PolicyDecisionLabels {
+                policy_name: bounded_policy_name(policy_name),
                 decision: "duplicate_suppressed",
             })
             .inc();
@@ -388,6 +443,7 @@ impl AppMetrics {
         &self,
         duration: Duration,
         peer_sessions_deleted: u64,
+        peer_policy_sessions_deleted: u64,
         peer_offences_deleted: u64,
         active_bans_deleted: u64,
         pending_ban_intents_deleted: u64,
@@ -402,6 +458,11 @@ impl AppMetrics {
                 table: "peer_sessions",
             })
             .inc_by(peer_sessions_deleted);
+        self.pruned_rows_total
+            .get_or_create(&PrunedRowsLabels {
+                table: "peer_policy_sessions",
+            })
+            .inc_by(peer_policy_sessions_deleted);
         self.pruned_rows_total
             .get_or_create(&PrunedRowsLabels {
                 table: "peer_offences",
@@ -454,6 +515,14 @@ impl AppMetrics {
     }
 }
 
+fn bounded_policy_name(policy_name: &str) -> &'static str {
+    match policy_name {
+        "score" => "score",
+        "receive_idle" => "receive_idle",
+        _ => "other",
+    }
+}
+
 impl Default for AppMetrics {
     fn default() -> Self {
         Self::new()
@@ -468,13 +537,14 @@ mod tests {
     #[test]
     fn prune_metrics_render_with_label_families() {
         let metrics = AppMetrics::new();
-        metrics.record_prune_success(Duration::from_millis(25), 3, 2, 1, 4, Some(7));
+        metrics.record_prune_success(Duration::from_millis(25), 3, 5, 2, 1, 4, Some(7));
         metrics.record_prune_failure(Duration::from_millis(10));
 
         let rendered = metrics.render().unwrap();
         assert!(rendered.contains("brrpolice_prune_runs_total{result=\"success\"} 1"));
         assert!(rendered.contains("brrpolice_prune_runs_total{result=\"failure\"} 1"));
         assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"peer_sessions\"} 3"));
+        assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"peer_policy_sessions\"} 5"));
         assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"peer_offences\"} 2"));
         assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"active_bans\"} 1"));
         assert!(rendered.contains("brrpolice_pruned_rows_total{table=\"pending_ban_intents\"} 4"));
@@ -484,23 +554,48 @@ mod tests {
     #[test]
     fn collapsed_counters_render_expected_labels() {
         let metrics = AppMetrics::new();
-        metrics.record_peer_evaluated(true);
-        metrics.record_policy_ban_decision();
-        metrics.record_policy_exemption_decision();
-        metrics.record_ban_applied(Duration::from_secs(3), "score_based");
+        metrics.record_peer_evaluated("score", true);
+        metrics.record_peer_evaluated("receive_idle", false);
+        metrics.record_policy_evaluation("receive_idle", true);
+        metrics.record_policy_ban_decision("receive_idle");
+        metrics.record_policy_exemption_decision("score");
+        metrics.record_ban_applied("score", Duration::from_secs(3), "score_based");
+        metrics.record_ban_applied("receive_idle", Duration::from_secs(3), "receive_idle");
         metrics.record_ban_failure();
         metrics.record_bans_expired(2);
 
         let rendered = metrics.render().unwrap();
-        assert!(rendered.contains("brrpolice_peer_samples_total{sample=\"all\"} 1"));
-        assert!(rendered.contains("brrpolice_peer_samples_total{sample=\"bad\"} 1"));
-        assert!(rendered.contains("brrpolice_policy_decisions_total{decision=\"ban\"} 1"));
-        assert!(rendered.contains("brrpolice_policy_decisions_total{decision=\"exemption\"} 1"));
-        assert!(rendered.contains("brrpolice_bans_total{result=\"applied\"} 1"));
+        assert!(
+            rendered
+                .contains("brrpolice_peer_samples_total{policy_name=\"score\",sample=\"all\"} 1")
+        );
+        assert!(
+            rendered
+                .contains("brrpolice_peer_samples_total{policy_name=\"score\",sample=\"bad\"} 1")
+        );
+        assert!(rendered.contains(
+            "brrpolice_peer_samples_total{policy_name=\"receive_idle\",sample=\"all\"} 1"
+        ));
+        assert!(rendered.contains(
+            "brrpolice_policy_evaluations_total{policy_name=\"receive_idle\",result=\"all\"} 1"
+        ));
+        assert!(rendered.contains(
+            "brrpolice_policy_evaluations_total{policy_name=\"receive_idle\",result=\"bannable\"} 1"
+        ));
+        assert!(rendered.contains(
+            "brrpolice_policy_decisions_total{policy_name=\"receive_idle\",decision=\"ban\"} 1"
+        ));
+        assert!(rendered.contains(
+            "brrpolice_policy_decisions_total{policy_name=\"score\",decision=\"exemption\"} 1"
+        ));
+        assert!(rendered.contains("brrpolice_bans_total{result=\"applied\"} 2"));
         assert!(rendered.contains("brrpolice_bans_total{result=\"failed\"} 1"));
         assert!(rendered.contains("brrpolice_bans_total{result=\"expired\"} 2"));
         assert!(
-            rendered.contains("brrpolice_ban_applied_reasons_total{reason_code=\"score_based\"} 1")
+            rendered.contains("brrpolice_ban_applied_reasons_total{policy_name=\"score\",reason_code=\"score_based\"} 1")
+        );
+        assert!(
+            rendered.contains("brrpolice_ban_applied_reasons_total{policy_name=\"receive_idle\",reason_code=\"receive_idle\"} 1")
         );
     }
 }
