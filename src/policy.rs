@@ -12,7 +12,8 @@ use crate::{
     config::{FiltersConfig, PolicyConfig},
     types::{
         BanDecision, BanDisposition, ExemptionReason, OffenceHistory, OffenceIdentity, PeerContext,
-        PeerEvaluation, PeerObservationId, PeerSessionState,
+        PeerEvaluation, PeerObservationId, PeerPolicyEvaluation, PeerPolicySessionState,
+        PeerSessionState,
     },
 };
 
@@ -24,6 +25,9 @@ pub struct PolicyEngine {
 }
 
 const SCORE_BASED_REASON_CODE: &str = "score_based";
+pub const SCORE_POLICY_NAME: &str = "score";
+pub const RECEIVE_IDLE_POLICY_NAME: &str = "receive_idle";
+const RECEIVE_IDLE_REASON_CODE: &str = "receive_idle";
 
 impl PolicyEngine {
     pub fn new(config: PolicyConfig, filters: &FiltersConfig) -> Self {
@@ -94,20 +98,28 @@ impl PolicyEngine {
     }
 
     pub fn ban_ttl_for_offence(&self, offence_number: u32) -> Duration {
+        self.policy_ban_ttl_for_offence(SCORE_POLICY_NAME, offence_number)
+    }
+
+    pub fn policy_ban_ttl_for_offence(&self, policy_name: &str, offence_number: u32) -> Duration {
+        let durations = if policy_name == RECEIVE_IDLE_POLICY_NAME {
+            &self.config.receive_idle.ban_ladder.durations
+        } else {
+            &self.config.ban_ladder.durations
+        };
         let index = offence_number.saturating_sub(1) as usize;
-        self.config
-            .ban_ladder
-            .durations
+        durations
             .get(index)
             .copied()
-            .unwrap_or_else(|| {
-                *self
-                    .config
-                    .ban_ladder
-                    .durations
-                    .last()
-                    .expect("ban ladder validated")
-            })
+            .unwrap_or_else(|| *durations.last().expect("ban ladder validated"))
+    }
+
+    pub fn policy_reban_cooldown(&self, policy_name: &str) -> Duration {
+        if policy_name == RECEIVE_IDLE_POLICY_NAME {
+            self.config.receive_idle.reban_cooldown
+        } else {
+            self.config.reban_cooldown
+        }
     }
 
     pub fn begin_session(
@@ -447,6 +459,175 @@ impl PolicyEngine {
         updated
     }
 
+    pub fn begin_receive_idle_session(
+        &self,
+        peer: &PeerContext,
+        carryover: Option<&PeerPolicySessionState>,
+    ) -> PeerPolicySessionState {
+        let observation_id = self.peer_observation_id(peer);
+        let offence_identity = self.offence_identity(peer);
+        let mut session = PeerPolicySessionState {
+            policy_name: RECEIVE_IDLE_POLICY_NAME.to_string(),
+            observation_id: observation_id.clone(),
+            offence_identity: offence_identity.clone(),
+            first_seen_at: peer.first_seen_at,
+            last_seen_at: peer.observed_at,
+            observed_duration: peer
+                .observed_at
+                .duration_since(peer.first_seen_at)
+                .unwrap_or_default(),
+            bad_duration: Duration::ZERO,
+            sample_count: 1,
+            last_uploaded_bytes: peer.peer.uploaded_bytes,
+            last_upload_rate_bps: peer.peer.up_rate_bps,
+            last_exemption_reason: self.classify_exemption(peer),
+            bannable_since: None,
+            last_ban_decision_at: None,
+        };
+
+        if let Some(previous) = carryover.filter(|previous| {
+            previous.policy_name == RECEIVE_IDLE_POLICY_NAME
+                && self.can_carry_over_policy(previous, &observation_id, &offence_identity, peer)
+        }) {
+            let sample_duration = peer
+                .observed_at
+                .duration_since(previous.last_seen_at)
+                .unwrap_or_default();
+            session.first_seen_at = previous.first_seen_at;
+            session.observed_duration = previous.observed_duration + sample_duration;
+            session.bad_duration = previous.bad_duration;
+            session.sample_count = previous.sample_count + 1;
+            session.bannable_since = previous.bannable_since;
+            session.last_ban_decision_at = previous.last_ban_decision_at;
+        }
+
+        session
+    }
+
+    pub fn evaluate_receive_idle_peer(
+        &self,
+        peer: &PeerContext,
+        existing: Option<&PeerPolicySessionState>,
+    ) -> PeerPolicyEvaluation {
+        let previous = existing.cloned();
+        let mut session = self.begin_receive_idle_session(peer, previous.as_ref());
+        let sample_duration = previous
+            .as_ref()
+            .map(|previous| {
+                peer.observed_at
+                    .duration_since(previous.last_seen_at)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_else(|| {
+                peer.observed_at
+                    .duration_since(peer.first_seen_at)
+                    .unwrap_or_default()
+            });
+        let uploaded_delta_bytes = previous.as_ref().and_then(|previous| {
+            match (previous.last_uploaded_bytes, peer.peer.uploaded_bytes) {
+                (Some(previous_uploaded), Some(current_uploaded))
+                    if current_uploaded >= previous_uploaded =>
+                {
+                    Some(current_uploaded - previous_uploaded)
+                }
+                _ => None,
+            }
+        });
+        let exemption = self.classify_exemption(peer);
+        let is_bad_sample = self.config.receive_idle.enabled
+            && exemption.is_none()
+            && peer.peer.up_rate_bps <= self.config.receive_idle.max_upload_rate_bps
+            && uploaded_delta_bytes
+                .is_some_and(|delta| delta <= self.config.receive_idle.max_uploaded_delta_bytes);
+
+        session.last_seen_at = peer.observed_at;
+        session.last_uploaded_bytes = peer.peer.uploaded_bytes;
+        session.last_upload_rate_bps = peer.peer.up_rate_bps;
+        session.last_exemption_reason = exemption;
+        session.bad_duration = if is_bad_sample {
+            session.bad_duration + sample_duration
+        } else {
+            Duration::ZERO
+        };
+
+        let is_bannable = self.config.receive_idle.enabled
+            && session.last_exemption_reason.is_none()
+            && session.observed_duration >= self.config.receive_idle.min_observation_duration
+            && session.bad_duration >= self.config.receive_idle.sustain_duration;
+        session.bannable_since = if is_bannable {
+            session.bannable_since.or(Some(peer.observed_at))
+        } else {
+            None
+        };
+        if !is_bannable {
+            session.last_ban_decision_at = None;
+        }
+
+        PeerPolicyEvaluation {
+            session,
+            sample_duration,
+            uploaded_delta_bytes,
+            is_bad_sample,
+            is_bannable,
+        }
+    }
+
+    pub fn decide_receive_idle_ban(
+        &self,
+        peer: &PeerContext,
+        evaluation: &PeerPolicyEvaluation,
+        history: &OffenceHistory,
+    ) -> BanDisposition {
+        if let Some(exemption) = evaluation.session.last_exemption_reason.clone() {
+            return BanDisposition::Exempt(exemption);
+        }
+
+        if !evaluation.is_bannable {
+            return BanDisposition::NotBannableYet {
+                observed_duration: evaluation.session.observed_duration,
+                required_observation: self.config.receive_idle.min_observation_duration,
+                bad_duration: evaluation.session.bad_duration,
+                required_bad_duration: self.config.receive_idle.sustain_duration,
+            };
+        }
+
+        if let Some(remaining) = self.remaining_policy_reban_cooldown(
+            history.last_ban_expires_at,
+            peer.observed_at,
+            RECEIVE_IDLE_POLICY_NAME,
+        ) {
+            return BanDisposition::RebanCooldown { remaining };
+        }
+
+        if evaluation.session.last_ban_decision_at.is_some() {
+            return BanDisposition::DuplicateSuppressed;
+        }
+
+        let offence_number = history.offence_count + 1;
+        let ttl = self.policy_ban_ttl_for_offence(RECEIVE_IDLE_POLICY_NAME, offence_number);
+        let reason_details = format!(
+            "receive idle peer: idle_seconds={} observed_seconds={} up_rate_bps={} uploaded_delta_bytes={} samples={} selected_ttl_seconds={}",
+            evaluation.session.bad_duration.as_secs(),
+            evaluation.session.observed_duration.as_secs(),
+            peer.peer.up_rate_bps,
+            evaluation
+                .uploaded_delta_bytes
+                .map(|delta| delta.to_string())
+                .unwrap_or_else(|| "missing".to_string()),
+            evaluation.session.sample_count,
+            ttl.as_secs(),
+        );
+
+        BanDisposition::Ban(BanDecision {
+            peer_ip: peer.peer.ip,
+            peer_port: peer.peer.port,
+            offence_number,
+            ttl,
+            reason_code: RECEIVE_IDLE_REASON_CODE.to_string(),
+            reason_details,
+        })
+    }
+
     pub fn evaluate(&self) -> Vec<BanDecision> {
         Vec::new()
     }
@@ -466,6 +647,24 @@ impl PolicyEngine {
     fn can_carry_over(
         &self,
         previous: &PeerSessionState,
+        observation_id: &PeerObservationId,
+        offence_identity: &OffenceIdentity,
+        peer: &PeerContext,
+    ) -> bool {
+        previous.observation_id != *observation_id
+            && previous.observation_id.torrent_hash == observation_id.torrent_hash
+            && previous.offence_identity == *offence_identity
+            && peer.observed_at >= previous.last_seen_at
+            && peer
+                .observed_at
+                .duration_since(previous.last_seen_at)
+                .unwrap_or_default()
+                <= self.config.decay_window
+    }
+
+    fn can_carry_over_policy(
+        &self,
+        previous: &PeerPolicySessionState,
         observation_id: &PeerObservationId,
         offence_identity: &OffenceIdentity,
         peer: &PeerContext,
@@ -700,13 +899,23 @@ impl PolicyEngine {
         last_ban_expires_at: Option<SystemTime>,
         observed_at: SystemTime,
     ) -> Option<Duration> {
+        self.remaining_policy_reban_cooldown(last_ban_expires_at, observed_at, SCORE_POLICY_NAME)
+    }
+
+    fn remaining_policy_reban_cooldown(
+        &self,
+        last_ban_expires_at: Option<SystemTime>,
+        observed_at: SystemTime,
+        policy_name: &str,
+    ) -> Option<Duration> {
         let expiry = last_ban_expires_at?;
         let elapsed = observed_at.duration_since(expiry).unwrap_or_default();
-        if elapsed >= self.config.reban_cooldown {
+        let cooldown = self.policy_reban_cooldown(policy_name);
+        if elapsed >= cooldown {
             return None;
         }
 
-        Some(self.config.reban_cooldown - elapsed)
+        Some(cooldown - elapsed)
     }
 
     fn reason_factors(
@@ -1705,8 +1914,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn receive_idle_bans_after_sustained_zero_upload_progress() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first_peer = seeded_peer_with_uploaded(180, 0);
+        let first = engine.evaluate_receive_idle_peer(&first_peer, None);
+        assert!(!first.is_bad_sample);
+        assert!(!first.is_bannable);
+
+        let second_peer = seeded_peer_with_uploaded(240, 0);
+        let second = engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
+        assert!(second.is_bad_sample);
+        assert!(second.is_bannable);
+
+        match engine.decide_receive_idle_ban(&second_peer, &second, &empty_history()) {
+            BanDisposition::Ban(decision) => {
+                assert_eq!(decision.reason_code, "receive_idle");
+                assert_eq!(decision.ttl, Duration::from_secs(600));
+                assert!(decision.reason_details.contains("uploaded_delta_bytes=0"));
+            }
+            other => panic!("expected receive idle ban, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receive_idle_resets_on_uploaded_byte_progress() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let second = engine
+            .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(240, 0), Some(&first.session));
+        assert!(second.is_bad_sample);
+
+        let third = engine
+            .evaluate_receive_idle_peer(&seeded_peer_with_uploaded(300, 1), Some(&second.session));
+        assert!(!third.is_bad_sample);
+        assert_eq!(third.session.bad_duration, Duration::ZERO);
+        assert!(!third.is_bannable);
+    }
+
+    #[test]
+    fn receive_idle_missing_uploaded_bytes_is_not_bannable() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let mut first_peer = seeded_peer_with_uploaded(180, 0);
+        first_peer.peer.uploaded_bytes = None;
+        let first = engine.evaluate_receive_idle_peer(&first_peer, None);
+
+        let mut second_peer = seeded_peer_with_uploaded(240, 0);
+        second_peer.peer.uploaded_bytes = None;
+        let second = engine.evaluate_receive_idle_peer(&second_peer, Some(&first.session));
+
+        assert_eq!(second.uploaded_delta_bytes, None);
+        assert!(!second.is_bad_sample);
+        assert!(!second.is_bannable);
+    }
+
+    #[test]
+    fn receive_idle_uses_policy_specific_reban_cooldown() {
+        let engine = PolicyEngine::new(receive_idle_test_config(), &FiltersConfig::default());
+        let first = engine.evaluate_receive_idle_peer(&seeded_peer_with_uploaded(180, 0), None);
+        let peer = seeded_peer_with_uploaded(240, 0);
+        let evaluation = engine.evaluate_receive_idle_peer(&peer, Some(&first.session));
+        let history = OffenceHistory {
+            offence_count: 1,
+            last_ban_expires_at: Some(peer.observed_at - Duration::from_secs(300)),
+        };
+
+        match engine.decide_receive_idle_ban(&peer, &evaluation, &history) {
+            BanDisposition::RebanCooldown { remaining } => {
+                assert_eq!(remaining, Duration::from_secs(300));
+            }
+            other => panic!("expected reban cooldown, got {other:?}"),
+        }
+    }
+
     fn test_peer() -> PeerContext {
         seeded_peer(120, 0.25, 1024)
+    }
+
+    fn receive_idle_test_config() -> PolicyConfig {
+        PolicyConfig {
+            new_peer_grace_period: Duration::from_secs(1),
+            receive_idle: crate::config::ReceiveIdlePolicyConfig {
+                enabled: true,
+                min_observation_duration: Duration::from_secs(60),
+                sustain_duration: Duration::from_secs(60),
+                max_upload_rate_bps: 0,
+                max_uploaded_delta_bytes: 0,
+                reban_cooldown: Duration::from_secs(600),
+                ban_ladder: BanLadderConfig {
+                    durations: vec![Duration::from_secs(600), Duration::from_secs(1800)],
+                },
+            },
+            ..PolicyConfig::default()
+        }
     }
 
     fn empty_history() -> OffenceHistory {
@@ -1732,11 +2032,18 @@ mod tests {
                 port: 51413,
                 progress,
                 up_rate_bps,
+                uploaded_bytes: Some(0),
             },
             first_seen_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(observed_secs),
             has_active_ban: false,
         }
+    }
+
+    fn seeded_peer_with_uploaded(observed_secs: u64, uploaded_bytes: u64) -> PeerContext {
+        let mut peer = seeded_peer(observed_secs, 0.25, 0);
+        peer.peer.uploaded_bytes = Some(uploaded_bytes);
+        peer
     }
 
     #[test]

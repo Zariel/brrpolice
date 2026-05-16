@@ -569,6 +569,7 @@ impl QbittorrentClient {
             port,
             progress: peer.progress.clamp(0.0, 1.0),
             up_rate_bps: peer.up_speed,
+            uploaded_bytes: peer.uploaded,
         };
 
         Ok(Some(TorrentPeer {
@@ -1194,6 +1195,7 @@ mod tests {
                             "port": 51414,
                             "progress": 1.2,
                             "dl_speed": 0,
+                            "uploaded": 4096,
                             "up_speed": 32768
                         },
                         "10.0.0.10:51413": {
@@ -1229,9 +1231,11 @@ mod tests {
         );
         assert_eq!(peers[0].peer.progress, 0.0);
         assert_eq!(peers[0].peer.up_rate_bps, 16384);
+        assert_eq!(peers[0].peer.uploaded_bytes, None);
         assert_eq!(peers[0].client_name, None);
         assert_eq!(peers[1].peer.progress, 1.0);
         assert_eq!(peers[1].peer.up_rate_bps, 32768);
+        assert_eq!(peers[1].peer.uploaded_bytes, Some(4096));
         assert_eq!(peers[1].client_name.as_deref(), Some("qBittorrent/5.0.0"));
     }
 

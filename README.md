@@ -1,6 +1,6 @@
 # brrpolice
 
-`brrpolice` is a Rust service for qBittorrent seeding nodes. It watches peers, identifies peers that stay slow and do not make progress, applies temporary bans, and stores state in SQLite so decisions survive restarts.
+`brrpolice` is a Rust service for qBittorrent seeding nodes. It watches peers, identifies peers that stay slow, do not make progress, or remain connected without receiving uploaded data, applies temporary bans, and stores state in SQLite so decisions survive restarts.
 
 ## What It Does
 
@@ -17,6 +17,7 @@
 - Peer state, offence history, and active bans are stored in SQLite.
 - Retention pruning periodically deletes stale rows so SQLite size converges instead of growing without bound.
 - Ban duration increases by offence count using a configurable ban ladder.
+- Independent policies keep separate state and offence history. If multiple policies nominate the same IP in one poll, brrpolice records each offence but applies only the longest selected qBittorrent ban for that IP.
 - Expired bans are reconciled so qBittorrent and the database stay consistent.
 - Policy logic overview: [`docs/policy-engine.md`](docs/policy-engine.md).
 
@@ -112,6 +113,13 @@ qBittorrent auth rule:
 
 ### Policy Settings
 
+Two ban policies are active by default:
+
+- **Score policy**: bans peers that stay slow and fail to make expected progress after the observation and sustain guardrails are met.
+- **Receive-idle policy**: bans peers that stay connected while qBittorrent reports no upload rate and no cumulative uploaded-byte progress. This policy requires qBittorrent peer `uploaded` telemetry; peers with missing or reset uploaded counters are treated as non-bannable for this policy.
+
+Shared exemptions apply before either policy can ban: out-of-scope torrents, allowlisted peers, near-complete peers, new-peer grace period, and peers already under an active brrpolice ban.
+
 | Setting | Env Var | Default | Impact |
 |---|---|---|---|
 | `policy.new_peer_grace_period` | `BRRPOLICE_POLICY__NEW_PEER_GRACE_PERIOD` | `60s` | New peers are exempt during this initial age window. |
@@ -138,7 +146,29 @@ qBittorrent auth rule:
 | `policy.score.churn.min_reconnects` | `BRRPOLICE_POLICY__SCORE__CHURN__MIN_RECONNECTS` | `2` | Minimum reconnect count in the churn window before churn amplification starts applying. |
 | `policy.score.churn.max_amplifier` | `BRRPOLICE_POLICY__SCORE__CHURN__MAX_AMPLIFIER` | `1.0` | Maximum extra multiplier applied to sample risk (`effective = sample * (1 + churn_amplifier)`). |
 | `policy.score.churn.decay_per_second` | `BRRPOLICE_POLICY__SCORE__CHURN__DECAY_PER_SECOND` | `0.002` | Decay rate for accumulated churn amplification between observations. |
+| `policy.receive_idle.enabled` | `BRRPOLICE_POLICY__RECEIVE_IDLE__ENABLED` | `true` | Enables the inactive/receive-idle policy. |
+| `policy.receive_idle.min_observation_duration` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MIN_OBSERVATION_DURATION` | `3m` | Minimum tracked peer age before receive-idle bans can trigger. |
+| `policy.receive_idle.sustain_duration` | `BRRPOLICE_POLICY__RECEIVE_IDLE__SUSTAIN_DURATION` | `2m` | Time a peer must continuously show no upload rate and no uploaded-byte progress before a receive-idle ban is allowed. |
+| `policy.receive_idle.max_upload_rate_bps` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MAX_UPLOAD_RATE_BPS` | `0` | Maximum current qBittorrent `up_speed` that still counts as idle. The default requires exactly zero current upload. |
+| `policy.receive_idle.max_uploaded_delta_bytes` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MAX_UPLOADED_DELTA_BYTES` | `0` | Maximum cumulative uploaded-byte delta between samples that still counts as idle. The default requires no uploaded-byte progress. |
+| `policy.receive_idle.reban_cooldown` | `BRRPOLICE_POLICY__RECEIVE_IDLE__REBAN_COOLDOWN` | `10m` | Cooldown before receive-idle can re-ban the same torrent/IP identity. |
+| `policy.receive_idle.ban_ladder.durations` | `BRRPOLICE_POLICY__RECEIVE_IDLE__BAN_LADDER__DURATIONS` | `["10m","30m","2h","6h"]` | Receive-idle ban durations by policy-specific offence number. If offences exceed the list, the final duration is reused. |
 | `policy.ban_ladder.durations` | `BRRPOLICE_POLICY__BAN_LADDER__DURATIONS` | `["1h","6h","24h","168h"]` | Ban durations by offence number. If offences exceed the list, the final duration is reused. |
+
+Example receive-idle override:
+
+```toml
+[policy.receive_idle]
+enabled = true
+min_observation_duration = "3m"
+sustain_duration = "2m"
+max_upload_rate_bps = 0
+max_uploaded_delta_bytes = 0
+reban_cooldown = "10m"
+
+[policy.receive_idle.ban_ladder]
+durations = ["10m", "30m", "2h", "6h"]
+```
 
 ### Filter Settings
 

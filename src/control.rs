@@ -11,12 +11,13 @@ use crate::{
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
-    policy::PolicyEngine,
+    policy::{PolicyEngine, RECEIVE_IDLE_POLICY_NAME, SCORE_POLICY_NAME},
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
     types::{
         BanDecision, BanDisposition, ExemptionReason, OffenceIdentity, PeerContext, PeerEvaluation,
-        PeerObservationId, PeerSessionState, TorrentScope,
+        PeerObservationId, PeerPolicyEvaluation, PeerPolicySessionState, PeerSessionState,
+        TorrentScope,
     },
 };
 
@@ -77,20 +78,16 @@ macro_rules! log_ban_action {
             peer_port = $action.decision.peer_port,
             offence_number = $action.decision.offence_number,
             observed_at = $observed_at_rfc3339,
-            bad_time_seconds = $action.evaluation.session.bad_duration.as_secs(),
-            ban_score = $action.evaluation.session.ban_score,
-            ban_score_above_threshold_seconds = $action
-                .evaluation
-                .session
-                .ban_score_above_threshold_duration
-                .as_secs(),
-            sample_score_risk = $action.evaluation.sample_score_risk,
-            effective_sample_score_risk = $action.evaluation.effective_sample_score_risk,
-            progress_delta = $action.evaluation.progress_delta,
-            average_upload_rate_bps = $action.evaluation.session.rolling_avg_up_rate_bps,
-            churn_reconnect_count = $action.evaluation.session.churn_reconnect_count,
-            churn_amplifier = $action.evaluation.session.churn_amplifier,
-            sample_count = $action.evaluation.session.sample_count,
+            bad_time_seconds = $action.evaluation.bad_duration().as_secs(),
+            ban_score = $action.evaluation.ban_score(),
+            ban_score_above_threshold_seconds = $action.evaluation.ban_score_above_threshold_duration().as_secs(),
+            sample_score_risk = $action.evaluation.sample_score_risk(),
+            effective_sample_score_risk = $action.evaluation.effective_sample_score_risk(),
+            progress_delta = $action.evaluation.progress_delta(),
+            average_upload_rate_bps = $action.evaluation.avg_upload_rate_bps(),
+            churn_reconnect_count = $action.evaluation.churn_reconnect_count(),
+            churn_amplifier = $action.evaluation.churn_amplifier(),
+            sample_count = $action.evaluation.sample_count(),
             selected_ban_ttl_seconds = $action.decision.ttl.as_secs(),
             reason_code = %$action.decision.reason_code,
             reason_details = %$action.decision.reason_details,
@@ -125,8 +122,87 @@ struct PendingBanAction {
     torrent_name: String,
     torrent_tracker: String,
     decision: BanDecision,
-    evaluation: PeerEvaluation,
+    evaluation: PendingBanEvaluation,
+    policy_name: String,
     pending_intent: PendingBanIntentRecord,
+}
+
+#[derive(Debug, Clone)]
+enum PendingBanEvaluation {
+    Score(PeerEvaluation),
+    Policy(PeerPolicyEvaluation),
+}
+
+impl PendingBanEvaluation {
+    fn bad_duration(&self) -> Duration {
+        match self {
+            Self::Score(evaluation) => evaluation.session.bad_duration,
+            Self::Policy(evaluation) => evaluation.session.bad_duration,
+        }
+    }
+
+    fn ban_score(&self) -> f64 {
+        match self {
+            Self::Score(evaluation) => evaluation.session.ban_score,
+            Self::Policy(_) => 0.0,
+        }
+    }
+
+    fn ban_score_above_threshold_duration(&self) -> Duration {
+        match self {
+            Self::Score(evaluation) => evaluation.session.ban_score_above_threshold_duration,
+            Self::Policy(_) => Duration::ZERO,
+        }
+    }
+
+    fn sample_score_risk(&self) -> f64 {
+        match self {
+            Self::Score(evaluation) => evaluation.sample_score_risk,
+            Self::Policy(_) => 0.0,
+        }
+    }
+
+    fn effective_sample_score_risk(&self) -> f64 {
+        match self {
+            Self::Score(evaluation) => evaluation.effective_sample_score_risk,
+            Self::Policy(_) => 0.0,
+        }
+    }
+
+    fn progress_delta(&self) -> f64 {
+        match self {
+            Self::Score(evaluation) => evaluation.progress_delta,
+            Self::Policy(_) => 0.0,
+        }
+    }
+
+    fn avg_upload_rate_bps(&self) -> u64 {
+        match self {
+            Self::Score(evaluation) => evaluation.session.rolling_avg_up_rate_bps,
+            Self::Policy(evaluation) => evaluation.session.last_upload_rate_bps,
+        }
+    }
+
+    fn churn_reconnect_count(&self) -> u32 {
+        match self {
+            Self::Score(evaluation) => evaluation.session.churn_reconnect_count,
+            Self::Policy(_) => 0,
+        }
+    }
+
+    fn churn_amplifier(&self) -> f64 {
+        match self {
+            Self::Score(evaluation) => evaluation.session.churn_amplifier,
+            Self::Policy(_) => 0.0,
+        }
+    }
+
+    fn sample_count(&self) -> u32 {
+        match self {
+            Self::Score(evaluation) => evaluation.session.sample_count,
+            Self::Policy(evaluation) => evaluation.session.sample_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +480,103 @@ impl ControlLoop {
                 let peer_key = peer_log_state_key(&evaluation.session.offence_identity);
                 seen_peer_keys.insert(peer_key.clone());
 
+                let receive_existing = self
+                    .persistence
+                    .get_peer_policy_session(RECEIVE_IDLE_POLICY_NAME, &peer.observation_id)
+                    .await?;
+                let receive_carryover = if receive_existing.is_none() {
+                    self.persistence
+                        .get_latest_peer_policy_session_for_torrent_ip(
+                            RECEIVE_IDLE_POLICY_NAME,
+                            &peer.observation_id.torrent_hash,
+                            peer.observation_id.peer_ip,
+                        )
+                        .await?
+                        .filter(|session| {
+                            observed_at >= session.last_seen_at
+                                && observed_at
+                                    .duration_since(session.last_seen_at)
+                                    .unwrap_or_default()
+                                    <= self.config.policy.decay_window
+                        })
+                } else {
+                    None
+                };
+                let receive_evaluation = self.policy.evaluate_receive_idle_peer(
+                    &peer_context,
+                    receive_existing.as_ref().or(receive_carryover.as_ref()),
+                );
+                let receive_history = self
+                    .persistence
+                    .load_policy_offence_history(
+                        RECEIVE_IDLE_POLICY_NAME,
+                        &receive_evaluation.session.offence_identity,
+                    )
+                    .await?;
+                match self.policy.decide_receive_idle_ban(
+                    &peer_context,
+                    &receive_evaluation,
+                    &receive_history,
+                ) {
+                    BanDisposition::Ban(decision) => {
+                        self.metrics.record_policy_ban_decision();
+                        info!(
+                            state = "ban_pending",
+                            torrent_hash = %torrent.hash,
+                            torrent_name = %torrent.name,
+                            torrent_tracker = %torrent_tracker,
+                            peer_ip = %peer.peer.ip,
+                            peer_port = peer.peer.port,
+                            offence_number = decision.offence_number,
+                            observed_at = %observed_at_rfc3339,
+                            bad_time_seconds = receive_evaluation.session.bad_duration.as_secs(),
+                            observed_duration_seconds = receive_evaluation.session.observed_duration.as_secs(),
+                            sample_count = receive_evaluation.session.sample_count,
+                            selected_ban_ttl_seconds = decision.ttl.as_secs(),
+                            reason_code = decision.reason_code.as_str(),
+                            reason_details = decision.reason_details.as_str(),
+                            "peer policy update"
+                        );
+                        let pending_intent = PendingBanIntentRecord {
+                            torrent_hash: torrent.hash.clone(),
+                            peer_ip: decision.peer_ip,
+                            peer_port: decision.peer_port,
+                            policy_name: RECEIVE_IDLE_POLICY_NAME.to_string(),
+                            offence_number: decision.offence_number,
+                            reason_code: decision.reason_code.clone(),
+                            observed_at,
+                            ban_expires_at: observed_at + decision.ttl,
+                            bad_duration: receive_evaluation.session.bad_duration,
+                            progress_delta_per_mille: 0,
+                            avg_up_rate_bps: receive_evaluation.session.last_upload_rate_bps,
+                            last_error: "pending qbittorrent enforcement".to_string(),
+                        };
+                        self.persistence
+                            .upsert_pending_ban_intent(&pending_intent)
+                            .await?;
+                        self.persistence
+                            .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
+                            .await?;
+                        pending_ban_actions.push(PendingBanAction {
+                            torrent_hash: torrent.hash.clone(),
+                            torrent_name: torrent.name.clone(),
+                            torrent_tracker: torrent_tracker.clone(),
+                            decision,
+                            evaluation: PendingBanEvaluation::Policy(receive_evaluation),
+                            policy_name: RECEIVE_IDLE_POLICY_NAME.to_string(),
+                            pending_intent,
+                        });
+                    }
+                    BanDisposition::Exempt(_)
+                    | BanDisposition::NotBannableYet { .. }
+                    | BanDisposition::RebanCooldown { .. }
+                    | BanDisposition::DuplicateSuppressed => {
+                        self.persistence
+                            .upsert_peer_policy_session(&receive_evaluation.session, "policy-v1")
+                            .await?;
+                    }
+                }
+
                 match self.policy.decide_ban(&peer_context, &evaluation, &history) {
                     BanDisposition::Ban(decision) => {
                         self.metrics.record_policy_ban_decision();
@@ -446,6 +619,7 @@ impl ControlLoop {
                             torrent_hash: torrent.hash.clone(),
                             peer_ip: decision.peer_ip,
                             peer_port: decision.peer_port,
+                            policy_name: SCORE_POLICY_NAME.to_string(),
                             offence_number: decision.offence_number,
                             reason_code: decision.reason_code.clone(),
                             observed_at,
@@ -468,7 +642,8 @@ impl ControlLoop {
                             torrent_name: torrent.name.clone(),
                             torrent_tracker: torrent_tracker.clone(),
                             decision,
-                            evaluation,
+                            evaluation: PendingBanEvaluation::Score(evaluation),
+                            policy_name: SCORE_POLICY_NAME.to_string(),
                             pending_intent,
                         });
                     }
@@ -688,9 +863,9 @@ impl ControlLoop {
             .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > observed_at)
             .cloned()
             .collect::<Vec<_>>();
-        let requested_bans = actions
-            .iter()
-            .map(|action| ActiveBanRecord {
+        let mut requested_by_ip: HashMap<std::net::IpAddr, ActiveBanRecord> = HashMap::new();
+        for action in actions {
+            let requested = ActiveBanRecord {
                 peer_ip: action.decision.peer_ip,
                 peer_port: action.decision.peer_port,
                 scope: format!("torrent:{}", action.torrent_hash),
@@ -699,8 +874,17 @@ impl ControlLoop {
                 created_at: observed_at,
                 expires_at: observed_at + action.decision.ttl,
                 reconciled_at: None,
-            })
-            .collect::<Vec<_>>();
+            };
+            requested_by_ip
+                .entry(requested.peer_ip)
+                .and_modify(|existing| {
+                    if requested.expires_at > existing.expires_at {
+                        *existing = requested.clone();
+                    }
+                })
+                .or_insert(requested);
+        }
+        let requested_bans = requested_by_ip.into_values().collect::<Vec<_>>();
 
         if let Err(error) = self
             .qbittorrent
@@ -727,12 +911,11 @@ impl ControlLoop {
         }
 
         let mut ban_count = 0;
-        for action in actions {
-            let stored = match self
-                .persistence
-                .record_ban_enforcement(&action.evaluation, &action.decision, observed_at)
-                .await
-            {
+        let mut action_order = (0..actions.len()).collect::<Vec<_>>();
+        action_order.sort_by_key(|index| actions[*index].decision.ttl);
+        for index in action_order {
+            let action = &actions[index];
+            let stored = match self.record_ban_enforcement(action, observed_at).await {
                 Ok(stored) => stored,
                 Err(error) => {
                     self.metrics.record_ban_failure();
@@ -757,6 +940,7 @@ impl ControlLoop {
                     &action.torrent_hash,
                     action.decision.peer_ip,
                     action.decision.peer_port,
+                    &action.policy_name,
                     action.decision.offence_number,
                 )
                 .await?;
@@ -766,7 +950,7 @@ impl ControlLoop {
             if !stored.duplicate_suppressed {
                 ban_count += 1;
                 self.metrics.record_ban_applied(
-                    action.evaluation.session.bad_duration,
+                    action.evaluation.bad_duration(),
                     &action.decision.reason_code,
                 );
                 log_ban_action!(
@@ -781,6 +965,25 @@ impl ControlLoop {
         }
 
         Ok(ban_count)
+    }
+
+    async fn record_ban_enforcement(
+        &self,
+        action: &PendingBanAction,
+        observed_at: std::time::SystemTime,
+    ) -> Result<crate::persistence::EnforcementWriteResult> {
+        match &action.evaluation {
+            PendingBanEvaluation::Score(evaluation) => {
+                self.persistence
+                    .record_ban_enforcement(evaluation, &action.decision, observed_at)
+                    .await
+            }
+            PendingBanEvaluation::Policy(evaluation) => {
+                self.persistence
+                    .record_policy_ban_enforcement(evaluation, &action.decision, observed_at)
+                    .await
+            }
+        }
     }
 
     async fn run_poll_cycle_with_retry(&mut self) -> Result<PollCycleResult> {
@@ -976,6 +1179,7 @@ impl ControlLoop {
                     &intent.torrent_hash,
                     intent.peer_ip,
                     intent.peer_port,
+                    &intent.policy_name,
                     intent.offence_number,
                 )
                 .await?;
@@ -1008,47 +1212,6 @@ impl ControlLoop {
             return Err(error);
         }
 
-        let observation_id = PeerObservationId {
-            torrent_hash: intent.torrent_hash.clone(),
-            peer_ip: intent.peer_ip,
-            peer_port: intent.peer_port,
-        };
-        let existing_session = self.persistence.get_peer_session(&observation_id).await?;
-        let session = existing_session.unwrap_or(PeerSessionState {
-            observation_id,
-            offence_identity: OffenceIdentity {
-                torrent_hash: intent.torrent_hash.clone(),
-                peer_ip: intent.peer_ip,
-            },
-            first_seen_at: intent.observed_at,
-            last_seen_at: intent.observed_at,
-            baseline_progress: 0.0,
-            latest_progress: f64::from(intent.progress_delta_per_mille) / 1000.0,
-            rolling_avg_up_rate_bps: intent.avg_up_rate_bps,
-            observed_duration: intent.bad_duration,
-            bad_duration: intent.bad_duration,
-            ban_score: 0.0,
-            ban_score_above_threshold_duration: Duration::ZERO,
-            churn_reconnect_count: 0,
-            churn_window_started_at: None,
-            churn_amplifier: 0.0,
-            sample_count: 1,
-            last_torrent_seeder_count: 0,
-            last_exemption_reason: None,
-            bannable_since: Some(intent.observed_at),
-            last_ban_decision_at: None,
-        });
-        let progress_delta = f64::from(intent.progress_delta_per_mille) / 1000.0;
-        let evaluation = PeerEvaluation {
-            session,
-            progress_delta,
-            sample_duration: intent.bad_duration,
-            sample_up_rate_bps: intent.avg_up_rate_bps,
-            is_bad_sample: true,
-            is_bannable: true,
-            sample_score_risk: 0.0,
-            effective_sample_score_risk: 0.0,
-        };
         let decision = BanDecision {
             peer_ip: intent.peer_ip,
             peer_port: intent.peer_port,
@@ -1057,12 +1220,91 @@ impl ControlLoop {
             reason_code: intent.reason_code.clone(),
             reason_details: "replayed pending intent".to_string(),
         };
-
-        let stored = match self
-            .persistence
-            .record_ban_enforcement(&evaluation, &decision, recovered_at)
-            .await
-        {
+        let stored = if intent.policy_name == RECEIVE_IDLE_POLICY_NAME {
+            let observation_id = PeerObservationId {
+                torrent_hash: intent.torrent_hash.clone(),
+                peer_ip: intent.peer_ip,
+                peer_port: intent.peer_port,
+            };
+            let existing_session = self
+                .persistence
+                .get_peer_policy_session(RECEIVE_IDLE_POLICY_NAME, &observation_id)
+                .await?;
+            let session = existing_session.unwrap_or(PeerPolicySessionState {
+                policy_name: RECEIVE_IDLE_POLICY_NAME.to_string(),
+                observation_id: observation_id.clone(),
+                offence_identity: OffenceIdentity {
+                    torrent_hash: intent.torrent_hash.clone(),
+                    peer_ip: intent.peer_ip,
+                },
+                first_seen_at: intent.observed_at,
+                last_seen_at: intent.observed_at,
+                observed_duration: intent.bad_duration,
+                bad_duration: intent.bad_duration,
+                sample_count: 1,
+                last_uploaded_bytes: None,
+                last_upload_rate_bps: intent.avg_up_rate_bps,
+                last_exemption_reason: None,
+                bannable_since: Some(intent.observed_at),
+                last_ban_decision_at: None,
+            });
+            let evaluation = PeerPolicyEvaluation {
+                session,
+                sample_duration: intent.bad_duration,
+                uploaded_delta_bytes: Some(0),
+                is_bad_sample: true,
+                is_bannable: true,
+            };
+            self.persistence
+                .record_policy_ban_enforcement(&evaluation, &decision, recovered_at)
+                .await
+        } else {
+            let observation_id = PeerObservationId {
+                torrent_hash: intent.torrent_hash.clone(),
+                peer_ip: intent.peer_ip,
+                peer_port: intent.peer_port,
+            };
+            let existing_session = self.persistence.get_peer_session(&observation_id).await?;
+            let session = existing_session.unwrap_or(PeerSessionState {
+                observation_id,
+                offence_identity: OffenceIdentity {
+                    torrent_hash: intent.torrent_hash.clone(),
+                    peer_ip: intent.peer_ip,
+                },
+                first_seen_at: intent.observed_at,
+                last_seen_at: intent.observed_at,
+                baseline_progress: 0.0,
+                latest_progress: f64::from(intent.progress_delta_per_mille) / 1000.0,
+                rolling_avg_up_rate_bps: intent.avg_up_rate_bps,
+                observed_duration: intent.bad_duration,
+                bad_duration: intent.bad_duration,
+                ban_score: 0.0,
+                ban_score_above_threshold_duration: Duration::ZERO,
+                churn_reconnect_count: 0,
+                churn_window_started_at: None,
+                churn_amplifier: 0.0,
+                sample_count: 1,
+                last_torrent_seeder_count: 0,
+                last_exemption_reason: None,
+                bannable_since: Some(intent.observed_at),
+                last_ban_decision_at: None,
+            });
+            let progress_delta = f64::from(intent.progress_delta_per_mille) / 1000.0;
+            let evaluation = PeerEvaluation {
+                session,
+                progress_delta,
+                sample_duration: intent.bad_duration,
+                sample_up_rate_bps: intent.avg_up_rate_bps,
+                is_bad_sample: true,
+                is_bannable: true,
+                sample_score_risk: 0.0,
+                effective_sample_score_risk: 0.0,
+            };
+            self.persistence
+                .record_ban_enforcement(&evaluation, &decision, recovered_at)
+                .await
+        };
+        let stored = match stored {
             Ok(stored) => stored,
             Err(error) => {
                 self.persistence
@@ -1080,6 +1322,7 @@ impl ControlLoop {
                 &intent.torrent_hash,
                 intent.peer_ip,
                 intent.peer_port,
+                &intent.policy_name,
                 intent.offence_number,
             )
             .await?;
@@ -1203,6 +1446,7 @@ impl ControlLoop {
                 offence.torrent_hash == torrent_hash
                     && offence.peer_port == ban.peer_port
                     && offence.offence_number == ban.offence_number
+                    && offence.reason_code == ban.reason
                     && offence.ban_revoked_at.is_none()
             })
             .and_then(|offence| offence.id)
@@ -1278,17 +1522,12 @@ fn parse_hostname(input: &str) -> Option<String> {
 fn has_active_ban(
     active_bans: &[ActiveBanRecord],
     peer_ip: std::net::IpAddr,
-    peer_port: u16,
-    torrent_hash: &str,
+    _peer_port: u16,
+    _torrent_hash: &str,
     observed_at: std::time::SystemTime,
 ) -> bool {
-    let scope = format!("torrent:{torrent_hash}");
     active_bans.iter().any(|ban| {
-        ban.peer_ip == peer_ip
-            && ban.peer_port == peer_port
-            && ban.scope == scope
-            && ban.reconciled_at.is_none()
-            && ban.expires_at > observed_at
+        ban.peer_ip == peer_ip && ban.reconciled_at.is_none() && ban.expires_at > observed_at
     })
 }
 
@@ -1458,6 +1697,7 @@ mod tests {
                 torrent_hash: "abc123".to_string(),
                 peer_ip: "10.0.0.10".parse().unwrap(),
                 peer_port: 51413,
+                policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
                 offence_number: 2,
                 reason_code: "slow_non_progressing".to_string(),
                 observed_duration: Duration::from_secs(120),
@@ -1996,6 +2236,10 @@ mod tests {
                 max_score: 5.0,
                 ..crate::config::ScorePolicyConfig::default()
             },
+            receive_idle: crate::config::ReceiveIdlePolicyConfig {
+                enabled: false,
+                ..crate::config::ReceiveIdlePolicyConfig::default()
+            },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -2392,6 +2636,10 @@ mod tests {
                 max_score: 5.0,
                 ..crate::config::ScorePolicyConfig::default()
             },
+            receive_idle: crate::config::ReceiveIdlePolicyConfig {
+                enabled: false,
+                ..crate::config::ReceiveIdlePolicyConfig::default()
+            },
             ban_ladder: BanLadderConfig {
                 durations: vec![Duration::from_secs(3600)],
             },
@@ -2474,6 +2722,7 @@ mod tests {
                 min_total_seeders: 3,
                 reban_cooldown: Duration::from_secs(1800),
                 score: crate::config::ScorePolicyConfig::default(),
+                receive_idle: crate::config::ReceiveIdlePolicyConfig::default(),
                 ban_ladder: BanLadderConfig {
                     durations: vec![Duration::from_secs(3600)],
                 },
@@ -2517,6 +2766,7 @@ mod tests {
             torrent_hash: torrent_hash.to_string(),
             peer_ip: peer_ip.parse().unwrap(),
             peer_port,
+            policy_name: crate::policy::SCORE_POLICY_NAME.to_string(),
             offence_number,
             reason_code: "slow_non_progressing".to_string(),
             observed_at,
