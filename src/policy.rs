@@ -19,7 +19,6 @@ use crate::{
         PeerEvaluation, PeerObservationId, PeerPolicyAssessment, PeerPolicyEvaluation,
         PeerPolicyInput, PeerPolicySessionState, PeerSessionState, PolicyDiagnostic,
         PolicyDiagnosticValue, PolicyEvaluation, PolicySessionSnapshot, TorrentPeer,
-        TorrentSummary,
     },
 };
 
@@ -65,6 +64,17 @@ pub trait PeerPolicy: Send + Sync {
         self.name()
     }
     fn reason_metric_label(&self, reason_code: &str) -> &'static str;
+    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment>;
+    fn record_policy_specific_metrics(
+        &self,
+        _metrics: &AppMetrics,
+        _assessment: &PeerPolicyAssessment,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+pub trait PeerPolicyStorage: PeerPolicy + Send + Sync {
     fn session_preload_kind(&self) -> PolicySessionPreloadKind;
     async fn preload_legacy_sessions(
         &self,
@@ -93,7 +103,6 @@ pub trait PeerPolicy: Send + Sync {
         store: &dyn PolicyDataStore,
         peer: &PeerContext,
     ) -> Result<OffenceHistory>;
-    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment>;
     async fn persist_assessment(
         &self,
         persistence: &Persistence,
@@ -106,6 +115,10 @@ pub trait PeerPolicy: Send + Sync {
         decision: &BanDecision,
         enforced_at: SystemTime,
     ) -> Result<EnforcementWriteResult>;
+}
+
+#[async_trait::async_trait]
+pub trait PeerPolicyReplay: PeerPolicy + Send + Sync {
     async fn record_replayed_intent(
         &self,
         persistence: &Persistence,
@@ -120,15 +133,11 @@ pub trait PeerPolicy: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    fn pending_ban_intent(
-        &self,
-        assessment: &PeerPolicyAssessment,
-        decision: &BanDecision,
-        torrent: &TorrentSummary,
-        observed_at: SystemTime,
-    ) -> PendingBanIntentRecord;
-    fn record_assessment_metrics(&self, metrics: &AppMetrics, assessment: &PeerPolicyAssessment);
 }
+
+pub trait PeerPolicyAdapter: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
+
+impl<T> PeerPolicyAdapter for T where T: PeerPolicy + PeerPolicyStorage + PeerPolicyReplay {}
 
 #[derive(Debug, Clone)]
 struct ScoreSessionSnapshot {
@@ -198,7 +207,7 @@ pub struct PolicyCycleCache {
 impl PolicyCycleCache {
     pub async fn load(
         persistence: &Persistence,
-        policies: &[Arc<dyn PeerPolicy>],
+        policies: &[Arc<dyn PeerPolicyAdapter>],
         torrent_hashes: &[String],
     ) -> Result<Self> {
         let policy_names = policies
@@ -493,6 +502,67 @@ impl PeerPolicy for ScorePeerPolicy {
         }
     }
 
+    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
+        let previous = score_previous_session(input.previous_session)?;
+        let evaluation = self.engine.evaluate_peer(input.peer, previous);
+        let disposition = self
+            .engine
+            .decide_ban(input.peer, &evaluation, input.offence_history);
+        let diagnostics = vec![
+            PolicyDiagnostic {
+                name: "score",
+                value: PolicyDiagnosticValue::String(format!(
+                    "{:.4}",
+                    evaluation.session.ban_score
+                )),
+            },
+            PolicyDiagnostic {
+                name: "score_bad_seconds",
+                value: PolicyDiagnosticValue::Duration(
+                    evaluation.session.ban_score_above_threshold_duration,
+                ),
+            },
+            PolicyDiagnostic {
+                name: "sample_risk",
+                value: PolicyDiagnosticValue::String(format!(
+                    "{:.4}",
+                    evaluation.sample_score_risk
+                )),
+            },
+            PolicyDiagnostic {
+                name: "threshold_met",
+                value: PolicyDiagnosticValue::Bool(
+                    evaluation.session.ban_score >= self.engine.config.score.ban_threshold,
+                ),
+            },
+        ];
+        Ok(PeerPolicyAssessment {
+            policy_name: self.name(),
+            evaluation: Box::new(ScoreAssessmentEvaluation { evaluation }),
+            disposition,
+            diagnostics,
+        })
+    }
+
+    fn record_policy_specific_metrics(
+        &self,
+        metrics: &AppMetrics,
+        assessment: &PeerPolicyAssessment,
+    ) {
+        let Ok(evaluation) = score_evaluation(assessment) else {
+            return;
+        };
+        metrics.record_score_evaluation(
+            evaluation.session.ban_score,
+            evaluation.sample_score_risk,
+            evaluation.session.ban_score_above_threshold_duration,
+            evaluation.is_bannable,
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerPolicyStorage for ScorePeerPolicy {
     fn session_preload_kind(&self) -> PolicySessionPreloadKind {
         PolicySessionPreloadKind::LegacyScore
     }
@@ -540,48 +610,6 @@ impl PeerPolicy for ScorePeerPolicy {
             .await
     }
 
-    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
-        let previous = score_previous_session(input.previous_session)?;
-        let evaluation = self.engine.evaluate_peer(input.peer, previous);
-        let disposition = self
-            .engine
-            .decide_ban(input.peer, &evaluation, input.offence_history);
-        let diagnostics = vec![
-            PolicyDiagnostic {
-                name: "score",
-                value: PolicyDiagnosticValue::String(format!(
-                    "{:.4}",
-                    evaluation.session.ban_score
-                )),
-            },
-            PolicyDiagnostic {
-                name: "score_bad_seconds",
-                value: PolicyDiagnosticValue::Duration(
-                    evaluation.session.ban_score_above_threshold_duration,
-                ),
-            },
-            PolicyDiagnostic {
-                name: "sample_risk",
-                value: PolicyDiagnosticValue::String(format!(
-                    "{:.4}",
-                    evaluation.sample_score_risk
-                )),
-            },
-            PolicyDiagnostic {
-                name: "threshold_met",
-                value: PolicyDiagnosticValue::Bool(
-                    evaluation.session.ban_score >= self.engine.config.score.ban_threshold,
-                ),
-            },
-        ];
-        Ok(PeerPolicyAssessment {
-            policy_name: self.name(),
-            evaluation: Box::new(ScoreAssessmentEvaluation { evaluation }),
-            disposition,
-            diagnostics,
-        })
-    }
-
     async fn persist_assessment(
         &self,
         persistence: &Persistence,
@@ -605,7 +633,10 @@ impl PeerPolicy for ScorePeerPolicy {
             .record_ban_enforcement(evaluation, decision, enforced_at)
             .await
     }
+}
 
+#[async_trait::async_trait]
+impl PeerPolicyReplay for ScorePeerPolicy {
     async fn record_replayed_intent(
         &self,
         persistence: &Persistence,
@@ -658,43 +689,6 @@ impl PeerPolicy for ScorePeerPolicy {
             .record_ban_enforcement(&evaluation, decision, recovered_at)
             .await
     }
-
-    fn pending_ban_intent(
-        &self,
-        assessment: &PeerPolicyAssessment,
-        decision: &BanDecision,
-        torrent: &TorrentSummary,
-        observed_at: SystemTime,
-    ) -> PendingBanIntentRecord {
-        PendingBanIntentRecord {
-            torrent_hash: torrent.hash.clone(),
-            peer_ip: decision.peer_ip,
-            peer_port: decision.peer_port,
-            policy_name: self.name().to_string(),
-            offence_number: decision.offence_number,
-            reason_code: decision.reason_code.clone(),
-            observed_at,
-            ban_expires_at: observed_at + decision.ttl,
-            bad_duration: assessment.evaluation.bad_duration(),
-            progress_delta_per_mille: assessment.evaluation.progress_delta_per_mille(),
-            avg_up_rate_bps: assessment.evaluation.avg_upload_rate_bps(),
-            last_error: "pending qbittorrent enforcement".to_string(),
-        }
-    }
-
-    fn record_assessment_metrics(&self, metrics: &AppMetrics, assessment: &PeerPolicyAssessment) {
-        metrics.record_peer_evaluated(self.metric_label(), assessment.evaluation.is_bad_sample());
-        metrics.record_policy_evaluation(self.metric_label(), assessment.evaluation.is_bannable());
-        let Ok(evaluation) = score_evaluation(assessment) else {
-            return;
-        };
-        metrics.record_score_evaluation(
-            evaluation.session.ban_score,
-            evaluation.sample_score_risk,
-            evaluation.session.ban_score_above_threshold_duration,
-            evaluation.is_bannable,
-        );
-    }
 }
 
 #[async_trait::async_trait]
@@ -711,6 +705,46 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         }
     }
 
+    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
+        let previous = receive_idle_previous_session(input.previous_session)?;
+        let evaluation = self.engine.evaluate_receive_idle_peer(input.peer, previous);
+        let disposition =
+            self.engine
+                .decide_receive_idle_ban(input.peer, &evaluation, input.offence_history);
+        let diagnostics = vec![
+            PolicyDiagnostic {
+                name: "idle_seconds",
+                value: PolicyDiagnosticValue::Duration(evaluation.session.bad_duration),
+            },
+            PolicyDiagnostic {
+                name: "uploaded_delta_bytes",
+                value: PolicyDiagnosticValue::String(
+                    evaluation
+                        .uploaded_delta_bytes
+                        .map(|delta| delta.to_string())
+                        .unwrap_or_else(|| "missing".to_string()),
+                ),
+            },
+            PolicyDiagnostic {
+                name: "current_upload_rate_bps",
+                value: PolicyDiagnosticValue::U64(evaluation.session.last_upload_rate_bps),
+            },
+            PolicyDiagnostic {
+                name: "threshold_met",
+                value: PolicyDiagnosticValue::Bool(evaluation.is_bad_sample),
+            },
+        ];
+        Ok(PeerPolicyAssessment {
+            policy_name: self.name(),
+            evaluation: Box::new(ReceiveIdleAssessmentEvaluation { evaluation }),
+            disposition,
+            diagnostics,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerPolicyStorage for ReceiveIdlePeerPolicy {
     fn session_preload_kind(&self) -> PolicySessionPreloadKind {
         PolicySessionPreloadKind::PeerPolicySessions
     }
@@ -752,43 +786,6 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
             .await
     }
 
-    fn assess_peer(&self, input: PeerPolicyInput<'_>) -> Result<PeerPolicyAssessment> {
-        let previous = receive_idle_previous_session(input.previous_session)?;
-        let evaluation = self.engine.evaluate_receive_idle_peer(input.peer, previous);
-        let disposition =
-            self.engine
-                .decide_receive_idle_ban(input.peer, &evaluation, input.offence_history);
-        let diagnostics = vec![
-            PolicyDiagnostic {
-                name: "idle_seconds",
-                value: PolicyDiagnosticValue::Duration(evaluation.session.bad_duration),
-            },
-            PolicyDiagnostic {
-                name: "uploaded_delta_bytes",
-                value: PolicyDiagnosticValue::String(
-                    evaluation
-                        .uploaded_delta_bytes
-                        .map(|delta| delta.to_string())
-                        .unwrap_or_else(|| "missing".to_string()),
-                ),
-            },
-            PolicyDiagnostic {
-                name: "current_upload_rate_bps",
-                value: PolicyDiagnosticValue::U64(evaluation.session.last_upload_rate_bps),
-            },
-            PolicyDiagnostic {
-                name: "threshold_met",
-                value: PolicyDiagnosticValue::Bool(evaluation.is_bad_sample),
-            },
-        ];
-        Ok(PeerPolicyAssessment {
-            policy_name: self.name(),
-            evaluation: Box::new(ReceiveIdleAssessmentEvaluation { evaluation }),
-            disposition,
-            diagnostics,
-        })
-    }
-
     async fn persist_assessment(
         &self,
         persistence: &Persistence,
@@ -813,7 +810,10 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
             .record_policy_ban_enforcement(evaluation, decision, enforced_at)
             .await
     }
+}
 
+#[async_trait::async_trait]
+impl PeerPolicyReplay for ReceiveIdlePeerPolicy {
     async fn record_replayed_intent(
         &self,
         persistence: &Persistence,
@@ -882,34 +882,6 @@ impl PeerPolicy for ReceiveIdlePeerPolicy {
         }
         Ok(())
     }
-
-    fn pending_ban_intent(
-        &self,
-        assessment: &PeerPolicyAssessment,
-        decision: &BanDecision,
-        torrent: &TorrentSummary,
-        observed_at: SystemTime,
-    ) -> PendingBanIntentRecord {
-        PendingBanIntentRecord {
-            torrent_hash: torrent.hash.clone(),
-            peer_ip: decision.peer_ip,
-            peer_port: decision.peer_port,
-            policy_name: self.name().to_string(),
-            offence_number: decision.offence_number,
-            reason_code: decision.reason_code.clone(),
-            observed_at,
-            ban_expires_at: observed_at + decision.ttl,
-            bad_duration: assessment.evaluation.bad_duration(),
-            progress_delta_per_mille: assessment.evaluation.progress_delta_per_mille(),
-            avg_up_rate_bps: assessment.evaluation.avg_upload_rate_bps(),
-            last_error: "pending qbittorrent enforcement".to_string(),
-        }
-    }
-
-    fn record_assessment_metrics(&self, metrics: &AppMetrics, assessment: &PeerPolicyAssessment) {
-        metrics.record_peer_evaluated(self.metric_label(), assessment.evaluation.is_bad_sample());
-        metrics.record_policy_evaluation(self.metric_label(), assessment.evaluation.is_bannable());
-    }
 }
 
 impl PolicyEngine {
@@ -941,8 +913,8 @@ impl PolicyEngine {
         }
     }
 
-    pub fn enabled_peer_policies(&self) -> Vec<Arc<dyn PeerPolicy>> {
-        let mut policies: Vec<Arc<dyn PeerPolicy>> = Vec::new();
+    pub fn enabled_peer_policies(&self) -> Vec<Arc<dyn PeerPolicyAdapter>> {
+        let mut policies: Vec<Arc<dyn PeerPolicyAdapter>> = Vec::new();
         if self.config.score.enabled {
             policies.push(Arc::new(ScorePeerPolicy {
                 engine: self.clone(),
@@ -956,7 +928,7 @@ impl PolicyEngine {
         policies
     }
 
-    pub fn replay_peer_policies(&self) -> Vec<Arc<dyn PeerPolicy>> {
+    pub fn replay_peer_policies(&self) -> Vec<Arc<dyn PeerPolicyAdapter>> {
         vec![
             Arc::new(ScorePeerPolicy {
                 engine: self.clone(),

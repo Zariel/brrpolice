@@ -11,7 +11,7 @@ use crate::{
     config::AppConfig,
     metrics::AppMetrics,
     persistence::{ActiveBanRecord, PendingBanIntentRecord, Persistence, RecoverySnapshot},
-    policy::{PeerPolicy, PolicyCycleCache, PolicyDataStore, PolicyEngine},
+    policy::{PeerPolicyAdapter, PolicyCycleCache, PolicyDataStore, PolicyEngine},
     qbittorrent::QbittorrentClient,
     runtime::ServiceState,
     types::{
@@ -88,8 +88,8 @@ pub struct ControlLoop {
     config: Arc<AppConfig>,
     persistence: Arc<Persistence>,
     qbittorrent: Arc<QbittorrentClient>,
-    peer_policies: Vec<Arc<dyn PeerPolicy>>,
-    replay_policies: Vec<Arc<dyn PeerPolicy>>,
+    peer_policies: Vec<Arc<dyn PeerPolicyAdapter>>,
+    replay_policies: Vec<Arc<dyn PeerPolicyAdapter>>,
     service_state: Arc<ServiceState>,
     metrics: Arc<AppMetrics>,
     shutdown: watch::Receiver<bool>,
@@ -106,7 +106,7 @@ pub struct PollCycleResult {
 
 #[derive(Clone)]
 struct PendingBanAction {
-    policy: Arc<dyn PeerPolicy>,
+    policy: Arc<dyn PeerPolicyAdapter>,
     torrent_hash: String,
     torrent_name: String,
     torrent_tracker: String,
@@ -119,7 +119,7 @@ struct PendingBanAction {
 
 #[derive(Clone)]
 struct PeerPolicyRun {
-    policy: Arc<dyn PeerPolicy>,
+    policy: Arc<dyn PeerPolicyAdapter>,
     policy_name: &'static str,
     metric_label: &'static str,
     peer_key: String,
@@ -523,7 +523,7 @@ impl ControlLoop {
 
     async fn load_peer_policy_run(
         &self,
-        policy: Arc<dyn PeerPolicy>,
+        policy: Arc<dyn PeerPolicyAdapter>,
         policy_store: &dyn PolicyDataStore,
         observed_peer: &ObservedPeer,
         observed_at: std::time::SystemTime,
@@ -556,7 +556,11 @@ impl ControlLoop {
             );
         }
         assessment.validate_telemetry()?;
-        policy.record_assessment_metrics(&self.metrics, &assessment);
+        self.metrics
+            .record_peer_evaluated(policy.metric_label(), assessment.evaluation.is_bad_sample());
+        self.metrics
+            .record_policy_evaluation(policy.metric_label(), assessment.evaluation.is_bannable());
+        policy.record_policy_specific_metrics(&self.metrics, &assessment);
         let peer_key = peer_log_state_key(policy.name(), assessment.evaluation.offence_identity());
         let metric_label = policy.metric_label();
         Ok(PeerPolicyRun {
@@ -702,8 +706,21 @@ impl ControlLoop {
         torrent: &TorrentSummary,
         observed_at: std::time::SystemTime,
     ) -> PendingBanIntentRecord {
-        run.policy
-            .pending_ban_intent(&run.assessment(), decision, torrent, observed_at)
+        let assessment = run.assessment();
+        PendingBanIntentRecord {
+            torrent_hash: torrent.hash.clone(),
+            peer_ip: decision.peer_ip,
+            peer_port: decision.peer_port,
+            policy_name: run.policy_name.to_string(),
+            offence_number: decision.offence_number,
+            reason_code: decision.reason_code.clone(),
+            observed_at,
+            ban_expires_at: observed_at + decision.ttl,
+            bad_duration: assessment.evaluation.bad_duration(),
+            progress_delta_per_mille: assessment.evaluation.progress_delta_per_mille(),
+            avg_up_rate_bps: assessment.evaluation.avg_upload_rate_bps(),
+            last_error: "pending qbittorrent enforcement".to_string(),
+        }
     }
 
     fn log_peer_policy_ban_pending(
@@ -1388,7 +1405,7 @@ impl ControlLoop {
         Ok(())
     }
 
-    fn peer_policy_by_name(&self, policy_name: &str) -> Option<Arc<dyn PeerPolicy>> {
+    fn peer_policy_by_name(&self, policy_name: &str) -> Option<Arc<dyn PeerPolicyAdapter>> {
         self.replay_policies
             .iter()
             .find(|policy| policy.name() == policy_name)
