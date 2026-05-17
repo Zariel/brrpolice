@@ -149,7 +149,7 @@ Shared exemptions apply before either policy can ban: out-of-scope torrents, all
 | `policy.score.churn.min_reconnects` | `BRRPOLICE_POLICY__SCORE__CHURN__MIN_RECONNECTS` | `2` | Minimum reconnect count in the churn window before churn amplification starts applying. |
 | `policy.score.churn.max_amplifier` | `BRRPOLICE_POLICY__SCORE__CHURN__MAX_AMPLIFIER` | `1.0` | Maximum extra multiplier applied to sample risk (`effective = sample * (1 + churn_amplifier)`). |
 | `policy.score.churn.decay_per_second` | `BRRPOLICE_POLICY__SCORE__CHURN__DECAY_PER_SECOND` | `0.002` | Decay rate for accumulated churn amplification between observations. |
-| `policy.receive_idle.enabled` | `BRRPOLICE_POLICY__RECEIVE_IDLE__ENABLED` | `true` | Enables the inactive/receive-idle policy. |
+| `policy.receive_idle.enabled` | `BRRPOLICE_POLICY__RECEIVE_IDLE__ENABLED` | `false` | Enables the inactive/receive-idle policy. |
 | `policy.receive_idle.min_observation_duration` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MIN_OBSERVATION_DURATION` | `3m` | Minimum tracked peer age before receive-idle bans can trigger. |
 | `policy.receive_idle.sustain_duration` | `BRRPOLICE_POLICY__RECEIVE_IDLE__SUSTAIN_DURATION` | `2m` | Time a peer must continuously show no upload rate and no uploaded-byte progress before a receive-idle ban is allowed. |
 | `policy.receive_idle.max_upload_rate_bps` | `BRRPOLICE_POLICY__RECEIVE_IDLE__MAX_UPLOAD_RATE_BPS` | `0` | Maximum current qBittorrent `up_speed` that still counts as idle. The default requires exactly zero current upload. |

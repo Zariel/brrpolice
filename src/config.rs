@@ -88,7 +88,7 @@ impl AppConfig {
             .set_default("policy.score.churn.min_reconnects", 2_u32)?
             .set_default("policy.score.churn.max_amplifier", 1.0_f64)?
             .set_default("policy.score.churn.decay_per_second", 0.002_f64)?
-            .set_default("policy.receive_idle.enabled", true)?
+            .set_default("policy.receive_idle.enabled", false)?
             .set_default("policy.receive_idle.min_observation_duration", "3m")?
             .set_default("policy.receive_idle.sustain_duration", "2m")?
             .set_default("policy.receive_idle.max_upload_rate_bps", 0_u64)?
