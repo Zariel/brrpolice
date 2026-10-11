@@ -102,7 +102,7 @@ qBittorrent auth rule:
 
 | Setting | Env Var | Default | Impact |
 |---|---|---|---|
-| `qbittorrent.base_url` | `BRRPOLICE_QBITTORRENT__BASE_URL` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. |
+| `qbittorrent.base_url` | `BRRPOLICE_QBITTORRENT__BASE_URL` | `http://qbittorrent:8080` | Base URL for qBittorrent WebUI API calls. Must be `http` or `https` and must not include credentials in the URL. Only the scheme, host, and port are logged or persisted; any path or query (for example a proxy API key) is redacted. |
 | `qbittorrent.username` | `BRRPOLICE_QBITTORRENT__USERNAME` | `""` | Enables authenticated API mode when set together with `password_env`. |
 | `qbittorrent.password_env` | `BRRPOLICE_QBITTORRENT__PASSWORD_ENV` | `""` | Name of the environment variable that contains the qBittorrent password. Used only when auth is enabled. |
 | `qbittorrent.api_key` | `BRRPOLICE_QBITTORRENT__API_KEY` | `""` | qBittorrent 5.2+ API key sent as `Authorization: Bearer ...`. Mutually exclusive with username/password cookie auth. |
