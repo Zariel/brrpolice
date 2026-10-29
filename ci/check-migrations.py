@@ -2,19 +2,47 @@
 """Exercise a populated database upgrade using the rendered chart's storage contract."""
 
 import hashlib
+import http.server
 import json
 import os
 import shlex
+import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = shlex.split(os.environ.get("CONTAINER_ENGINE", "docker"))
 IMAGE = os.environ.get("TEST_IMAGE", "brrpolice-ci:test")
 OFFENCES = 155_000
+
+
+class QbittorrentStub(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        bodies = {
+            "/api/v2/app/webapiVersion": "2.11.0",
+            "/api/v2/app/preferences": '{"banned_IPs":""}',
+            "/api/v2/torrents/info": "[]",
+        }
+        body = bodies.get(self.path.split("?", 1)[0])
+        self.send_response(200 if body is not None else 404)
+        payload = (body or "unknown endpoint").encode()
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
 def command(*args, **kwargs):
@@ -60,14 +88,20 @@ def fixture(path):
     path.chmod(0o666)
 
 
-def main():
+def check_migrations(qbittorrent_port):
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        http_port = available.getsockname()[1]
+
     rendered = command(
         "helm",
         "template",
         "brrpolice",
         str(ROOT / "charts/brrpolice"),
         "--set",
-        "config.qbittorrent.base_url=http://127.0.0.1:1",
+        f"config.qbittorrent.base_url=http://127.0.0.1:{qbittorrent_port}",
+        "--set",
+        f"config.http.port={http_port}",
         "--set",
         "persistence.existingClaim=fixture",
         "--set",
@@ -113,6 +147,7 @@ def main():
             *ENGINE,
             "run",
             "--read-only",
+            "--network=host",
             "--memory",
             "64m",
             "--cap-drop=ALL",
@@ -160,6 +195,14 @@ def main():
             try:
                 deadline = time.monotonic() + 60
                 while True:
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{http_port}/readyz", timeout=1
+                        ) as response:
+                            ready = response.status == 200
+                    except OSError:
+                        ready = False
+
                     with sqlite3.connect(database, timeout=1) as observer:
                         complete = observer.execute(
                             "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=8 AND success=1"
@@ -167,7 +210,7 @@ def main():
                         metadata = observer.execute(
                             "SELECT schema_version FROM service_meta"
                         ).fetchone()
-                        if complete and metadata:
+                        if ready and complete and metadata:
                             assert (
                                 observer.execute(
                                     "SELECT COUNT(*) FROM peer_offences"
@@ -185,12 +228,21 @@ def main():
                     assert state == "true", command(*ENGINE, "logs", running)
                     time.sleep(0.1)
                 print(
-                    f"With /tmp, start {attempt + 1}: schema 8; {OFFENCES} offences retained",
+                    f"With /tmp, start {attempt + 1}: Ready; schema 8; {OFFENCES} offences retained",
                     flush=True,
                 )
             finally:
                 command(*ENGINE, "stop", "--time", "10", running)
                 command(*ENGINE, "rm", running)
+
+
+def main():
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), QbittorrentStub) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            check_migrations(server.server_port)
+        finally:
+            server.shutdown()
 
 
 if __name__ == "__main__":
