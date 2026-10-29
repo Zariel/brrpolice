@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_HASH: &str = "bootstrap";
 const MIGRATIONS_TABLE_SQL: &str = r#"
@@ -908,16 +908,14 @@ impl Persistence {
                         (po.ban_revoked_at IS NOT NULL AND po.ban_revoked_at <= ?)
                         OR (po.ban_revoked_at IS NULL AND po.ban_expires_at <= ?)
                     )
-                    AND EXISTS (
-                        SELECT 1
-                        FROM peer_offences newer
-                        WHERE newer.torrent_hash = po.torrent_hash
-                            AND newer.peer_ip = po.peer_ip
-                            AND newer.policy_name = po.policy_name
-                            AND (
-                                newer.banned_at > po.banned_at
-                                OR (newer.banned_at = po.banned_at AND newer.rowid > po.rowid)
-                            )
+                    AND po.rowid != (
+                        SELECT latest.rowid
+                        FROM peer_offences latest
+                        WHERE latest.torrent_hash = po.torrent_hash
+                            AND latest.peer_ip = po.peer_ip
+                            AND latest.policy_name = po.policy_name
+                        ORDER BY latest.banned_at DESC, latest.rowid DESC
+                        LIMIT 1
                     )
                     AND NOT EXISTS (
                         SELECT 1
@@ -1937,6 +1935,12 @@ mod tests {
             "peer session churn fields",
             include_str!("../migrations/0005_peer_session_churn_fields.sql"),
         ),
+        (6, MIGRATION_0006_DESCRIPTION, MIGRATION_0006_SQL),
+        (
+            7,
+            "policy sessions and policy names",
+            include_str!("../migrations/0007_policy_sessions_and_policy_names.sql"),
+        ),
     ];
 
     #[tokio::test]
@@ -2545,7 +2549,7 @@ mod tests {
         let db_path = temp_dir.path().join("legacy-v5.sqlite");
         let persistence = file_persistence(&db_path).await;
 
-        for (_, _, sql) in MIGRATION_FIXTURES {
+        for (_, _, sql) in MIGRATION_FIXTURES.iter().take(5) {
             persistence.pool.execute(*sql).await.unwrap();
         }
         persistence
@@ -2553,7 +2557,7 @@ mod tests {
             .execute(MIGRATIONS_TABLE_SQL)
             .await
             .unwrap();
-        for (version, description, sql) in MIGRATION_FIXTURES {
+        for (version, description, sql) in MIGRATION_FIXTURES.iter().take(5) {
             sqlx::query(
                 r#"
                 INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
@@ -2663,7 +2667,7 @@ mod tests {
         let db_path = temp_dir.path().join("legacy-v6.sqlite");
         let persistence = file_persistence(&db_path).await;
 
-        for (_, _, sql) in MIGRATION_FIXTURES {
+        for (_, _, sql) in MIGRATION_FIXTURES.iter().take(5) {
             persistence.pool.execute(*sql).await.unwrap();
         }
         persistence.pool.execute(MIGRATION_0006_SQL).await.unwrap();
@@ -2672,7 +2676,7 @@ mod tests {
             .execute(MIGRATIONS_TABLE_SQL)
             .await
             .unwrap();
-        for (version, description, sql) in MIGRATION_FIXTURES {
+        for (version, description, sql) in MIGRATION_FIXTURES.iter().take(5) {
             mark_fixture_migration_applied(&persistence, *version, description, sql).await;
         }
         mark_fixture_migration_applied(
@@ -3443,6 +3447,147 @@ mod tests {
         let remaining = persistence.load_peer_offences_by_ip(peer_ip).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].offence_number, 2);
+    }
+
+    #[tokio::test]
+    async fn retention_prune_orders_offences_by_time_then_id() {
+        let persistence = test_persistence().await;
+        persistence.run_migrations().await.unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(30_000_000);
+
+        // Insertion order alone cannot identify the latest offence. Equal times
+        // retain the last inserted row, even when the peer port has changed.
+        for (offence_number, expires_at) in [(1, 200), (2, 100), (3, 200), (4, 100)] {
+            let mut offence = sample_peer_offence(offence_number, expires_at);
+            offence.banned_at = UNIX_EPOCH + Duration::from_secs(expires_at - 1);
+            offence.peer_port += offence_number as u16;
+            persistence.insert_peer_offence(&offence).await.unwrap();
+        }
+
+        let retention = RetentionConfig::default();
+        let result = persistence
+            .run_retention_prune(&retention, now)
+            .await
+            .unwrap();
+        assert_eq!(result.peer_offences_deleted, 3);
+
+        let remaining = persistence
+            .load_peer_offences_by_ip("10.0.0.10".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].offence_number, 3);
+        assert_eq!(
+            persistence
+                .run_retention_prune(&retention, now)
+                .await
+                .unwrap()
+                .peer_offences_deleted,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prune_scales_with_history() {
+        for distribution in ["identities", "history", "timestamp ties"] {
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("retention.sqlite");
+            let persistence = file_persistence(&db_path).await;
+
+            // Populate the released schema before upgrading so the workload also
+            // verifies that existing databases receive the retention indexes.
+            persistence
+                .pool
+                .execute(MIGRATIONS_TABLE_SQL)
+                .await
+                .unwrap();
+            for (version, description, sql) in MIGRATION_FIXTURES {
+                persistence.pool.execute(*sql).await.unwrap();
+                mark_fixture_migration_applied(&persistence, *version, description, sql).await;
+            }
+
+            sqlx::query(
+                r#"
+                WITH RECURSIVE seq(n) AS (
+                    VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 2000
+                )
+                INSERT INTO peer_offences (
+                    torrent_hash, peer_ip, peer_port, policy_name, offence_number,
+                    reason_code, observed_seconds, bad_seconds, progress_delta,
+                    avg_up_rate_bps, banned_at, ban_expires_at
+                )
+                SELECT
+                    CASE WHEN ? = 'identities' THEN 'torrent-' || n ELSE 'history' END,
+                    '10.0.0.10', n, 'score', n, 'score_based', 600, 600, 0, 0,
+                    CASE WHEN ? = 'timestamp ties' THEN '1970-01-01T00:00:00Z'
+                        ELSE strftime('%Y-%m-%dT%H:%M:%SZ', n, 'unixepoch') END,
+                    '1970-01-02T00:00:00Z'
+                FROM seq
+                "#,
+            )
+            .bind(distribution)
+            .bind(distribution)
+            .execute(&persistence.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                WITH RECURSIVE seq(n) AS (
+                    VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 2000
+                )
+                INSERT INTO active_bans (
+                    peer_ip, peer_port, scope, offence_number, reason, created_at, expires_at
+                )
+                SELECT '10.0.0.10', n, 'torrent:unrelated-' || n, 1, 'score_based',
+                    '1970-01-01T00:00:00Z', '1971-01-01T00:00:00Z'
+                FROM seq
+                "#,
+            )
+            .execute(&persistence.pool)
+            .await
+            .unwrap();
+
+            let mut ban = sample_active_ban();
+            ban.scope = "torrent:history".to_string();
+            persistence.upsert_active_ban(&ban).await.unwrap();
+
+            persistence.run_migrations().await.unwrap();
+            persistence.pool.close().await;
+            let reopened = file_persistence(&db_path).await;
+            reopened.run_migrations().await.unwrap();
+
+            let mut connection = reopened.pool.acquire().await.unwrap();
+            let mut callbacks = 0;
+            // Bound database work rather than elapsed time: one million VM
+            // instructions allows indexed lookups but rejects repeated scans
+            // across 2,000 offences or bans, including no-op prune runs.
+            connection
+                .lock_handle()
+                .await
+                .unwrap()
+                .set_progress_handler(1000, move || {
+                    callbacks += 1;
+                    callbacks < 1000
+                });
+            drop(connection);
+
+            let now = UNIX_EPOCH + Duration::from_secs(30_000_000);
+            for _ in 0..2 {
+                let result = reopened
+                    .run_retention_prune(&RetentionConfig::default(), now)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("prune exceeded work budget for {distribution}: {error}")
+                    });
+                assert_eq!(result.peer_offences_deleted, 0, "{distribution}");
+                assert_eq!(result.active_bans_deleted, 0, "{distribution}");
+            }
+
+            // Observe the committed data through a separate SQLite connection.
+            let observer = file_persistence(&db_path).await;
+            assert_eq!(count_rows(&observer, "peer_offences").await, 2000);
+            assert_eq!(count_rows(&observer, "active_bans").await, 2001);
+        }
     }
 
     #[tokio::test]
