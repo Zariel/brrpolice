@@ -47,13 +47,15 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  publish:
+  image:
     needs:
       - test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    env:
+      PUBLISH_IMAGE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -76,14 +78,14 @@ jobs:
         run: goss -g ci/goss/docker-image.yaml validate
 
       - name: Resolve image name
-        if: github.event_name == 'push'
+        if: env.PUBLISH_IMAGE == 'true'
         id: image
         run: |
           set -euo pipefail
           echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve image metadata
-        if: github.event_name == 'push'
+        if: env.PUBLISH_IMAGE == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -95,7 +97,7 @@ jobs:
             type=ref,event=tag
 
       - name: Validate publish tag contract
-        if: github.event_name == 'push'
+        if: env.PUBLISH_IMAGE == 'true'
         env:
           RESOLVED_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -114,7 +116,7 @@ jobs:
           fi
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: env.PUBLISH_IMAGE == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -122,7 +124,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Tag and push image
-        if: github.event_name == 'push'
+        if: env.PUBLISH_IMAGE == 'true'
         env:
           RESOLVED_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
