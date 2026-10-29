@@ -1,12 +1,19 @@
 name: ci
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
       - "**"
     tags:
       - "v*"
+
+env:
+  HELM_VERSION: v4.2.4
+  HELM_UNITTEST_VERSION: v1.2.1
+  HELM_DOCS_VERSION: 1.14.2
+  YQ_VERSION: v4.53.3
 
 jobs:
   test:
@@ -60,6 +67,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Install Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$RUNNER_TEMP/bin/yq"
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       - name: Install goss
         env:
           GOSS_VERSION: 0.4.10
@@ -76,6 +95,9 @@ jobs:
 
       - name: Validate image with goss
         run: goss -g ci/goss/docker-image.yaml validate
+
+      - name: Validate populated database migration with read-only root
+        run: python3 ci/check-migrations.py
 
       - name: Resolve image name
         if: env.PUBLISH_IMAGE == 'true'
@@ -134,3 +156,88 @@ jobs:
             docker tag brrpolice-ci:test "$tag"
             docker push "$tag"
           done
+
+  chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install chart validation tools
+        run: |
+          helm plugin install https://github.com/helm-unittest/helm-unittest --version "$HELM_UNITTEST_VERSION" --verify=false
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/norwoodj/helm-docs/releases/download/v${HELM_DOCS_VERSION}/helm-docs_${HELM_DOCS_VERSION}_Linux_x86_64.tar.gz" -o "$RUNNER_TEMP/helm-docs.tar.gz"
+          tar -xzf "$RUNNER_TEMP/helm-docs.tar.gz" -C "$RUNNER_TEMP/bin" helm-docs
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint and test chart
+        run: |
+          helm lint --strict charts/brrpolice --set config.qbittorrent.base_url=http://qbittorrent.default.svc.cluster.local
+          helm unittest --strict charts/brrpolice
+          python3 ci/check-chart-values.py
+
+      - name: Check generated chart documentation
+        run: |
+          helm-docs --chart-search-root charts
+          git diff --exit-code -- charts/brrpolice/README.md
+
+  publish-chart:
+    needs:
+      - image
+      - chart
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$RUNNER_TEMP/bin/yq"
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Pin released image and package chart
+        run: |
+          set -euo pipefail
+          version="$(yq -r '.version' charts/brrpolice/Chart.yaml)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          repository="$(yq -r '.image.repository' charts/brrpolice/values.yaml)"
+          digest="$(docker buildx imagetools inspect "${repository}:v${version}" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          DIGEST="$digest" yq -i '.image.digest = strenv(DIGEST)' charts/brrpolice/values.yaml
+          helm package charts/brrpolice --version "$version" --app-version "$version" --destination "$RUNNER_TEMP"
+          echo "CHART_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Publish chart to GHCR (OCI)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "$RUNNER_TEMP/brrpolice-${CHART_VERSION}.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"

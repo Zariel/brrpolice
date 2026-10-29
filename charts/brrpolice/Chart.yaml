@@ -1,0 +1,16 @@
+apiVersion: v2
+name: brrpolice
+description: Temporary peer enforcement for qBittorrent seeding nodes
+type: application
+version: 0.16.0
+appVersion: "0.16.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/Zariel/brrpolice
+sources:
+  - https://github.com/Zariel/brrpolice
+keywords:
+  - qbittorrent
+  - monitoring
+  - sqlite
+annotations:
+  org.opencontainers.image.source: https://github.com/Zariel/brrpolice

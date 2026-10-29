@@ -1,0 +1,9 @@
+Install documentation: https://github.com/Zariel/brrpolice/tree/main/charts/brrpolice
+
+HTTP endpoints: /healthz, /readyz, /metrics
+Service: {{ include "brrpolice.fullname" . }}:{{ .Values.service.port }}
+
+{{- if not .Values.persistence.enabled }}
+
+Persistence is disabled. Replacing the pod discards offence history and recovery state.
+{{- end }}

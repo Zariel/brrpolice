@@ -1,0 +1,46 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+Install the OCI chart:
+
+```sh
+helm install brrpolice oci://ghcr.io/zariel/charts/brrpolice \
+  --namespace default \
+  --set config.qbittorrent.base_url=http://qbittorrent.default.svc.cluster.local
+```
+
+The chart runs one instance with `Recreate` upgrades so enforcement and SQLite
+writes never overlap. `replicaCount` accepts only `0` or `1`.
+
+SQLite data uses a PVC by default. Set `persistence.existingClaim` to reuse an
+existing database, and match `podSecurityContext` to the volume's ownership. A
+disk-backed `emptyDir` is always mounted at `/tmp`: SQLite needs writable
+temporary storage for large migrations and query sorts even when `/data` is
+writable. The root filesystem stays read-only.
+
+`config` is the application's native configuration, serialized as TOML. It
+supports the policy, filters, retention, logging, and qBittorrent settings in the
+[application README](../../README.md). Strings support Helm template expressions.
+The ConfigMap checksum rolls out configuration changes.
+
+Keep credentials in Kubernetes Secrets. For API-key authentication, for example:
+
+```yaml
+extraEnv:
+  - name: BRRPOLICE_QBITTORRENT__API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: qbittorrent-auth
+        key: api-key
+```
+
+For cookie authentication, set `config.qbittorrent.username` and
+`config.qbittorrent.password_env` to the name of a Secret-backed environment
+variable supplied through `extraEnv`. Do not put credentials in `config`.
+
+Charts are published only as OCI artifacts. Release packages pin the container
+image digest and use the application release version for both chart version
+and `appVersion`. Pull requests validate charts without publishing them.
+
+{{ template "chart.valuesSection" . }}

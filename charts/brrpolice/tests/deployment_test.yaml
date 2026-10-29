@@ -1,0 +1,99 @@
+suite: deployment contract
+templates:
+  - templates/deployment.yaml
+set:
+  config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
+release:
+  name: brrpolice
+tests:
+  - it: keeps one writer and disk-backed temporary storage on a read-only root
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.strategy
+          value:
+            type: Recreate
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir: {}
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+  - it: reuses the existing data volume and ownership
+    set:
+      persistence.existingClaim: brrpolice-data
+      podSecurityContext.runAsUser: 568
+      podSecurityContext.runAsGroup: 568
+      podSecurityContext.fsGroup: 568
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: brrpolice-data
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 568
+  - it: pins a digest instead of using a mutable tag
+    set:
+      image.tag: ignored
+      image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/zariel/brrpolice@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: uses the released application tag by default
+    chart:
+      appVersion: 1.2.3
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/zariel/brrpolice:v1.2.3
+  - it: derives ports and image environment overrides from native configuration
+    set:
+      config.http.port: 8080
+      config.database.path: /data/history.sqlite
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BRRPOLICE_HTTP__PORT
+            value: "8080"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BRRPOLICE_DATABASE__PATH
+            value: /data/history.sqlite
+  - it: accepts secret references without embedding credentials in configuration
+    set:
+      extraEnv:
+        - name: BRRPOLICE_QBITTORRENT__API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: qbittorrent-auth
+              key: api-key
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BRRPOLICE_QBITTORRENT__API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: qbittorrent-auth
+                key: api-key

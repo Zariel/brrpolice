@@ -1,0 +1,4 @@
+.git/
+tests/
+README.md.gotmpl
+*.tgz
