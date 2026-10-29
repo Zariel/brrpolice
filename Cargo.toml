@@ -4,7 +4,7 @@ default-members = [".", "./crates/score-simulator"]
 
 [package]
 name = "brrpolice"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 license-file = "LICENSE"
 
