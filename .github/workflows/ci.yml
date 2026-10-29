@@ -59,10 +59,14 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install goss
+        env:
+          GOSS_VERSION: 0.4.10
         run: |
           set -euo pipefail
-          curl -fsSL https://github.com/goss-org/goss/releases/latest/download/goss-linux-amd64 -o /usr/local/bin/goss
-          chmod +x /usr/local/bin/goss
+          goss_tmp="$(mktemp -d)"
+          curl -fsSL "https://github.com/goss-org/goss/releases/download/v${GOSS_VERSION}/goss_${GOSS_VERSION}_linux_x86_64.tar.gz" -o "$goss_tmp/goss.tar.gz"
+          tar -xzf "$goss_tmp/goss.tar.gz" -C "$goss_tmp" goss
+          sudo install -m 0755 "$goss_tmp/goss" /usr/local/bin/goss
           goss --version
 
       - name: Build image
