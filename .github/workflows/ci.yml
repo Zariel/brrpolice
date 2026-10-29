@@ -213,11 +213,13 @@ jobs:
         with:
           version: ${{ env.HELM_VERSION }}
 
-      - name: Install yq
+      - name: Install packaging tools
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$RUNNER_TEMP/bin/yq"
           chmod +x "$RUNNER_TEMP/bin/yq"
+          curl -fsSL "https://github.com/norwoodj/helm-docs/releases/download/v${HELM_DOCS_VERSION}/helm-docs_${HELM_DOCS_VERSION}_Linux_x86_64.tar.gz" -o "$RUNNER_TEMP/helm-docs.tar.gz"
+          tar -xzf "$RUNNER_TEMP/helm-docs.tar.gz" -C "$RUNNER_TEMP/bin" helm-docs
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Pin released image and package chart
@@ -228,10 +230,14 @@ jobs:
             version="${GITHUB_REF_NAME#v}"
           fi
           repository="$(yq -r '.image.repository' charts/brrpolice/values.yaml)"
-          digest="$(docker buildx imagetools inspect "${repository}:v${version}" --format '{{.Manifest.Digest}}')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          DIGEST="$digest" yq -i '.image.digest = strenv(DIGEST)' charts/brrpolice/values.yaml
+          export IMAGE_TAG="v${version}"
+          DIGEST="$(docker buildx imagetools inspect "${repository}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          export DIGEST
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          yq -i '.image.tag = strenv(IMAGE_TAG) | .image.digest = strenv(DIGEST)' charts/brrpolice/values.yaml
+          helm-docs --chart-search-root charts
           helm package charts/brrpolice --version "$version" --app-version "$version" --destination "$RUNNER_TEMP"
+          helm show values "$RUNNER_TEMP/brrpolice-${version}.tgz" | yq -e '.image.tag == strenv(IMAGE_TAG) and .image.digest == strenv(DIGEST)'
           echo "CHART_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Publish chart to GHCR (OCI)
