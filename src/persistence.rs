@@ -978,8 +978,11 @@ impl Persistence {
             VacuumMode::Off => None,
             VacuumMode::Incremental => {
                 let pages = retention.vacuum.incremental_pages;
+                // PRAGMA arguments cannot be bound; pages is an unsigned integer.
                 let statement = format!("PRAGMA incremental_vacuum({pages})");
-                sqlx::query(&statement).execute(&mut *tx).await?;
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut *tx)
+                    .await?;
                 Some(pages)
             }
         };
@@ -3983,9 +3986,9 @@ mod tests {
         );
     }
 
-    async fn count_rows(persistence: &Persistence, table: &str) -> usize {
+    async fn count_rows(persistence: &Persistence, table: &'static str) -> usize {
         let query = format!("SELECT COUNT(*) FROM {table}");
-        let count = sqlx::query_scalar::<_, i64>(&query)
+        let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query))
             .fetch_one(&persistence.pool)
             .await
             .unwrap();

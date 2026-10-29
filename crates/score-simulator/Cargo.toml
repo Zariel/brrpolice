@@ -1,12 +1,12 @@
 [package]
 name = "score-simulator"
-version = "0.1.0"
+version = "0.16.0"
 edition = "2024"
 license-file = "../../LICENSE"
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.104"
 brrpolice = { path = "../.." }
-humantime = "2.3.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+humantime = "2.4.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
