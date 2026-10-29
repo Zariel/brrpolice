@@ -4,30 +4,30 @@ default-members = [".", "./crates/score-simulator"]
 
 [package]
 name = "brrpolice"
-version = "0.1.0"
+version = "0.16.0"
 edition = "2024"
 license-file = "LICENSE"
 
 [dependencies]
-anyhow = "1.0.100"
-axum = "0.8.4"
-config = { version = "0.15.18", default-features = false, features = ["toml"] }
-humantime = "2.3.0"
-ipnet = "2.11.0"
-prometheus-client = "0.24.0"
-reqwest = { version = "0.12.24", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+anyhow = "1.0.104"
+axum = "0.8.9"
+config = { version = "0.15.27", default-features = false, features = ["toml"] }
+humantime = "2.4.0"
+ipnet = "2.12.2"
+prometheus-client = "0.25.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "form", "json", "query", "rustls"] }
 secrecy = "0.10.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-sha2 = "0.10.9"
-sqlx = { version = "0.8.6", default-features = false, features = ["derive", "migrate", "runtime-tokio-rustls", "sqlite"] }
-tempfile = "3.23.0"
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-toml = "0.9.8"
-tower = { version = "0.5.2", features = ["util"] }
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["derive", "migrate", "runtime-tokio", "sqlite"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.8"
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
-proptest = "1.9.0"
+proptest = "1.12.0"
 wiremock = "0.6.5"

@@ -7,7 +7,7 @@ WORKDIR /workspace
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=cargo-target,target=/workspace/target \
-    cargo install cargo-chef --locked --version 0.1.74
+    cargo install cargo-chef --locked --version 0.1.78
 
 FROM chef AS planner
 
