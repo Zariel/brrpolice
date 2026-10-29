@@ -39,6 +39,32 @@ For cookie authentication, set `config.qbittorrent.username` and
 `config.qbittorrent.password_env` to the name of a Secret-backed environment
 variable supplied through `extraEnv`. Do not put credentials in `config`.
 
+Set `monitoring.dashboards.enabled: true` to deploy the bundled Grafana overview
+dashboard as a ConfigMap labeled `grafana_dashboard: "1"` for the Grafana sidecar.
+The sidecar must watch the dashboard namespace, which defaults to the release
+namespace and can be changed with `monitoring.dashboards.namespace`. Customize
+the ConfigMap with `monitoring.dashboards.labels` and `annotations`.
+
+For Grafana Operator, enable the dashboard and its `GrafanaDashboard` resource:
+
+```yaml
+monitoring:
+  dashboards:
+    enabled: true
+    grafanaOperator:
+      enabled: true
+      matchLabels:
+        dashboards: grafana
+      folder: brrpolice
+```
+
+The Grafana Operator CRD must already be installed. `matchLabels` can select a
+target Grafana instance; leave it empty to match all instances. The operator
+reads the dashboard from the ConfigMap; the sidecar label is omitted in this
+mode. Dashboard deployment is independent of
+`monitoring.serviceMonitor.enabled`; configure Prometheus to scrape brrpolice
+and select its datasource in the dashboard.
+
 Charts are published only as OCI artifacts. Release packages pin the container
 image digest and use the application release version for both chart version
 and `appVersion`. Pull requests validate charts without publishing them.
@@ -65,6 +91,15 @@ and `appVersion`. Pull requests validate charts without publishing them.
 | image.tag | string | `""` | Image tag; empty uses v followed by the chart appVersion. |
 | imagePullSecrets | list | `[]` | Registry credentials for private mirrors. |
 | livenessProbe | object | `{"httpGet":{"path":"/healthz","port":"http"},"periodSeconds":10,"timeoutSeconds":5}` | Liveness probe. |
+| monitoring.dashboards.annotations | object | `{}` | Dashboard ConfigMap annotations. |
+| monitoring.dashboards.enabled | bool | `false` | Deploy the bundled Grafana dashboard in a ConfigMap. |
+| monitoring.dashboards.grafanaOperator.allowCrossNamespaceImport | bool | `true` | Allow Grafana instances in other namespaces to import the dashboard. |
+| monitoring.dashboards.grafanaOperator.enabled | bool | `false` | Create a GrafanaDashboard referencing the ConfigMap; requires the Grafana Operator CRD and dashboards.enabled. |
+| monitoring.dashboards.grafanaOperator.folder | string | `""` | Grafana folder; empty uses the operator default. |
+| monitoring.dashboards.grafanaOperator.matchLabels | object | `{}` | Grafana instance selector labels; empty matches all Grafana instances. |
+| monitoring.dashboards.grafanaOperator.resyncPeriod | string | `"10m"` | Dashboard resync period. |
+| monitoring.dashboards.labels | object | `{}` | Additional dashboard ConfigMap labels; can override grafana_dashboard for a custom sidecar selector. |
+| monitoring.dashboards.namespace | string | `""` | Namespace for dashboard resources; empty uses the release namespace. |
 | monitoring.serviceMonitor.enabled | bool | `false` | Create a Prometheus Operator ServiceMonitor; requires its CRD. |
 | monitoring.serviceMonitor.interval | string | `"30s"` | Scrape interval. |
 | monitoring.serviceMonitor.labels | object | `{}` | Additional ServiceMonitor labels. |

@@ -25,6 +25,18 @@ cases = [
         ["config.database.path=/tmp/history.sqlite"],
         "path",
     ),
+    (
+        "non-string Grafana instance selector labels",
+        [
+            "monitoring.dashboards.grafanaOperator.matchLabels.dashboards=1",
+        ],
+        "matchLabels",
+    ),
+    (
+        "non-string dashboard labels",
+        ["monitoring.dashboards.labels.grafana_dashboard=1"],
+        "grafana_dashboard",
+    ),
 ]
 for name, values, field in cases:
     args = [*base]

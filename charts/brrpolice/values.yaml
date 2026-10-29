@@ -134,6 +134,26 @@ monitoring:
     scrapeTimeout: 10s
     # -- Additional ServiceMonitor labels.
     labels: {}
+  dashboards:
+    # -- Deploy the bundled Grafana dashboard in a ConfigMap.
+    enabled: false
+    # -- Namespace for dashboard resources; empty uses the release namespace.
+    namespace: ""
+    # -- Dashboard ConfigMap annotations.
+    annotations: {}
+    # -- Additional dashboard ConfigMap labels; can override grafana_dashboard for a custom sidecar selector.
+    labels: {}
+    grafanaOperator:
+      # -- Create a GrafanaDashboard referencing the ConfigMap; requires the Grafana Operator CRD and dashboards.enabled.
+      enabled: false
+      # -- Allow Grafana instances in other namespaces to import the dashboard.
+      allowCrossNamespaceImport: true
+      # -- Grafana folder; empty uses the operator default.
+      folder: ""
+      # -- Dashboard resync period.
+      resyncPeriod: "10m"
+      # -- Grafana instance selector labels; empty matches all Grafana instances.
+      matchLabels: {}
 
 # -- Additional volumes, for example a private CA bundle.
 extraVolumes: []

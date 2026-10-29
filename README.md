@@ -272,7 +272,10 @@ curl -fsS http://127.0.0.1:9090/metrics
 
 ## Grafana Dashboard
 
-Import [`dashboards/grafana/brrpolice-overview.json`](dashboards/grafana/brrpolice-overview.json) into Grafana to get a starter operational dashboard for brrpolice metrics.
+Set `monitoring.dashboards.enabled: true` in the Helm chart to deploy the
+operational dashboard through a Grafana sidecar or Grafana Operator. See the
+[chart documentation](charts/brrpolice/README.md) for configuration. For manual
+imports, use [`brrpolice-overview.json`](charts/brrpolice/dashboards/brrpolice-overview.json).
 
 ## License
 

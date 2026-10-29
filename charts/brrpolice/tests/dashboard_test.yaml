@@ -1,0 +1,164 @@
+suite: dashboard
+templates:
+  - templates/dashboard.yaml
+  - templates/grafanadashboard.yaml
+set:
+  config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
+tests:
+  - it: creates no dashboard resources by default
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: requires the dashboard switch even in operator mode
+    set:
+      monitoring.dashboards.grafanaOperator.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: bundles the dashboard for sidecar discovery in the release namespace
+    release:
+      name: police
+      namespace: monitoring
+    set:
+      monitoring.dashboards.enabled: true
+    asserts:
+      - isKind:
+          of: ConfigMap
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.name
+          value: police-brrpolice-dashboard
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.namespace
+          value: monitoring
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.labels.grafana_dashboard
+          value: "1"
+        template: templates/dashboard.yaml
+      - matchRegex:
+          path: data["brrpolice-overview.json"]
+          pattern: '"uid": "brrpolice-overview"'
+        template: templates/dashboard.yaml
+      - matchRegex:
+          path: data["brrpolice-overview.json"]
+          pattern: '"legendFormat": "\{\{decision\}\}"'
+        template: templates/dashboard.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/grafanadashboard.yaml
+  - it: supports a custom namespace and sidecar selector without duplicate labels
+    set:
+      fullnameOverride: custom
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.namespace: grafana
+      monitoring.dashboards.annotations:
+        grafana_folder: Operations
+      monitoring.dashboards.labels:
+        grafana_dashboard: "custom"
+        team: operations
+    asserts:
+      - equal:
+          path: metadata.name
+          value: custom-dashboard
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.namespace
+          value: grafana
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.annotations.grafana_folder
+          value: Operations
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.labels.grafana_dashboard
+          value: "custom"
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.labels.team
+          value: operations
+        template: templates/dashboard.yaml
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: brrpolice
+        template: templates/dashboard.yaml
+  - it: creates an operator resource referencing the bundled ConfigMap
+    release:
+      name: police
+      namespace: monitoring
+    set:
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
+      monitoring.dashboards.grafanaOperator.matchLabels:
+        dashboards: grafana
+    asserts:
+      - isKind:
+          of: GrafanaDashboard
+        template: templates/grafanadashboard.yaml
+      - isAPIVersion:
+          of: grafana.integreatly.org/v1beta1
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: metadata.name
+          value: police-brrpolice-dashboard
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: metadata.namespace
+          value: monitoring
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: spec
+          value:
+            allowCrossNamespaceImport: true
+            resyncPeriod: 10m
+            instanceSelector:
+              matchLabels:
+                dashboards: grafana
+            configMapRef:
+              name: police-brrpolice-dashboard
+              key: brrpolice-overview.json
+        template: templates/grafanadashboard.yaml
+      - notExists:
+          path: metadata.labels.grafana_dashboard
+        template: templates/dashboard.yaml
+  - it: applies operator settings and puts both resources in the requested namespace
+    set:
+      fullnameOverride: custom
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.namespace: grafana
+      monitoring.dashboards.grafanaOperator.enabled: true
+      monitoring.dashboards.grafanaOperator.allowCrossNamespaceImport: false
+      monitoring.dashboards.grafanaOperator.folder: Operations
+      monitoring.dashboards.grafanaOperator.resyncPeriod: 5m
+      monitoring.dashboards.grafanaOperator.matchLabels:
+        dashboards: grafana
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: grafana
+      - equal:
+          path: spec.configMapRef.name
+          value: custom-dashboard
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: spec.allowCrossNamespaceImport
+          value: false
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: spec.folder
+          value: Operations
+        template: templates/grafanadashboard.yaml
+      - equal:
+          path: spec.resyncPeriod
+          value: 5m
+        template: templates/grafanadashboard.yaml
+  - it: allows operator mode without instance selector labels
+    set:
+      monitoring.dashboards.enabled: true
+      monitoring.dashboards.grafanaOperator.enabled: true
+    asserts:
+      - equal:
+          path: spec.instanceSelector.matchLabels
+          value: {}
+        template: templates/grafanadashboard.yaml

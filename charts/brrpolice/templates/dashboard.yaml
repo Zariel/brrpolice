@@ -1,0 +1,20 @@
+{{- if .Values.monitoring.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "brrpolice.fullname" . }}-dashboard
+  namespace: {{ .Values.monitoring.dashboards.namespace | default .Release.Namespace | quote }}
+  {{- with .Values.monitoring.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- $labels := include "brrpolice.labels" . | fromYaml }}
+    {{- if not .Values.monitoring.dashboards.grafanaOperator.enabled }}
+    {{- $_ := set $labels "grafana_dashboard" "1" }}
+    {{- end }}
+    {{- mergeOverwrite $labels .Values.monitoring.dashboards.labels | toYaml | nindent 4 }}
+data:
+  brrpolice-overview.json: |
+    {{- .Files.Get "dashboards/brrpolice-overview.json" | nindent 4 }}
+{{- end }}
