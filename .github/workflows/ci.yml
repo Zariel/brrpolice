@@ -1,7 +1,6 @@
 name: ci
 
 on:
-  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -195,9 +194,7 @@ jobs:
     needs:
       - image
       - chart
-    if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -225,10 +222,7 @@ jobs:
       - name: Pin released image and package chart
         run: |
           set -euo pipefail
-          version="$(yq -r '.version' charts/brrpolice/Chart.yaml)"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          fi
+          version="${GITHUB_REF_NAME#v}"
           repository="$(yq -r '.image.repository' charts/brrpolice/values.yaml)"
           export IMAGE_TAG="v${version}"
           DIGEST="$(docker buildx imagetools inspect "${repository}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
