@@ -1,0 +1,23 @@
+suite: monitoring
+templates:
+  - templates/servicemonitor.yaml
+set:
+  config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
+tests:
+  - it: needs no Prometheus CRD by default
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: scrapes the named application service port when enabled
+    set:
+      monitoring.serviceMonitor.enabled: true
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: spec.endpoints[0]
+          value:
+            port: http
+            path: /metrics
+            interval: 30s
+            scrapeTimeout: 10s

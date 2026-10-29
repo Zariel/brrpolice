@@ -1,0 +1,149 @@
+# -- One SQLite writer is supported. Set to 0 to pause enforcement.
+replicaCount: 1
+
+image:
+  # -- Container image repository.
+  repository: ghcr.io/zariel/brrpolice
+  # -- Image tag; empty uses v followed by the chart appVersion.
+  tag: ""
+  # -- Image digest; overrides tag. OCI packages pin the released image digest.
+  digest: ""
+  # -- Container image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Registry credentials for private mirrors.
+imagePullSecrets: []
+# -- Override the application name.
+nameOverride: ""
+# -- Override resource names.
+fullnameOverride: ""
+
+# Non-secret native brrpolice configuration, rendered as TOML. See the application
+# README for policy and retention settings. Credentials belong in Secret refs
+# through extraEnv or envFrom, not in this ConfigMap.
+config:
+  qbittorrent:
+    # -- (required) qBittorrent Web API base URL.
+    base_url: ""
+  database:
+    # -- SQLite file within the mounted data directory.
+    path: /data/brrpolice.sqlite
+  http:
+    # -- HTTP bind address; must be reachable through the Service.
+    host: 0.0.0.0
+    # -- Application HTTP port, also used by probes and metrics.
+    port: 9090
+  logging:
+    # -- Application log level.
+    level: info
+    # -- Application log format.
+    format: json
+
+# -- Additional environment variables, including Secret key references.
+extraEnv: []
+# -- Environment sources, such as existing Secrets containing BRRPOLICE_* keys.
+envFrom: []
+
+serviceAccount:
+  # -- Create a ServiceAccount without API credentials mounted into the pod.
+  create: true
+  # -- Existing ServiceAccount name; defaults to the release name when creating one.
+  name: ""
+  # -- ServiceAccount annotations.
+  annotations: {}
+
+# -- Pod security context. Match an existing volume's ownership when reusing data.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context. Writable data and temporary storage are mounted separately.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Additional pod annotations.
+podAnnotations: {}
+
+service:
+  # -- Kubernetes Service type.
+  type: ClusterIP
+  # -- Service port; forwards to config.http.port.
+  port: 9090
+
+persistence:
+  # -- Keep SQLite state on a PVC. Disabling uses an emptyDir and loses state when the pod is replaced.
+  enabled: true
+  # -- Reuse an existing PVC instead of creating one.
+  existingClaim: ""
+  # -- StorageClass for a new PVC; null uses the cluster default, an empty string disables dynamic provisioning.
+  storageClass: null
+  # -- Access modes for a new PVC.
+  accessModes:
+    - ReadWriteOnce
+  # -- Requested size of a new PVC.
+  size: 5Gi
+  # -- Annotations for a new PVC.
+  annotations: {}
+
+# -- Pod resources. Temporary SQLite sort files use disk-backed emptyDir storage, not tmpfs.
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+# -- Startup probe allowing time for migrations before liveness checks begin.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  failureThreshold: 60
+# -- Liveness probe.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+# -- Readiness probe; enforcement initialization must succeed.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+monitoring:
+  serviceMonitor:
+    # -- Create a Prometheus Operator ServiceMonitor; requires its CRD.
+    enabled: false
+    # -- Scrape interval.
+    interval: 30s
+    # -- Scrape timeout.
+    scrapeTimeout: 10s
+    # -- Additional ServiceMonitor labels.
+    labels: {}
+
+# -- Additional volumes, for example a private CA bundle.
+extraVolumes: []
+# -- Additional container volume mounts.
+extraVolumeMounts: []
+# -- Node selector.
+nodeSelector: {}
+# -- Scheduling tolerations.
+tolerations: []
+# -- Scheduling affinity.
+affinity: {}
+# -- Grace period for shutdown and committing SQLite writes.
+terminationGracePeriodSeconds: 30

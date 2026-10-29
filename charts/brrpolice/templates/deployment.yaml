@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "brrpolice.fullname" . }}
+  labels:
+    {{- include "brrpolice.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # SQLite and enforcement state require non-overlapping writers during upgrades.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "brrpolice.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "brrpolice.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "brrpolice.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "brrpolice.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ include "brrpolice.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/brrpolice/config.toml
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.http.port }}
+          env:
+            - name: BRRPOLICE_DATABASE__PATH
+              value: {{ .Values.config.database.path | quote }}
+            - name: BRRPOLICE_HTTP__HOST
+              value: {{ .Values.config.http.host | quote }}
+            - name: BRRPOLICE_HTTP__PORT
+              value: {{ .Values.config.http.port | quote }}
+            {{- with .Values.extraEnv }}
+            {{- tpl (toYaml .) $ | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- tpl (toYaml .) $ | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/brrpolice
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- tpl (toYaml .) $ | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (include "brrpolice.fullname" .) .Values.persistence.existingClaim | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        # SQLite spills large index builds and query sorts to disk, including at startup.
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ include "brrpolice.fullname" . }}
+        {{- with .Values.extraVolumes }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

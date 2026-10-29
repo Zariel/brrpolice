@@ -1,0 +1,34 @@
+suite: persistent data ownership
+templates:
+  - templates/pvc.yaml
+set:
+  config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
+tests:
+  - it: creates persistent storage with the cluster default StorageClass
+    asserts:
+      - isKind:
+          of: PersistentVolumeClaim
+      - equal:
+          path: spec.resources.requests.storage
+          value: 5Gi
+      - notExists:
+          path: spec.storageClassName
+  - it: never takes ownership of an existing claim
+    set:
+      persistence.existingClaim: brrpolice
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: can explicitly disable dynamic provisioning
+    set:
+      persistence.storageClass: ""
+    asserts:
+      - equal:
+          path: spec.storageClassName
+          value: ""
+  - it: creates no PVC when ephemeral storage is requested
+    set:
+      persistence.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

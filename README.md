@@ -26,6 +26,7 @@
 - qBittorrent WebUI API reachable from this service
 - Docker (for container runs) or Rust toolchain (for local source runs)
 - Writable storage for SQLite (`/data` in the container image by default)
+- Writable temporary storage (`/tmp`), including when the root filesystem is read-only. SQLite uses it for large index builds and query sorts.
 - qBittorrent credentials only when WebUI auth is enabled
 
 ## Quick Start (Docker)
@@ -62,6 +63,18 @@ docker run --rm -p 9090:9090 \
   -v "$(pwd)/data:/data" \
   brrpolice:latest
 ```
+
+## Helm (Kubernetes)
+
+The application chart is published only as an OCI artifact:
+
+```sh
+helm install brrpolice oci://ghcr.io/zariel/charts/brrpolice \
+  --namespace default \
+  --set config.qbittorrent.base_url=http://qbittorrent.default.svc.cluster.local
+```
+
+The chart provides persistent SQLite data, disk-backed temporary storage, a read-only root filesystem, and single-instance `Recreate` upgrades. See the [chart documentation](charts/brrpolice/README.md) for existing PVCs, credentials, monitoring, and configuration values.
 
 ## Run From Source
 
