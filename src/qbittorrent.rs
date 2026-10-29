@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeSet,
     collections::HashMap,
+    error::Error as _,
+    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -276,6 +278,7 @@ impl QbittorrentClient {
         }
     }
 
+    // Requests must be safe to replay: a reset can occur after qBittorrent applies a write.
     async fn execute_request<F>(&self, build: &F) -> Result<reqwest::Response>
     where
         F: Fn() -> RequestBuilder,
@@ -822,7 +825,26 @@ fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 fn is_transient_transport_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect()
+    if error.is_timeout() || error.is_connect() {
+        return true;
+    }
+
+    let mut source = error.source();
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<io::Error>()
+            && matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            )
+        {
+            return true;
+        }
+        source = error.source();
+    }
+
+    false
 }
 
 fn matches_list(value: Option<&str>, filter_values: &[String]) -> bool {
@@ -2165,6 +2187,116 @@ mod tests {
         let rendered = format!("{error:?} {error:#}");
         assert!(rendered.contains("qbittorrent request failed"));
         assert!(!rendered.contains("path-secret"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn retries_connection_resets_within_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for reset_count in [2, 3] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = network_test_client_without_auth(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ));
+            client.config.transient_retries = 3;
+
+            let server = tokio::spawn(async move {
+                for attempt in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    if attempt < reset_count {
+                        // Closing with unread request data resets the established connection.
+                        drop(stream);
+                        continue;
+                    }
+
+                    let mut request = vec![byte[0]];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                    }
+                    assert!(request.starts_with(b"GET /api/v2/sync/torrentPeers?"));
+
+                    let body = r#"{"rid":1,"peers":{"10.0.0.10:51413":{"client":"test","ip":"10.0.0.10","port":51413,"progress":0.42,"dl_speed":0,"up_speed":65536,"uploaded":4096}}}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.list_torrent_peers("abc123"),
+            )
+            .await
+            .expect("request retries must be bounded");
+
+            if reset_count == 2 {
+                let peers = result.expect("peer fetch must recover after connection resets");
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].observation_id.torrent_hash, "abc123");
+                assert_eq!(peers[0].peer.ip, "10.0.0.10".parse::<IpAddr>().unwrap());
+                assert_eq!(peers[0].peer.port, 51413);
+                assert_eq!(peers[0].peer.progress, 0.42);
+                assert_eq!(peers[0].peer.up_rate_bps, 65536);
+                assert_eq!(peers[0].peer.uploaded_bytes, Some(4096));
+            } else {
+                let error = result.expect_err("connection resets must exhaust the retry budget");
+                assert!(error.chain().any(|source| {
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+                }));
+            }
+
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_malformed_responses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client =
+            network_test_client_without_auth(&format!("http://{}", listener.local_addr().unwrap()));
+        client.config.transient_retries = 2;
+
+        let server = tokio::spawn(async move {
+            for response in [
+                "invalid HTTP\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_in_scope_torrents(),
+        )
+        .await;
+        server.abort();
+
+        result
+            .expect("malformed responses must fail promptly")
+            .expect_err("a malformed response must not be retried against the valid response");
     }
 
     #[tokio::test]
