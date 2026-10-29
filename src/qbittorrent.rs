@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     backoff::jittered_exponential_backoff,
-    config::{FiltersConfig, QbittorrentConfig},
+    config::{FiltersConfig, QbittorrentConfig, redact_url},
     metrics::AppMetrics,
     persistence::ActiveBanRecord,
     types::{PeerObservationId, PeerSnapshot, TorrentPeer, TorrentSummary},
@@ -108,12 +108,13 @@ impl QbittorrentClient {
                 let body = read_limited_response_body(response, MAX_ERROR_BODY_BYTES)
                     .await
                     .context("failed to read qbittorrent login response")?;
+                let body = self.scrub_base_path(&body);
                 if status != StatusCode::OK || body.trim() != "Ok." {
                     self.metrics.record_qbittorrent_api_error();
                     warn!(
                         status = %status,
                         response_body = body.trim(),
-                        base_url = %self.base_url,
+                        base_url = %redact_url(&self.base_url),
                         username = username,
                         "qbittorrent authentication failed"
                     );
@@ -124,8 +125,7 @@ impl QbittorrentClient {
                     );
                 }
                 info!(
-                    login_url = %self.api_url(AUTH_LOGIN_PATH)?,
-                    base_url = %self.base_url,
+                    base_url = %redact_url(&self.base_url),
                     username = username,
                     "qbittorrent authentication succeeded"
                 );
@@ -146,12 +146,12 @@ impl QbittorrentClient {
                     bail!(
                         "qbittorrent api-key authentication failed: qBittorrent 5.2+ with a valid configured API key is required (status={} body={})",
                         status,
-                        body.trim()
+                        self.scrub_base_path(&body).trim()
                     );
                 }
-                Self::ensure_success(response).await?;
+                self.ensure_success(response).await?;
                 info!(
-                    base_url = %self.base_url,
+                    base_url = %redact_url(&self.base_url),
                     "qbittorrent api-key authentication probe succeeded"
                 );
                 Ok(())
@@ -248,6 +248,7 @@ impl QbittorrentClient {
         response
             .text()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("failed to read qbittorrent response body")
     }
 
@@ -262,10 +263,10 @@ impl QbittorrentClient {
                 .execute_request(&|| self.apply_auth(build()))
                 .await
                 .context("qbittorrent authenticated retry failed")?;
-            return Self::ensure_success(retried).await;
+            return self.ensure_success(retried).await;
         }
 
-        Self::ensure_success(response).await
+        self.ensure_success(response).await
     }
 
     fn apply_auth(&self, request: RequestBuilder) -> RequestBuilder {
@@ -313,6 +314,8 @@ impl QbittorrentClient {
                     return Ok(response);
                 }
                 Err(error) => {
+                    // reqwest errors render the request URL, which may carry a proxy API key.
+                    let error = error.without_url();
                     self.metrics.record_qbittorrent_api_error();
                     if attempt + 1 < max_retries && is_transient_transport_error(&error) {
                         let delay = jittered_exponential_backoff(
@@ -339,7 +342,7 @@ impl QbittorrentClient {
         unreachable!("qbittorrent request retry loop exhausted unexpectedly")
     }
 
-    async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
+    async fn ensure_success(&self, response: reqwest::Response) -> Result<reqwest::Response> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -351,8 +354,17 @@ impl QbittorrentClient {
         bail!(
             "qbittorrent request failed: status={} body={}",
             status,
-            body.trim()
+            self.scrub_base_path(&body).trim()
         );
+    }
+
+    /// Removes the configured base path from upstream text in case a proxy echoes it back.
+    fn scrub_base_path(&self, text: &str) -> String {
+        let base_path = self.base_url.path().trim_matches('/');
+        if base_path.is_empty() {
+            return text.to_string();
+        }
+        text.replace(base_path, "<redacted>")
     }
 
     fn api_url(&self, path: &str) -> Result<Url> {
@@ -831,7 +843,11 @@ async fn read_limited_response_body(
     let mut buffer = Vec::with_capacity(max_bytes.min(256));
     let mut truncated = false;
 
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
         if buffer.len() >= max_bytes {
             truncated = true;
             break;
@@ -2132,6 +2148,45 @@ mod tests {
         ResponseTemplate::new(200)
             .insert_header("Set-Cookie", "SID=abc; Path=/; HttpOnly")
             .set_body_string("Ok.")
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_expose_base_url_path() {
+        // Bind then drop a listener so the port is closed and the connect fails.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut client =
+            network_test_client_without_auth(&format!("http://127.0.0.1:{port}/proxy/path-secret"));
+        client.config.transient_retries = 1;
+
+        let error = client.list_in_scope_torrents().await.unwrap_err();
+        let rendered = format!("{error:?} {error:#}");
+        assert!(rendered.contains("qbittorrent request failed"));
+        assert!(!rendered.contains("path-secret"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn error_bodies_echoing_base_url_path_are_scrubbed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/path-secret/api/v2/torrents/info"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string("no route for /proxy/path-secret/api/v2/torrents/info"),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            network_test_client_without_auth(&format!("{}/proxy/path-secret", server.uri()));
+
+        let error = client.list_in_scope_torrents().await.unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("status=404"));
+        assert!(rendered.contains("no route for /<redacted>/api/v2/torrents/info"));
+        assert!(!rendered.contains("path-secret"), "{rendered}");
     }
 
     fn network_test_client(base_url: &str) -> QbittorrentClient {

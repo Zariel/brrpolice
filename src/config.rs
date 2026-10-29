@@ -218,7 +218,7 @@ impl AppConfig {
                 "logging.level={}\n",
                 "logging.format={}\n"
             ),
-            self.qbittorrent.base_url,
+            self.qbittorrent.redacted_base_url(),
             self.qbittorrent.auth_mode_name(),
             self.qbittorrent.poll_interval.as_secs(),
             self.qbittorrent.request_timeout.as_secs(),
@@ -517,7 +517,7 @@ fn default_env_filter_expression(level: &str) -> String {
     format!("{base_level},hyper_util::client::legacy::pool=warn")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct QbittorrentConfig {
     pub base_url: String,
     pub username: String,
@@ -532,7 +532,48 @@ pub struct QbittorrentConfig {
     pub transient_retries: u32,
 }
 
+const REDACTED: &str = "<redacted>";
+
+/// Renders a URL for logs and persisted metadata. Proxies such as qui carry an
+/// API key in the path, so only the origin is safe to expose.
+pub fn redact_url(url: &reqwest::Url) -> String {
+    let origin = url.origin().ascii_serialization();
+    let has_path = !url.path().trim_matches('/').is_empty();
+    if has_path || url.query().is_some() || url.fragment().is_some() {
+        format!("{origin}/{REDACTED}")
+    } else {
+        origin
+    }
+}
+
+impl std::fmt::Debug for QbittorrentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key = if self.api_key.trim().is_empty() {
+            ""
+        } else {
+            REDACTED
+        };
+        f.debug_struct("QbittorrentConfig")
+            .field("base_url", &self.redacted_base_url())
+            .field("username", &self.username)
+            .field("password_env", &self.password_env)
+            .field("api_key", &api_key)
+            .field("poll_interval", &self.poll_interval)
+            .field("request_timeout", &self.request_timeout)
+            .field("pool_idle_timeout", &self.pool_idle_timeout)
+            .field("transient_retries", &self.transient_retries)
+            .finish()
+    }
+}
+
 impl QbittorrentConfig {
+    pub fn redacted_base_url(&self) -> String {
+        match reqwest::Url::parse(self.base_url.trim()) {
+            Ok(url) => redact_url(&url),
+            Err(_) => REDACTED.to_string(),
+        }
+    }
+
     pub fn auth_mode_name(&self) -> &'static str {
         if !self.api_key.trim().is_empty() {
             "api_key"
@@ -1044,7 +1085,7 @@ mod tests {
         time::Duration,
     };
 
-    use super::AppConfig;
+    use super::{AppConfig, QbittorrentConfig};
     use tempfile::tempdir;
 
     #[test]
@@ -1802,6 +1843,42 @@ api_key = "super-secret-key"
         assert!(!fingerprint.contains("super-secret-key"));
         assert!(!fingerprint.contains("qb.username="));
         assert!(!fingerprint.contains("qb.password_env="));
+    }
+
+    #[test]
+    fn fingerprint_and_debug_redact_base_url_path_and_query() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+[qbittorrent]
+base_url = "http://qui:7476/proxy/path-secret?token=query-secret"
+api_key = "super-secret-key"
+"#,
+        );
+
+        let config = load_test_config(&config_path, HashMap::new()).unwrap();
+        let fingerprint = config.fingerprint();
+        let debug = format!("{config:?}");
+
+        assert!(fingerprint.contains("qb.base_url=http://qui:7476/<redacted>\n"));
+        for rendered in [&fingerprint, &debug] {
+            assert!(!rendered.contains("path-secret"));
+            assert!(!rendered.contains("query-secret"));
+            assert!(!rendered.contains("super-secret-key"));
+        }
+    }
+
+    #[test]
+    fn redacted_base_url_keeps_plain_origin_readable() {
+        let config = QbittorrentConfig::default();
+        assert_eq!(config.redacted_base_url(), "http://qbittorrent:8080");
+
+        let unparseable = QbittorrentConfig {
+            base_url: "not a url/secret".to_string(),
+            ..QbittorrentConfig::default()
+        };
+        assert_eq!(unparseable.redacted_base_url(), "<redacted>");
     }
 
     #[test]
