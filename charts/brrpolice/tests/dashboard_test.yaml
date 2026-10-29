@@ -43,7 +43,7 @@ tests:
         template: templates/dashboard.yaml
       - matchRegex:
           path: data["brrpolice-overview.json"]
-          pattern: '"legendFormat": "\{\{decision\}\}"'
+          pattern: '"legendFormat": "\{\{reason_code\}\}"'
         template: templates/dashboard.yaml
       - hasDocuments:
           count: 0

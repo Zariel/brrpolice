@@ -45,6 +45,11 @@ The sidecar must watch the dashboard namespace, which defaults to the release
 namespace and can be changed with `monitoring.dashboards.namespace`. Customize
 the ConfigMap with `monitoring.dashboards.labels` and `annotations`.
 
+The dashboard was donated to brrpolice by [buroa](https://github.com/buroa)
+from [buroa/grafana-dashboards](https://github.com/buroa/grafana-dashboards).
+Thank you, buroa! Set the dashboard's Ban threshold, Clear threshold, and Poll
+interval variables to match your application configuration.
+
 For Grafana Operator, enable the dashboard and its `GrafanaDashboard` resource:
 
 ```yaml

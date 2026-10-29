@@ -277,6 +277,10 @@ operational dashboard through a Grafana sidecar or Grafana Operator. See the
 [chart documentation](charts/brrpolice/README.md) for configuration. For manual
 imports, use [`brrpolice-overview.json`](charts/brrpolice/dashboards/brrpolice-overview.json).
 
+The dashboard was donated to the project by [buroa](https://github.com/buroa)
+from [buroa/grafana-dashboards](https://github.com/buroa/grafana-dashboards).
+Thank you, buroa!
+
 ## License
 
 This project is licensed under the terms in [`LICENSE`](LICENSE).
