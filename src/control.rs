@@ -324,19 +324,27 @@ impl ControlLoop {
     }
 
     pub async fn recover_startup_state(&self) -> Result<RecoverySnapshot> {
+        let exempt_ip = self.qbittorrent.external_ipv4_exemption().await?;
         let snapshot = self.persistence.load_recovery_snapshot().await?;
         let now = std::time::SystemTime::now();
         // Only unreconciled + unexpired rows represent bans that should still exist in qBittorrent.
         let mut active_bans = snapshot
             .active_bans
             .iter()
-            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > now)
+            .filter(|ban| {
+                ban.reconciled_at.is_none()
+                    && ban.expires_at > now
+                    && Some(ban.peer_ip) != exempt_ip
+            })
             .cloned()
             .collect::<Vec<_>>();
         let expired_bans = snapshot
             .active_bans
             .iter()
-            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at <= now)
+            .filter(|ban| {
+                ban.reconciled_at.is_none()
+                    && (ban.expires_at <= now || Some(ban.peer_ip) == exempt_ip)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let previously_managed_bans = active_bans
@@ -348,10 +356,15 @@ impl ControlLoop {
             .qbittorrent
             .reconcile_expired_bans(&active_bans, &previously_managed_bans)
             .await?;
-        self.mark_expired_bans_reconciled(&expired_bans, now)
+        self.mark_expired_bans_reconciled(&expired_bans, now, exempt_ip)
             .await?;
         let (replayed_pending_count, failed_pending_count) = self
-            .replay_pending_ban_intents(&snapshot.pending_ban_intents, &mut active_bans, now)
+            .replay_pending_ban_intents(
+                &snapshot.pending_ban_intents,
+                &mut active_bans,
+                now,
+                exempt_ip,
+            )
             .await?;
         self.refresh_gauges().await?;
         self.service_state.mark_recovery_complete();
@@ -452,7 +465,8 @@ impl ControlLoop {
     pub async fn run_poll_cycle(&mut self) -> Result<PollCycleResult> {
         let observed_at = std::time::SystemTime::now();
         let observed_at_rfc3339 = humantime::format_rfc3339_millis(observed_at).to_string();
-        self.reconcile_expired_bans(observed_at).await?;
+        let exempt_ip = self.qbittorrent.external_ipv4_exemption().await?;
+        self.reconcile_expired_bans(observed_at, exempt_ip).await?;
         let torrents = self.qbittorrent.list_in_scope_torrents().await?;
         self.metrics.set_in_scope_torrents(torrents.len());
         let mut active_bans = self.persistence.load_active_bans().await?;
@@ -494,6 +508,9 @@ impl ControlLoop {
                     break 'torrents;
                 }
                 peer_count += 1;
+                if Some(peer.observation_id.peer_ip) == exempt_ip {
+                    continue;
+                }
                 let existing = self
                     .persistence
                     .get_peer_session(&peer.observation_id)
@@ -1457,22 +1474,21 @@ impl ControlLoop {
         *self.shutdown.borrow()
     }
 
-    async fn reconcile_expired_bans(&self, reconciled_at: std::time::SystemTime) -> Result<usize> {
-        let expired_bans = self
-            .persistence
-            .list_expired_active_bans(reconciled_at)
-            .await?;
-        if expired_bans.is_empty() {
-            return Ok(0);
-        }
-
-        let remaining_active_bans = self
+    async fn reconcile_expired_bans(
+        &self,
+        reconciled_at: std::time::SystemTime,
+        exempt_ip: Option<std::net::IpAddr>,
+    ) -> Result<usize> {
+        let (expired_bans, remaining_active_bans): (Vec<_>, Vec<_>) = self
             .persistence
             .load_active_bans()
             .await?
             .into_iter()
-            .filter(|ban| ban.reconciled_at.is_none() && ban.expires_at > reconciled_at)
-            .collect::<Vec<_>>();
+            .filter(|ban| ban.reconciled_at.is_none())
+            .partition(|ban| ban.expires_at <= reconciled_at || Some(ban.peer_ip) == exempt_ip);
+        if expired_bans.is_empty() {
+            return Ok(0);
+        }
 
         self.qbittorrent
             .reconcile_expired_bans(&remaining_active_bans, &expired_bans)
@@ -1487,7 +1503,7 @@ impl ControlLoop {
                 );
             })?;
 
-        self.mark_expired_bans_reconciled(&expired_bans, reconciled_at)
+        self.mark_expired_bans_reconciled(&expired_bans, reconciled_at, exempt_ip)
             .await?;
         self.metrics.record_bans_expired(expired_bans.len());
         self.refresh_gauges().await?;
@@ -1500,12 +1516,26 @@ impl ControlLoop {
         pending_ban_intents: &[PendingBanIntentRecord],
         active_bans: &mut Vec<ActiveBanRecord>,
         recovered_at: std::time::SystemTime,
+        exempt_ip: Option<std::net::IpAddr>,
     ) -> Result<(usize, usize)> {
         let mut replayed = 0;
         let mut failed = 0;
 
         let mut shutdown = self.shutdown.clone();
         for intent in pending_ban_intents {
+            if Some(intent.peer_ip) == exempt_ip {
+                self.persistence
+                    .delete_pending_ban_intent(
+                        &intent.torrent_hash,
+                        intent.peer_ip,
+                        intent.peer_port,
+                        &intent.policy_name,
+                        intent.offence_number,
+                    )
+                    .await?;
+                continue;
+            }
+
             if intent.ban_expires_at <= recovered_at {
                 debug!(
                     torrent_hash = %intent.torrent_hash,
@@ -1842,11 +1872,15 @@ impl ControlLoop {
         &self,
         expired_bans: &[ActiveBanRecord],
         reconciled_at: std::time::SystemTime,
+        exempt_ip: Option<std::net::IpAddr>,
     ) -> Result<()> {
         for ban in expired_bans {
             self.persistence
                 .mark_active_ban_reconciled(ban.peer_ip, ban.peer_port, &ban.scope, reconciled_at)
                 .await?;
+            if Some(ban.peer_ip) == exempt_ip {
+                continue;
+            }
             self.revoke_expired_offence(ban, reconciled_at).await?;
             info!(
                 scope = %ban.scope,
@@ -2111,6 +2145,99 @@ mod tests {
         state.mark_poll_loop_entered();
         assert!(state.is_ready());
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retires_the_reported_address_without_replaying_it() {
+        let persistence = Arc::new(test_persistence().await);
+        persistence.run_migrations().await.unwrap();
+        let metrics = Arc::new(AppMetrics::new());
+        let now = std::time::SystemTime::now();
+        let self_ip = "203.0.113.7".parse().unwrap();
+        let ban = ActiveBanRecord {
+            peer_ip: self_ip,
+            peer_port: 51413,
+            scope: "torrent:abc123".into(),
+            offence_number: 1,
+            reason: "slow_non_progressing".into(),
+            created_at: now,
+            expires_at: now + Duration::from_secs(3600),
+            reconciled_at: None,
+        };
+        persistence.upsert_active_ban(&ban).await.unwrap();
+        persistence
+            .upsert_pending_ban_intent(&pending_ban_intent(
+                "abc123",
+                "203.0.113.7",
+                51413,
+                1,
+                now,
+                ban.expires_at,
+                "retry",
+            ))
+            .await
+            .unwrap();
+        let (base_url, server) = spawn_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/transfer/info",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"last_external_address_v4\":\"203.0.113.7\"}",
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v2/app/preferences",
+                must_contain: vec![],
+                response: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"banned_IPs\":\"203.0.113.7\\n198.51.100.9\"}",
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v2/app/setPreferences",
+                must_contain: vec!["json=%7B%22banned_IPs%22%3A%22198.51.100.9%22%7D"],
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            },
+        ]).await;
+        let mut config = test_config(&base_url);
+        config.filters.exempt_external_ipv4 = true;
+        let client = Arc::new(
+            crate::qbittorrent::QbittorrentClient::new(
+                config.qbittorrent.clone(),
+                "secret".to_string(),
+                config.filters.clone(),
+                config.policy.min_total_seeders,
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        let policy = Arc::new(PolicyEngine::new(config.policy.clone(), &config.filters));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let control = ControlLoop::new(
+            Arc::new(config),
+            persistence.clone(),
+            client,
+            policy,
+            Arc::new(ServiceState::new()),
+            metrics,
+            shutdown_rx,
+        );
+
+        control.recover_startup_state().await.unwrap();
+        assert!(
+            persistence
+                .load_active_bans()
+                .await
+                .unwrap()
+                .iter()
+                .all(|ban| ban.reconciled_at.is_some())
+        );
+        assert!(
+            persistence
+                .load_pending_ban_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         server.await.unwrap();
     }
 
