@@ -12,24 +12,24 @@ concurrency:
 
 jobs:
   release-please:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: write
-      issues: write
-      pull-requests: write
+    permissions: {}
+    environment: release-please
     steps:
+      - name: Create release app token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
       - name: Release Please
-        id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-
-      # Tags created with GITHUB_TOKEN do not trigger ci.yml, but a dispatch does.
-      - name: Publish the release
-        if: ${{ steps.release.outputs.release_created }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.release.outputs.tag_name }}
-        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"

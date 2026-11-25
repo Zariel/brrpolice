@@ -3,10 +3,11 @@ name: ci
 on:
   pull_request:
   push:
-    branches:
-      - "**"
-    tags:
-      - "v*"
+    branches-ignore:
+      # Release Please branches already get CI through pull_request.
+      - "release-please--branches--**"
+  release:
+    types: [published]
   workflow_dispatch:
 
 env:
