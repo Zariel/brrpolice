@@ -1,4 +1,7 @@
 {{- $statefulSet := eq .Values.controller.type "statefulset" }}
+{{- if and $statefulSet (gt (len (include "brrpolice.fullname" .)) 52) }}
+{{- fail "controller.type statefulset needs a fullname of 52 characters or fewer: the controller-revision-hash pod label appends a hash to it and must stay within 63 characters. Set fullnameOverride." }}
+{{- end }}
 apiVersion: apps/v1
 kind: {{ ternary "StatefulSet" "Deployment" $statefulSet }}
 metadata:
@@ -8,8 +11,9 @@ metadata:
 spec:
   replicas: {{ .Values.replicaCount }}
   {{- if $statefulSet }}
-  {{- /* A StatefulSet starts the replacement pod only after the old one has stopped. */}}
+  {{- /* The single pod <fullname>-0 is replaced only after the old one has stopped. Parallel lets an upgrade replace a pod that is not Ready. */}}
   serviceName: {{ include "brrpolice.fullname" . }}
+  podManagementPolicy: Parallel
   {{- else }}
   # SQLite and enforcement state require non-overlapping writers during upgrades.
   strategy:

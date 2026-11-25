@@ -2,7 +2,7 @@
 replicaCount: 1
 
 controller:
-  # -- Workload kind, `deployment` or `statefulset`. A StatefulSet creates the data PVC from a volumeClaimTemplate unless `persistence.existingClaim` is set.
+  # -- Workload kind, `deployment` or `statefulset`. Read the chart README before switching an existing install.
   type: deployment
 
 image:
@@ -95,7 +95,7 @@ persistence:
     - ReadWriteOnce
   # -- Requested size of a new PVC.
   size: 5Gi
-  # -- Data source for a new PVC, such as a volume populator that restores a backup.
+  # -- Data source for a PVC that the chart creates, such as a volume populator that restores a backup. Requires `kind` and `name`.
   dataSourceRef: {}
   # -- Annotations for a new PVC.
   annotations: {}

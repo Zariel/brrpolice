@@ -32,7 +32,21 @@ cases = [
         ],
         "matchLabels",
     ),
-    ("unknown controller type", ["controller.type=daemonset"], "type"),
+    ("unknown controller type", ["controller.type=daemonset"], "/controller/type"),
+    (
+        "incomplete data source",
+        ["persistence.dataSourceRef.kind=Restore"],
+        "/persistence/dataSourceRef",
+    ),
+    (
+        "data source for an existing claim",
+        [
+            "persistence.existingClaim=keep",
+            "persistence.dataSourceRef.kind=Restore",
+            "persistence.dataSourceRef.name=keep",
+        ],
+        "/persistence/dataSourceRef",
+    ),
     (
         "non-string dashboard labels",
         ["monitoring.dashboards.labels.grafana_dashboard=1"],

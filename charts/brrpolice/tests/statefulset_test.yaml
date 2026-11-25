@@ -30,6 +30,10 @@ tests:
           path: spec.strategy
       - template: templates/workload.yaml
         equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+      - template: templates/workload.yaml
+        equal:
           path: spec.volumeClaimTemplates
           value:
             - metadata:
@@ -88,3 +92,48 @@ tests:
           content:
             name: data
             emptyDir: {}
+
+  - it: leaves optional claim fields unset by default
+    asserts:
+      - template: templates/workload.yaml
+        equal:
+          path: spec.volumeClaimTemplates
+          value:
+            - metadata:
+                name: data
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 5Gi
+
+  - it: can explicitly disable dynamic provisioning for the claim
+    set:
+      persistence.storageClass: ""
+    asserts:
+      - template: templates/workload.yaml
+        equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: ""
+
+  - it: keeps the claim template when paused
+    set:
+      replicaCount: 0
+    asserts:
+      - template: templates/workload.yaml
+        equal:
+          path: spec.replicas
+          value: 0
+      - template: templates/workload.yaml
+        equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+
+  - it: rejects a name too long for StatefulSet pod labels
+    set:
+      fullnameOverride: a-name-that-is-fifty-three-characters-long-for-the-st
+    asserts:
+      - template: templates/workload.yaml
+        failedTemplate:
+          errorPattern: 52 characters or fewer
