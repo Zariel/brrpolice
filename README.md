@@ -202,6 +202,7 @@ durations = ["10m", "30m", "2h", "6h"]
 | `filters.include_tags` | `BRRPOLICE_FILTERS__INCLUDE_TAGS` | `[]` | Optional allow-list of torrent tags. Works with `include_categories`. |
 | `filters.exclude_tags` | `BRRPOLICE_FILTERS__EXCLUDE_TAGS` | `[]` | Deny-list of torrent tags. Excludes are applied before includes. |
 | `filters.allowlist_peer_ips` | `BRRPOLICE_FILTERS__ALLOWLIST_PEER_IPS` | `[]` | Peer IPs that are never banned. |
+| `filters.exempt_external_ipv4` | `BRRPOLICE_FILTERS__EXEMPT_EXTERNAL_IPV4` | `false` | Exempt qBittorrent’s reported external IPv4 from new and recovered bans. While the address is unavailable, ban enforcement waits for qBittorrent to report it. |
 | `filters.allowlist_peer_cidrs` | `BRRPOLICE_FILTERS__ALLOWLIST_PEER_CIDRS` | `[]` | Peer CIDR ranges that are never banned. |
 
 ### Retention Settings

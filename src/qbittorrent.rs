@@ -176,6 +176,27 @@ impl QbittorrentClient {
         self.normalize_torrent_peers(torrent_hash, &body)
     }
 
+    pub(crate) async fn external_ipv4_exemption(&self) -> Result<Option<IpAddr>> {
+        if !self.filters.exempt_external_ipv4 {
+            return Ok(None);
+        }
+
+        #[derive(Deserialize)]
+        struct TransferInfo {
+            last_external_address_v4: std::net::Ipv4Addr,
+        }
+
+        let url = self.api_url("api/v2/transfer/info")?;
+        let body = self.authenticated_get_text(url).await?;
+        let info: TransferInfo =
+            serde_json::from_str(&body).context("qBittorrent did not report an external IPv4")?;
+        let ip = info.last_external_address_v4;
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+            bail!("qBittorrent did not report a usable external IPv4");
+        }
+        Ok(Some(IpAddr::V4(ip)))
+    }
+
     pub async fn apply_peer_ban(
         &self,
         ban: &ActiveBanRecord,
@@ -1108,6 +1129,7 @@ mod tests {
             exclude_tags: vec!["skip".to_string()],
             allowlist_peer_ips: vec![],
             allowlist_peer_cidrs: vec![],
+            ..Default::default()
         });
 
         let filtered = client.filter_in_scope_torrents(vec![
@@ -1783,6 +1805,7 @@ mod tests {
                 exclude_tags: vec!["skip".to_string()],
                 allowlist_peer_ips: vec![],
                 allowlist_peer_cidrs: vec![],
+                ..Default::default()
             },
         );
         let torrents = client.list_in_scope_torrents().await.unwrap();

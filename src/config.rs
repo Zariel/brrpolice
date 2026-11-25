@@ -202,6 +202,7 @@ impl AppConfig {
                 "filters.exclude_tags={}\n",
                 "filters.allowlist_peer_ips={}\n",
                 "filters.allowlist_peer_cidrs={}\n",
+                "filters.exempt_external_ipv4={}\n",
                 "database.path={}\n",
                 "database.busy_timeout={}\n",
                 "retention.enabled={}\n",
@@ -285,6 +286,7 @@ impl AppConfig {
             join(&self.filters.exclude_tags),
             join(&self.filters.allowlist_peer_ips),
             join(&self.filters.allowlist_peer_cidrs),
+            self.filters.exempt_external_ipv4,
             self.database.path.display(),
             self.database.busy_timeout.as_secs(),
             self.retention.enabled,
@@ -830,6 +832,8 @@ pub struct FiltersConfig {
     pub allowlist_peer_ips: Vec<String>,
     #[serde(default)]
     pub allowlist_peer_cidrs: Vec<String>,
+    #[serde(default)]
+    pub exempt_external_ipv4: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
