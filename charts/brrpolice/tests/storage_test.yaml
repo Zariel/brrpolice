@@ -13,6 +13,8 @@ tests:
           value: 5Gi
       - notExists:
           path: spec.storageClassName
+      - notExists:
+          path: spec.dataSourceRef
   - it: never takes ownership of an existing claim
     set:
       persistence.existingClaim: brrpolice

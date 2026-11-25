@@ -211,7 +211,33 @@
           "minLength": 1
         },
         "dataSourceRef": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "apiGroup": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "minLength": 1
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "if": {
+            "minProperties": 1
+          },
+          "then": {
+            "required": [
+              "kind",
+              "name"
+            ]
+          }
         },
         "annotations": {
           "type": "object"
@@ -231,6 +257,38 @@
             "properties": {
               "enabled": {
                 "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "existingClaim": {
+                "minLength": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dataSourceRef": {
+                "maxProperties": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dataSourceRef": {
+                "maxProperties": 0
               }
             }
           }

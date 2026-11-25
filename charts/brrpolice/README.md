@@ -10,14 +10,28 @@ helm install brrpolice oci://ghcr.io/zariel/charts/brrpolice \
   --set config.qbittorrent.base_url=http://qbittorrent.default.svc.cluster.local
 ```
 
-The chart runs one instance with `Recreate` upgrades so enforcement and SQLite
-writes never overlap. `replicaCount` accepts only `0` or `1`.
+The chart runs one instance so enforcement and SQLite writes never overlap.
+`replicaCount` accepts only `0` or `1`. The default Deployment upgrades with
+`Recreate`.
 
-Set `controller.type: statefulset` to run a StatefulSet instead. It starts the
-replacement pod only after the old one has stopped, and it creates the data PVC
-from a volumeClaimTemplate unless `persistence.existingClaim` is set.
-`persistence.dataSourceRef` fills a new PVC from a data source, for example a
-volume populator that restores a backup.
+Set `controller.type: statefulset` to run a StatefulSet instead. Its single pod,
+`<fullname>-0`, is replaced only after the old one has stopped. Unless
+`persistence.existingClaim` is set, the StatefulSet creates the data PVC
+`data-<fullname>-0` from a volumeClaimTemplate when the pod first starts.
+Kubernetes cannot change a volumeClaimTemplate, so the `persistence` values are
+fixed at install. To change them, run
+`kubectl delete statefulset <fullname> --cascade=orphan` before the upgrade. The
+PVC survives `helm uninstall`; delete it yourself to start with an empty
+database.
+
+Switching an existing install between `deployment` and `statefulset` does not
+move the data. With a chart-made PVC, the upgrade deletes the old PVC and the
+database in it. Back up the database first, or restore it into the new PVC with
+`persistence.dataSourceRef`.
+
+`persistence.dataSourceRef` fills a PVC that the chart creates, for example from
+a volume populator that restores a backup. It does not apply to
+`persistence.existingClaim`.
 
 SQLite data uses a PVC by default. Set `persistence.existingClaim` to reuse an
 existing database, and match `podSecurityContext` to the volume's ownership. A
@@ -91,7 +105,7 @@ and `appVersion`. Pull requests validate charts without publishing them.
 | config.logging.format | string | `"json"` | Application log format. |
 | config.logging.level | string | `"info"` | Application log level. |
 | config.qbittorrent.base_url | required | `""` | qBittorrent Web API base URL. |
-| controller.type | string | `"deployment"` | Workload kind, `deployment` or `statefulset`. A StatefulSet creates the data PVC from a volumeClaimTemplate unless `persistence.existingClaim` is set. |
+| controller.type | string | `"deployment"` | Workload kind, `deployment` or `statefulset`. Read the chart README before switching an existing install. |
 | envFrom | list | `[]` | Environment sources, such as existing Secrets containing BRRPOLICE_* keys. |
 | extraEnv | list | `[]` | Additional environment variables, including Secret key references. |
 | extraVolumeMounts | list | `[]` | Additional container volume mounts. |
@@ -120,7 +134,7 @@ and `appVersion`. Pull requests validate charts without publishing them.
 | nodeSelector | object | `{}` | Node selector. |
 | persistence.accessModes | list | `["ReadWriteOnce"]` | Access modes for a new PVC. |
 | persistence.annotations | object | `{}` | Annotations for a new PVC. |
-| persistence.dataSourceRef | object | `{}` | Data source for a new PVC, such as a volume populator that restores a backup. |
+| persistence.dataSourceRef | object | `{}` | Data source for a PVC that the chart creates, such as a volume populator that restores a backup. Requires `kind` and `name`. |
 | persistence.enabled | bool | `true` | Keep SQLite state on a PVC. Disabling uses an emptyDir and loses state when the pod is replaced. |
 | persistence.existingClaim | string | `""` | Reuse an existing PVC instead of creating one. |
 | persistence.size | string | `"5Gi"` | Requested size of a new PVC. |

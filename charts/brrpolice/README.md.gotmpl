@@ -10,14 +10,28 @@ helm install brrpolice oci://ghcr.io/zariel/charts/brrpolice \
   --set config.qbittorrent.base_url=http://qbittorrent.default.svc.cluster.local
 ```
 
-The chart runs one instance with `Recreate` upgrades so enforcement and SQLite
-writes never overlap. `replicaCount` accepts only `0` or `1`.
+The chart runs one instance so enforcement and SQLite writes never overlap.
+`replicaCount` accepts only `0` or `1`. The default Deployment upgrades with
+`Recreate`.
 
-Set `controller.type: statefulset` to run a StatefulSet instead. It starts the
-replacement pod only after the old one has stopped, and it creates the data PVC
-from a volumeClaimTemplate unless `persistence.existingClaim` is set.
-`persistence.dataSourceRef` fills a new PVC from a data source, for example a
-volume populator that restores a backup.
+Set `controller.type: statefulset` to run a StatefulSet instead. Its single pod,
+`<fullname>-0`, is replaced only after the old one has stopped. Unless
+`persistence.existingClaim` is set, the StatefulSet creates the data PVC
+`data-<fullname>-0` from a volumeClaimTemplate when the pod first starts.
+Kubernetes cannot change a volumeClaimTemplate, so the `persistence` values are
+fixed at install. To change them, run
+`kubectl delete statefulset <fullname> --cascade=orphan` before the upgrade. The
+PVC survives `helm uninstall`; delete it yourself to start with an empty
+database.
+
+Switching an existing install between `deployment` and `statefulset` does not
+move the data. With a chart-made PVC, the upgrade deletes the old PVC and the
+database in it. Back up the database first, or restore it into the new PVC with
+`persistence.dataSourceRef`.
+
+`persistence.dataSourceRef` fills a PVC that the chart creates, for example from
+a volume populator that restores a backup. It does not apply to
+`persistence.existingClaim`.
 
 SQLite data uses a PVC by default. Set `persistence.existingClaim` to reuse an
 existing database, and match `podSecurityContext` to the volume's ownership. A
