@@ -146,12 +146,11 @@ _Add a brief overview of your project architecture_
 Only commit touched filed, when commiting commit logical changes not just
 the whole workspace. Commit messages should include a title and the body
 should describe the change so that a reviewer can get an understanding. The
-title should be all lower case and no longer than 50 characters, the body must
-use prose, avoid lists and overly explainging things, be concise.
+title must follow Conventional Commits, for example `fix(chart): ...`, be all
+lower case and no longer than 50 characters, the body must use prose, avoid
+lists and overly explainging things, be concise.
 
-### Release tags
-When creating a tag, include a very brief changelog in the tag annotation using
-one concise line per notable change item. Keep the annotation focused on the
-externally meaningful behavior change, not implementation details. Do not list
-docs, refactors, config renames, or internal plumbing unless they are
-themselves the notable user-facing change.
+### Releases
+release-please opens a release pull request from the Conventional Commit
+titles on main. Merging it bumps the versions, updates CHANGELOG.md and tags
+the release. Do not bump versions or create release tags by hand.
