@@ -32,3 +32,16 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+  - it: passes a data source to a new PVC
+    set:
+      persistence.dataSourceRef:
+        apiGroup: kopiur.home-operations.com
+        kind: Restore
+        name: brrpolice
+    asserts:
+      - equal:
+          path: spec.dataSourceRef
+          value:
+            apiGroup: kopiur.home-operations.com
+            kind: Restore
+            name: brrpolice

@@ -10,6 +10,18 @@
         1
       ]
     },
+    "controller": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "deployment",
+            "statefulset"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "image": {
       "type": "object",
       "properties": {
@@ -197,6 +209,9 @@
         "size": {
           "type": "string",
           "minLength": 1
+        },
+        "dataSourceRef": {
+          "type": "object"
         },
         "annotations": {
           "type": "object"

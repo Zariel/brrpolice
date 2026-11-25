@@ -1,14 +1,20 @@
+{{- $statefulSet := eq .Values.controller.type "statefulset" }}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ ternary "StatefulSet" "Deployment" $statefulSet }}
 metadata:
   name: {{ include "brrpolice.fullname" . }}
   labels:
     {{- include "brrpolice.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if $statefulSet }}
+  {{- /* A StatefulSet starts the replacement pod only after the old one has stopped. */}}
+  serviceName: {{ include "brrpolice.fullname" . }}
+  {{- else }}
   # SQLite and enforcement state require non-overlapping writers during upgrades.
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "brrpolice.selectorLabels" . | nindent 6 }}
@@ -85,6 +91,7 @@ spec:
             {{- tpl (toYaml .) $ | nindent 12 }}
             {{- end }}
       volumes:
+        {{- if not (include "brrpolice.dataClaimTemplate" .) }}
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
@@ -92,6 +99,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
         # SQLite spills large index builds and query sorts to disk, including at startup.
         - name: tmp
           emptyDir: {}
@@ -113,3 +121,14 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if include "brrpolice.dataClaimTemplate" . }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        {{- include "brrpolice.dataClaimSpec" . | nindent 8 }}
+  {{- end }}

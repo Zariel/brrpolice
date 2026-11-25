@@ -1,6 +1,6 @@
 suite: deployment contract
 templates:
-  - templates/deployment.yaml
+  - templates/workload.yaml
 set:
   config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
 release:
@@ -97,3 +97,9 @@ tests:
               secretKeyRef:
                 name: qbittorrent-auth
                 key: api-key
+  - it: runs a Deployment by default
+    asserts:
+      - isKind:
+          of: Deployment
+      - notExists:
+          path: spec.volumeClaimTemplates
