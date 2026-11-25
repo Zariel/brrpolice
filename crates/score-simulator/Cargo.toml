@@ -1,6 +1,6 @@
 [package]
 name = "score-simulator"
-version = "0.16.4"
+version = "0.16.5"
 edition = "2024"
 license-file = "../../LICENSE"
 
