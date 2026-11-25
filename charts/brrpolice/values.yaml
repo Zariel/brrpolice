@@ -1,6 +1,10 @@
 # -- One SQLite writer is supported. Set to 0 to pause enforcement.
 replicaCount: 1
 
+controller:
+  # -- Workload kind, `deployment` or `statefulset`. A StatefulSet creates the data PVC from a volumeClaimTemplate unless `persistence.existingClaim` is set.
+  type: deployment
+
 image:
   # -- Container image repository.
   repository: ghcr.io/zariel/brrpolice
@@ -91,6 +95,8 @@ persistence:
     - ReadWriteOnce
   # -- Requested size of a new PVC.
   size: 5Gi
+  # -- Data source for a new PVC, such as a volume populator that restores a backup.
+  dataSourceRef: {}
   # -- Annotations for a new PVC.
   annotations: {}
 

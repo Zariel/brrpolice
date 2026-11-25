@@ -32,6 +32,7 @@ cases = [
         ],
         "matchLabels",
     ),
+    ("unknown controller type", ["controller.type=daemonset"], "type"),
     (
         "non-string dashboard labels",
         ["monitoring.dashboards.labels.grafana_dashboard=1"],

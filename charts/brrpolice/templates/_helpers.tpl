@@ -44,3 +44,26 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- printf "%s:%s" .Values.image.repository (default (printf "v%s" .Chart.AppVersion) .Values.image.tag) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Whether a StatefulSet owns the data PVC through a volumeClaimTemplate. */}}
+{{- define "brrpolice.dataClaimTemplate" -}}
+{{- if and (eq .Values.controller.type "statefulset") .Values.persistence.enabled (not .Values.persistence.existingClaim) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* PVC spec shared by the standalone PVC and the StatefulSet volumeClaimTemplate. */}}
+{{- define "brrpolice.dataClaimSpec" -}}
+accessModes:
+  {{- toYaml .Values.persistence.accessModes | nindent 2 }}
+{{- if ne .Values.persistence.storageClass nil }}
+storageClassName: {{ .Values.persistence.storageClass | quote }}
+{{- end }}
+resources:
+  requests:
+    storage: {{ .Values.persistence.size | quote }}
+{{- with .Values.persistence.dataSourceRef }}
+dataSourceRef:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}

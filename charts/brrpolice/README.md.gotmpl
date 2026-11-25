@@ -13,6 +13,12 @@ helm install brrpolice oci://ghcr.io/zariel/charts/brrpolice \
 The chart runs one instance with `Recreate` upgrades so enforcement and SQLite
 writes never overlap. `replicaCount` accepts only `0` or `1`.
 
+Set `controller.type: statefulset` to run a StatefulSet instead. It starts the
+replacement pod only after the old one has stopped, and it creates the data PVC
+from a volumeClaimTemplate unless `persistence.existingClaim` is set.
+`persistence.dataSourceRef` fills a new PVC from a data source, for example a
+volume populator that restores a backup.
+
 SQLite data uses a PVC by default. Set `persistence.existingClaim` to reuse an
 existing database, and match `podSecurityContext` to the volume's ownership. A
 disk-backed `emptyDir` is always mounted at `/tmp`: SQLite needs writable

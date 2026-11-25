@@ -1,0 +1,90 @@
+suite: statefulset contract
+templates:
+  - templates/workload.yaml
+  - templates/pvc.yaml
+set:
+  config.qbittorrent.base_url: http://qbittorrent.default.svc.cluster.local
+  controller.type: statefulset
+release:
+  name: brrpolice
+tests:
+  - it: owns the data PVC through a volumeClaimTemplate
+    set:
+      persistence.storageClass: ceph-block
+      persistence.annotations:
+        example.com/owner: brrpolice
+      persistence.dataSourceRef:
+        apiGroup: kopiur.home-operations.com
+        kind: Restore
+        name: brrpolice
+    asserts:
+      - template: templates/workload.yaml
+        isKind:
+          of: StatefulSet
+      - template: templates/workload.yaml
+        equal:
+          path: spec.serviceName
+          value: brrpolice
+      - template: templates/workload.yaml
+        notExists:
+          path: spec.strategy
+      - template: templates/workload.yaml
+        equal:
+          path: spec.volumeClaimTemplates
+          value:
+            - metadata:
+                name: data
+                annotations:
+                  example.com/owner: brrpolice
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                storageClassName: ceph-block
+                resources:
+                  requests:
+                    storage: 5Gi
+                dataSourceRef:
+                  apiGroup: kopiur.home-operations.com
+                  kind: Restore
+                  name: brrpolice
+      - template: templates/workload.yaml
+        notExists:
+          path: spec.template.spec.volumes[?(@.name == "data")]
+      - template: templates/workload.yaml
+        contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data
+      - template: templates/pvc.yaml
+        hasDocuments:
+          count: 0
+
+  - it: mounts an existing claim without a volumeClaimTemplate
+    set:
+      persistence.existingClaim: brrpolice
+    asserts:
+      - template: templates/workload.yaml
+        notExists:
+          path: spec.volumeClaimTemplates
+      - template: templates/workload.yaml
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: brrpolice
+
+  - it: uses an emptyDir when persistence is disabled
+    set:
+      persistence.enabled: false
+    asserts:
+      - template: templates/workload.yaml
+        notExists:
+          path: spec.volumeClaimTemplates
+      - template: templates/workload.yaml
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
